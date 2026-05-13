@@ -1,0 +1,20 @@
+# Ignore the provided assignment folder
+HW4/
+
+# Standard ROS/catkin workspaces ignores
+catkin_ws/build/
+catkin_ws/devel/
+catkin_ws/install/
+catkin_ws/.catkin_tools/
+catkin_ws/.catkin_workspace
+*~
+*.pyc
+__pycache__/
+
+# ChatGPT Client Keys
+ChatGPT_API_KEY.txt
+
+# Editor / OS specifics
+.vscode/
+.idea/
+.DS_Store

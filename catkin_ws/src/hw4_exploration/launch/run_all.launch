@@ -1,0 +1,48 @@
+<launch>
+    <!-- 1. Start Gazebo simulation with mecanum robot -->
+    <include file="$(find nexus_4wd_mecanum_gazebo)/launch/nexus_4wd_mecanum_world.launch" />
+
+    <!-- 2. Start local costmap generator (converts Realsense pointcloud to 2D occupancy grid for motion primitives planner) -->
+    <include file="$(find local_costmap_generator)/launch/run.launch" />
+
+    <!-- 3. Start RTAB-Map SLAM (Configured for Visual Odometry using the RGB-D Camera) -->
+    <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
+        <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 600 --Kp/MaxFeatures 600 --Rtabmap/LoopThr 0.3 --Rtabmap/DetectionRate 2"/>
+        <arg name="rgb_topic" value="/camera/color/image_raw"/>
+        <arg name="depth_topic" value="/camera/depth/image_raw"/>
+        <arg name="camera_info_topic" value="/camera/color/camera_info"/>
+        <arg name="depth_camera_info_topic" value="/camera/depth/camera_info"/>
+        <arg name="frame_id" value="base_footprint"/>
+        <arg name="odom_topic" value="/rtabmap/odom"/>
+        <arg name="visual_odometry" value="true"/>
+        <arg name="icp_odometry" value="false"/>
+        <arg name="publish_tf_odom" value="true"/>
+        <arg name="vo_frame_id" value="odom"/>
+        <arg name="subscribe_scan" value="true"/>
+        <arg name="scan_topic" value="/scan"/>
+        <arg name="approx_sync" value="true"/>
+        <arg name="rviz" value="false"/>
+        <arg name="rtabmap_viz" value="true"/>
+    </include>
+
+    <!-- 3.5 Start AprilTag Localization for global pose correction -->
+    <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
+        <arg name="tag_file_name" value="hw4_tags" />
+        <arg name="camera_name" value="/camera/color" />
+        <arg name="image_topic" value="image_raw" />
+        <arg name="world_frame_name" value="map" />
+        <arg name="camera_frame_name" value="camera_link" />
+        <arg name="image_frame_name" value="camera_color_optical_frame" />
+        <arg name="with_visualization" value="false" />
+        <arg name="with_realsense_tf" value="false" />
+    </include>
+
+    <!-- 4. Start Graph Planner for generating the global path on the map -->
+    <include file="$(find graph_planner)/launch/graph_planner.launch" />
+
+    <!-- 5. Start the existing Python Motion Primitives Planner -->
+    <include file="$(find control_space_planner)/launch/run.launch" />
+
+    <!-- 6. Start RViz with the specific assignment configuration -->
+    <node pkg="rviz" type="rviz" name="rviz_display" args="-d $(find hw4_exploration)/rviz/ee478_rtabmap.rviz" output="screen" />
+</launch>

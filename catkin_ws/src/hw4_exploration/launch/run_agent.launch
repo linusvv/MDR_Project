@@ -1,0 +1,13 @@
+<launch>
+    <!-- 1. Start LLM Client -->
+    <node name="simple_llm_client" pkg="gpt_llm_client" type="simple_llm_client.py" output="screen" />
+    
+    <!-- 2. Start Vision Perception Node -->
+    <node name="vision_perception_node" pkg="hw4_exploration" type="vision_perception_node.py" output="screen" />
+    
+    <!-- 3. Start Semantic Map Node -->
+    <node name="semantic_map_node" pkg="hw4_exploration" type="semantic_map_node.py" output="screen" />
+    
+    <!-- 4. Start Adjust Base Service Node -->
+    <node name="adjust_base_node" pkg="hw4_exploration" type="adjust_base_node.py" output="screen" />
+</launch>

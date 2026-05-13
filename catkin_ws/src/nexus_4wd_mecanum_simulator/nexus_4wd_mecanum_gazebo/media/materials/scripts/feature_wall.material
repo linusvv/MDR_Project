@@ -1,0 +1,19 @@
+material Custom/FeatureWall
+{
+  technique
+  {
+    pass
+    {
+      ambient 0.8 0.8 0.8 1.0
+      diffuse 1.0 1.0 1.0 1.0
+      specular 0.1 0.1 0.1 1.0 10.0
+
+      texture_unit
+      {
+        texture feature_wall_diffuse.png
+        scale 1.0 1.0
+        filtering trilinear
+      }
+    }
+  }
+}

@@ -1,0 +1,94 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Robot Control Interface</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="app-container">
+        <!-- Header -->
+        <header class="app-header">
+            <div class="logo">
+                <div class="status-indicator active"></div>
+                <h1>Robot Control Center</h1>
+            </div>
+            <div class="header-actions">
+                <div class="layout-control-container">
+                    <span class="control-label">Column Width:</span>
+                    <input type="range" id="layout-slider" min="15" max="45" value="25" class="layout-slider" title="Adjust sidebar column width">
+                    <span class="control-value" id="layout-val">25%</span>
+                </div>
+                <div class="mode-toggle-container">
+                    <span class="mode-label active" id="label-remote">Remote Control</span>
+                    <label class="switch">
+                        <input type="checkbox" id="mode-toggle">
+                        <span class="slider round"></span>
+                    </label>
+                    <span class="mode-label" id="label-explore">Exploration (Disabled)</span>
+                </div>
+            </div>
+        </header>
+
+        <!-- Main Content -->
+        <main class="main-grid">
+            <!-- Left Column: Primary & Depth Camera (smaller) -->
+            <section class="video-section">
+                <div class="card video-card small-video">
+                    <div class="card-header"><h2>Primary Camera (AprilTag Detection)</h2></div>
+                    <div class="video-container"><img src="{{ url_for('video_color') }}" alt="Color Camera Stream" class="video-stream"></div>
+                </div>
+                <div class="card video-card small-video">
+                    <div class="card-header"><h2>Depth Camera (3D View)</h2></div>
+                    <div class="video-container"><img src="{{ url_for('video_depth') }}" alt="Depth Camera Stream" class="video-stream"></div>
+                </div>
+            </section>
+
+            <!-- Center Column: SLAM/Map placeholder (now main piece) -->
+            <section class="slam-section">
+                <div class="card slam-card">
+                    <div class="card-header"><h2>SLAM & Exploration Data</h2></div>
+                    <div class="map-container" style="display: flex; justify-content: center; align-items: center; background: #0f172a; border-radius: 8px; overflow: hidden; position: relative; height: 350px;">
+                        <img id="map-stream" src="/video_map" alt="SLAM Map Stream" style="max-width: 100%; max-height: 100%; object-fit: contain;">
+                    </div>
+                    <div class="slam-data-grid">
+                        <div class="data-item"><span class="data-label">Robot Position</span><span class="data-value" id="robot-pose">[X: --, Y: --, θ: --]</span></div>
+                        <div class="data-item"><span class="data-label">Shops Detected</span><span class="data-value" id="shops-count">0</span></div>
+                        <div class="data-item"><span class="data-label">Map Coverage</span><span class="data-value" id="map-coverage">0.0 m²</span></div>
+                        <div class="data-item"><span class="data-label">Classification</span><span class="data-value">Pending</span></div>
+                    </div>
+                </div>
+            </section>
+
+            <!-- Right Column: Remote Control & LLM placeholder -->
+            <section class="control-section">
+                <div class="card control-card">
+                    <div class="card-header"><h2>Remote Control</h2></div>
+                    <div class="joystick-container">
+                        <div class="d-pad">
+                            <button class="d-btn up" id="btn-up" data-linear="0.5" data-angular="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+                            <button class="d-btn left" id="btn-left" data-linear="0" data-angular="1.0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
+                            <button class="d-btn stop" id="btn-stop" data-linear="0" data-angular="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg></button>
+                            <button class="d-btn right" id="btn-right" data-linear="0" data-angular="-1.0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></button>
+                            <button class="d-btn down" id="btn-down" data-linear="-0.5" data-angular="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M19 12l-7 7-7-7"/></svg></button>
+                        </div>
+                    </div>
+                </div>
+
+                <div class="card llm-card">
+                    <div class="card-header"><h2>LLM Command Prompt</h2><span class="badge pending">Coming Soon</span></div>
+                    <div class="llm-input-area"><textarea class="llm-input" placeholder="Enter natural language command for the robot..." disabled></textarea><button class="btn-primary" disabled>Send to Agent</button></div>
+                </div>
+
+                <div class="card console-card">
+                    <div class="card-header"><h2>Console Output</h2></div>
+                    <div class="console-output" id="console-output" style="height:150px; overflow-y:auto; background:#111827; color:#e2e8f0; padding:0.5rem; border-radius:6px;">(Console messages will appear here)</div>
+                </div>
+            </section>
+        </main>
+    </div>
+    <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>

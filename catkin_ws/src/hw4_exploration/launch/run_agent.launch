@@ -2,12 +2,18 @@
     <!-- 1. Start LLM Client -->
     <node name="simple_llm_client" pkg="gpt_llm_client" type="simple_llm_client.py" output="screen" />
     
-    <!-- 2. Start Vision Perception Node -->
+    <!-- 2. Start Vision Perception Services -->
     <node name="vision_perception_node" pkg="hw4_exploration" type="vision_perception_node.py" output="screen" />
     
-    <!-- 3. Start Semantic Map Node -->
-    <node name="semantic_map_node" pkg="hw4_exploration" type="semantic_map_node.py" output="screen" />
+    <!-- 3. Start Store Coordinator (Map Anchor Points) -->
+    <node name="store_coordinator_node" pkg="hw4_exploration" type="store_coordinator_node.py" output="screen" />
     
-    <!-- 4. Start Adjust Base Service Node -->
-    <node name="adjust_base_node" pkg="hw4_exploration" type="adjust_base_node.py" output="screen" />
+    <!-- 4. Start AprilTag Visualizer -->
+    <node name="tag_visualizer" pkg="hw4_exploration" type="tag_visualizer.py" output="screen" />
+
+    <!-- 5. Start the Stage Handler Agent Brain -->
+    <node name="agent_node" pkg="hw4_exploration" type="agent_node.py" output="screen" />
+    
+    <!-- 6. Start the Tag Pose Injector to correct RTAB-Map -->
+    <node name="tag_pose_injector" pkg="hw4_exploration" type="tag_pose_injector.py" output="screen" />
 </launch>

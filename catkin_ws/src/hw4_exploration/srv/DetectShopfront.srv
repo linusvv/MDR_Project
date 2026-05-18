@@ -1,0 +1,3 @@
+string target_shop
+---
+bool is_found

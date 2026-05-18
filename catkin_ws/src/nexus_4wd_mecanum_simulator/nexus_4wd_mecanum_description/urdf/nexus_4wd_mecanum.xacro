@@ -358,7 +358,7 @@
 
   <xacro:include filename="$(find realsense_gazebo_plugin)/urdf/_d435.urdf.xacro" />
     <xacro:sensor_d435 parent="base_link">
-      <origin xyz="0.20 0 0.05" rpy="0 0.20 0"/>
+      <origin xyz="0.20 0 0.10" rpy="0 0.05 0"/>
   </xacro:sensor_d435>
 
 
@@ -377,6 +377,7 @@
   <xacro:urm04_sensor frame_name="rear_sensor" ros_topic="rear_sensor" update_rate="10" min_range="0.04" max_range="2.5" horizontal_field_of_view="1.04" vertical_field_of_view="0.04" ray_count="2" />
 
   <!-- Lidar -->
+  <!--
   <joint name="lidar_joint" type="fixed">
     <origin xyz="0.0 0.0 0.30" rpy="0 0 0" />
     <parent link="base_link"/>
@@ -419,5 +420,6 @@
       </plugin>
     </sensor>
   </gazebo>
+  -->
 
 </robot>

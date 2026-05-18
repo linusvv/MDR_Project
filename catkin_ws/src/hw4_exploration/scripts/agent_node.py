@@ -1,0 +1,165 @@
+#!/usr/bin/env python3
+import rospy
+import math
+import tf
+import tf2_ros
+from std_msgs.msg import String
+from nav_msgs.msg import Path
+from geometry_msgs.msg import PoseStamped, Quaternion
+from apriltag_ros.msg import AprilTagDetectionArray
+from hw4_exploration.srv import AnalyzeSign, DetectShopfront
+
+class AgentNode:
+    def __init__(self):
+        rospy.init_node("agent_node")
+        
+        self.state = "IDLE"
+        self.target_shop = ""
+        
+        self.path_pub = rospy.Publisher("/graph_planner/path/global_path", Path, queue_size=1)
+        self.prompt_sub = rospy.Subscriber("/user_prompt", String, self.prompt_cb)
+        self.tag_sub = rospy.Subscriber("/tag_detections", AprilTagDetectionArray, self.tag_cb)
+        
+        self.tf_buffer = tf2_ros.Buffer()
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        
+        rospy.wait_for_service("/analyze_sign")
+        rospy.wait_for_service("/detect_shopfront")
+        self.analyze_srv = rospy.ServiceProxy("/analyze_sign", AnalyzeSign)
+        self.shop_srv = rospy.ServiceProxy("/detect_shopfront", DetectShopfront)
+        
+        self.last_tag_time = rospy.Time(0)
+        self.tag_cooldown = rospy.Duration(10.0) # ignore tags for 10 seconds after reading one
+        
+        self.last_shop_check_time = rospy.Time.now()
+        self.shop_check_interval = rospy.Duration(8.0) # Check for shop every 8 seconds of exploring
+        
+        self.turn_end_time = rospy.Time(0)
+        self.turn_dx = 0.0
+        self.turn_dy = 0.0
+        self.turn_dyaw = 0.0
+        
+        self.rate = rospy.Rate(10)
+        rospy.loginfo("Agent Node initialized. Waiting for user input on /user_prompt...")
+        
+    def prompt_cb(self, msg):
+        if self.state == "IDLE":
+            self.target_shop = msg.data
+            rospy.loginfo(f"Received target: {self.target_shop}. Starting EXPLORE.")
+            self.last_shop_check_time = rospy.Time.now()
+            self.state = "EXPLORE"
+            
+    def tag_cb(self, msg):
+        if self.state == "EXPLORE":
+            if len(msg.detections) > 0:
+                if (rospy.Time.now() - self.last_tag_time) > self.tag_cooldown:
+                    rospy.loginfo("Detected AprilTag! Stopping to read sign.")
+                    self.state = "READ_SIGN"
+                    
+    def stop_robot(self):
+        # Publish empty path to stop control_space_planner
+        path = Path()
+        path.header.frame_id = "odom"
+        path.header.stamp = rospy.Time.now()
+        self.path_pub.publish(path)
+
+    def publish_local_path(self, dx, dy, dyaw):
+        try:
+            trans = self.tf_buffer.lookup_transform("odom", "base_footprint", rospy.Time(0), rospy.Duration(1.0))
+        except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
+            rospy.logwarn(f"TF lookup failed: {e}")
+            return
+            
+        path = Path()
+        path.header.frame_id = "odom"
+        path.header.stamp = rospy.Time.now()
+        
+        p0 = PoseStamped()
+        p0.pose.position.x = trans.transform.translation.x
+        p0.pose.position.y = trans.transform.translation.y
+        p0.pose.orientation = trans.transform.rotation
+        path.poses.append(p0)
+        
+        q = [trans.transform.rotation.x, trans.transform.rotation.y, trans.transform.rotation.z, trans.transform.rotation.w]
+        euler = tf.transformations.euler_from_quaternion(q)
+        yaw = euler[2]
+        
+        target_yaw = yaw + dyaw
+        p1 = PoseStamped()
+        p1.pose.position.x = p0.pose.position.x + dx * math.cos(yaw) - dy * math.sin(yaw)
+        p1.pose.position.y = p0.pose.position.y + dx * math.sin(yaw) + dy * math.cos(yaw)
+        q1 = tf.transformations.quaternion_from_euler(0, 0, target_yaw)
+        p1.pose.orientation = Quaternion(*q1)
+        path.poses.append(p1)
+        
+        self.path_pub.publish(path)
+
+    def run(self):
+        while not rospy.is_shutdown():
+            if self.state == "IDLE":
+                pass
+                
+            elif self.state == "EXPLORE":
+                if (rospy.Time.now() - self.last_shop_check_time) > self.shop_check_interval:
+                    self.stop_robot()
+                    rospy.loginfo("Pausing exploration to check for shopfront...")
+                    self.state = "CHECK_SHOP"
+                else:
+                    self.publish_local_path(1.5, 0.0, 0.0) # publish point 1.5m straight ahead
+                    
+            elif self.state == "READ_SIGN":
+                self.stop_robot()
+                rospy.sleep(1.5) # stabilize camera blur
+                
+                rospy.loginfo("Calling /analyze_sign API...")
+                res = self.analyze_srv(self.target_shop)
+                direction = res.direction
+                rospy.loginfo(f"Sign says go: {direction}")
+                
+                self.last_tag_time = rospy.Time.now()
+                
+                if direction == "LEFT":
+                    self.turn_dx = 1.0
+                    self.turn_dy = 1.0
+                    self.turn_dyaw = math.pi / 2
+                    self.turn_end_time = rospy.Time.now() + rospy.Duration(6.0)
+                elif direction == "RIGHT":
+                    self.turn_dx = 1.0
+                    self.turn_dy = -1.0
+                    self.turn_dyaw = -math.pi / 2
+                    self.turn_end_time = rospy.Time.now() + rospy.Duration(6.0)
+                else: # STRAIGHT or UNKNOWN
+                    self.turn_dx = 2.0
+                    self.turn_dy = 0.0
+                    self.turn_dyaw = 0.0
+                    self.turn_end_time = rospy.Time.now() + rospy.Duration(3.0)
+                    
+                self.state = "TURN"
+                
+            elif self.state == "TURN":
+                if rospy.Time.now() > self.turn_end_time:
+                    self.state = "EXPLORE"
+                    self.last_shop_check_time = rospy.Time.now()
+                else:
+                    self.publish_local_path(self.turn_dx, self.turn_dy, self.turn_dyaw)
+                    
+            elif self.state == "CHECK_SHOP":
+                rospy.sleep(1.0)
+                rospy.loginfo("Calling /detect_shopfront API...")
+                res = self.shop_srv(self.target_shop)
+                if res.is_found:
+                    rospy.loginfo("SUCCESS! Arrived at target shop.")
+                    self.state = "ARRIVED"
+                else:
+                    rospy.loginfo("Shop not found yet. Resuming exploration.")
+                    self.last_shop_check_time = rospy.Time.now()
+                    self.state = "EXPLORE"
+                    
+            elif self.state == "ARRIVED":
+                self.stop_robot()
+                
+            self.rate.sleep()
+
+if __name__ == '__main__':
+    node = AgentNode()
+    node.run()

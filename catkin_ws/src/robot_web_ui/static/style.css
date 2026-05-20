@@ -248,6 +248,30 @@ input:checked + .slider:before{transform:translateX(24px);}
     cursor: not-allowed;
 }
 
+#btn-find-tag {
+    background: #8b5cf6;
+}
+#btn-find-tag:hover {
+    background: #7c3aed;
+    box-shadow: 0 0 10px rgba(139, 92, 246, 0.4);
+}
+#btn-find-tag.searching {
+    background: #ef4444 !important;
+    animation: searchPulse 1.5s infinite alternate;
+}
+#btn-find-tag.searching:hover {
+    background: #dc2626 !important;
+    box-shadow: 0 0 10px rgba(239, 68, 68, 0.4);
+}
+@keyframes searchPulse {
+    from {
+        box-shadow: 0 0 5px rgba(239, 68, 68, 0.3);
+    }
+    to {
+        box-shadow: 0 0 15px rgba(239, 68, 68, 0.7);
+    }
+}
+
 /* Exploration Map Legend */
 .legend-container {
     margin-top: 1rem;

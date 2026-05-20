@@ -120,6 +120,60 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    const btnFindTag = document.getElementById('btn-find-tag');
+    if (btnFindTag) {
+        btnFindTag.addEventListener('click', async () => {
+            logConsole("Toggling autonomous AprilTag search...");
+            try {
+                const res = await fetch('/api/find_tag', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await res.json();
+                logConsole(`System: ${data.message || 'Tag search toggled.'}`);
+            } catch (error) {
+                console.error("Failed to toggle tag search", error);
+                logConsole("Error: Failed to connect to search backend.");
+            }
+        });
+    }
+
+    // Navigate to AprilTag handler
+    const selectTag = document.getElementById('select-tag');
+    const btnGoToTag = document.getElementById('btn-go-to-tag');
+    
+    if (btnGoToTag && selectTag) {
+        btnGoToTag.addEventListener('click', async () => {
+            const tagName = selectTag.value;
+            if (!tagName) {
+                alert("Please select a tag first!");
+                return;
+            }
+            
+            logConsole(`Commanding robot to navigate to tag: ${tagName}...`);
+            btnGoToTag.disabled = true;
+            
+            try {
+                const res = await fetch('/api/navigate_to_tag', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ tag_name: tagName })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    logConsole(`System: ${data.message}`);
+                } else {
+                    logConsole(`Error: ${data.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to navigate to tag", error);
+                logConsole("Error: Failed to connect to navigation backend.");
+            } finally {
+                btnGoToTag.disabled = false;
+            }
+        });
+    }
+
     // OpenAI API Key Submission Form Logic
     const apiKeyInput = document.getElementById('openai-api-key');
     const apiKeySubmit = document.getElementById('btn-submit-api-key');
@@ -389,8 +443,40 @@ document.addEventListener('DOMContentLoaded', () => {
                 tagsCountEl.textContent = `${data.tags_detected} tags`;
             }
             
-
-
+            // Dynamic Find Tag Button UI updates
+            const btnFindTag = document.getElementById('btn-find-tag');
+            if (btnFindTag) {
+                if (data.searching_tag) {
+                    if (!btnFindTag.classList.contains('searching')) {
+                        btnFindTag.classList.add('searching');
+                        btnFindTag.innerHTML = `
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 0.5rem; vertical-align: middle;"><rect x="4" y="4" width="16" height="16" rx="2"/></svg>
+                            Stop Searching
+                        `;
+                    }
+                } else {
+                    if (btnFindTag.classList.contains('searching')) {
+                        btnFindTag.classList.remove('searching');
+                        btnFindTag.innerHTML = `
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 0.5rem; vertical-align: middle;"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+                            Find Next Tag
+                        `;
+                    }
+                }
+            }
+            
+            // Dynamic Navigate to Tag Button UI updates
+            const btnGoToTag = document.getElementById('btn-go-to-tag');
+            if (btnGoToTag) {
+                if (data.navigating_to_tag) {
+                    btnGoToTag.textContent = "Navigating...";
+                    btnGoToTag.style.background = "#d97706";
+                } else {
+                    btnGoToTag.textContent = "Go to Tag";
+                    btnGoToTag.style.background = "#10b981";
+                }
+            }
+            
             // Dynamic API Key Status Update
             if (apiKeyStatus && document.activeElement !== apiKeyInput) {
                 if (data.has_api_key) {

@@ -138,9 +138,24 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
     double trueDistToGoal = sqrt(pow(final_gx - this->ego_x, 2) + pow(final_gy - this->ego_y, 2));
 
     if (trueDistToGoal < this->ARRIVAL_THRES) {
-      command.angular.z = 0.0;
       command.linear.x = 0.0;
       command.linear.y = 0.0;
+      
+      // Rotate in place to align with final goal orientation
+      double final_gyaw;
+      tf2::Quaternion final_goal_quat;
+      double roll, pitch;
+      tf2::convert(this->globalPath.poses.back().pose.orientation, final_goal_quat);
+      tf2::Matrix3x3(final_goal_quat).getRPY(roll, pitch, final_gyaw);
+      
+      double yaw_diff = final_gyaw - this->ego_yaw;
+      yaw_diff = atan2(sin(yaw_diff), cos(yaw_diff)); // normalize to [-pi, pi]
+      
+      if (abs(yaw_diff) > 0.08) {
+          command.angular.z = (yaw_diff > 0 ? 1.0 : -1.0) * std::max(0.3, std::min(1.0, abs(yaw_diff) * 1.5));
+      } else {
+          command.angular.z = 0.0;
+      }
     }
     else if (trueDistToGoal < 2.0 * this->ARRIVAL_THRES) {
       double scale = pow(trueDistToGoal / (2.0 * this->ARRIVAL_THRES), 3.0);
@@ -226,6 +241,29 @@ void MotionPlanner::Plan()
     goalNode.y = this->goal_y;
     goalNode.yaw = this->goal_yaw;
     localNode = GlobalToLocalCoordinate(goalNode, this->egoOdom);
+    
+    // Rotate in place first if target is behind or to the side (angle > 1.2 rad / 70 deg)
+    double final_gx = this->globalPath.poses.back().pose.position.x;
+    double final_gy = this->globalPath.poses.back().pose.position.y;
+    double trueDistToGoal = sqrt(pow(final_gx - this->ego_x, 2) + pow(final_gy - this->ego_y, 2));
+    if (trueDistToGoal >= this->ARRIVAL_THRES) {
+      double target_angle = atan2(localNode.y, localNode.x);
+      if (abs(target_angle) > 1.2) {
+        geometry_msgs::Twist command;
+        command.linear.x = 0.0;
+        command.linear.y = 0.0;
+        command.angular.z = (target_angle > 0 ? 1.0 : -1.0) * std::max(0.4, std::min(1.2, abs(target_angle) * 1.5));
+        pubCommand.publish(command);
+        
+        // Publish empty selected motion to clear visualization
+        sensor_msgs::PointCloud2 emptyCloud;
+        emptyCloud.header.frame_id = this->frame_id;
+        emptyCloud.header.stamp = ros::Time::now();
+        pubSelectedMotion.publish(emptyCloud);
+        return; // Exit planning early
+      }
+    }
+
     // - compute truncated local node pose within local map
     Node tmpLocalNode;
     memcpy(&tmpLocalNode, &localNode, sizeof(struct Node));
@@ -417,7 +455,7 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
       double expected_size = this->MAX_PROGRESS / this->DIST_RESOL;
       double cost_collision_penalty = 0.0;
       if (motionPrimitive.size() < expected_size - 1) {
-          cost_collision_penalty = (expected_size - motionPrimitive.size()) * 10.0; // Increased significantly for dynamic obstacle avoidance
+          cost_collision_penalty = 10.0 + (expected_size - motionPrimitive.size()) * 500.0; // Heavily penalize any collision to prioritize safety
       }
       
       // Extremely heavily penalize primitives that just aim backward (driving away from goal) to survive

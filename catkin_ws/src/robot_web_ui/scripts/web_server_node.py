@@ -11,8 +11,8 @@ import math
 from flask import Flask, render_template, Response, request, jsonify
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 import sensor_msgs.point_cloud2 as pc2
-from geometry_msgs.msg import Twist, PointStamped
-from nav_msgs.msg import OccupancyGrid
+from geometry_msgs.msg import Twist, PointStamped, PoseStamped
+from nav_msgs.msg import OccupancyGrid, Path
 from cv_bridge import CvBridge
 import tf
 import tf.transformations
@@ -54,6 +54,9 @@ class RobotWebServer:
         self.R = np.eye(2)
         self.T = np.array([0.0, -3.125])
         self.T_map_odom = np.eye(4)
+        self.searching_tag = False
+        self.search_thread = None
+        self.navigating_to_tag = False
         
         # Set default parameter: Local AI mode active on startup
         rospy.set_param("/use_local_ai", True)
@@ -70,6 +73,7 @@ class RobotWebServer:
         # ROS Publishers
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
         self.user_prompt_pub = rospy.Publisher('/user_prompt', String, queue_size=5)
+        self.path_pub = rospy.Publisher('/graph_planner/path/global_path', Path, queue_size=5)
 
         # ROS Subscribers
         rospy.Subscriber('/camera/color/image_raw', Image, self.color_cb)
@@ -205,11 +209,340 @@ class RobotWebServer:
             except tf.Exception:
                 pass
                 
-        # Draw lines connecting the points
-        for i in range(len(pts_2d) - 1):
-            cv2.line(cv_image, pts_2d[i], pts_2d[i+1], (0, 255, 0), 4)
-            
         return cv_image
+
+    def get_current_robot_pose(self):
+        if self.tf_listener.canTransform('map', 'base_footprint', rospy.Time(0)):
+            try:
+                (trans, rot) = self.tf_listener.lookupTransform('map', 'base_footprint', rospy.Time(0))
+                rx, ry = trans[0], trans[1]
+                euler = tf.transformations.euler_from_quaternion(rot)
+                yaw = euler[2]
+                return rx, ry, yaw
+            except Exception:
+                pass
+        return getattr(self, 'robot_x', 0.0), getattr(self, 'robot_y', 0.0), getattr(self, 'robot_yaw', 0.0)
+
+    def find_tag_thread(self):
+        rospy.loginfo("[Find Tag] Starting tag search process...")
+        rate = rospy.Rate(10)
+        scan_duration = 15.8
+        tag_found = False
+
+        while not rospy.is_shutdown() and self.searching_tag:
+            # ================= PHASE 1: SCAN TURN =================
+            rospy.loginfo("[Find Tag] Starting scan-turn phase...")
+            # Disable planner during scanning
+            rospy.set_param("/exploration_state", "IDLE")
+            path = Path()
+            path.header.frame_id = "map"
+            path.header.stamp = rospy.Time.now()
+            self.path_pub.publish(path) # Clear path
+            self.cmd_vel_pub.publish(Twist()) # Stop movement
+            rospy.sleep(0.2)
+            
+            start_time = rospy.Time.now()
+            cmd = Twist()
+            cmd.angular.z = 0.4 # Slowly turn in place
+            
+            while not rospy.is_shutdown() and self.searching_tag and (rospy.Time.now() - start_time).to_sec() < scan_duration:
+                # Check for tag detection
+                with self.lock:
+                    detections_count = len(self.tag_detections) if hasattr(self, 'tag_detections') else 0
+                if detections_count > 0:
+                    rospy.loginfo("[Find Tag] Tag detected during scan phase!")
+                    tag_found = True
+                    break
+                self.cmd_vel_pub.publish(cmd)
+                rate.sleep()
+                
+            self.cmd_vel_pub.publish(Twist()) # Stop turn
+            
+            if tag_found or not self.searching_tag:
+                break
+                
+            # ================= PHASE 2: WANDER TRAVEL =================
+            rospy.loginfo("[Find Tag] No tag found during scan. Commencing safe wandering...")
+            # Enable C++ planner
+            rospy.set_param("/exploration_state", "EXPLORE")
+            rospy.set_param("/exploration_paused", False)
+            
+            # Select random global heading direction to explore
+            import random
+            explore_angle = random.uniform(-math.pi, math.pi)
+            rospy.loginfo(f"[Find Tag] Selected wandering heading: {explore_angle:.2f} rad.")
+            
+            # Track position to check for progress / stuck condition
+            rx, ry, _ = self.get_current_robot_pose()
+            last_progress_x = rx
+            last_progress_y = ry
+            last_progress_time = rospy.Time.now()
+            
+            # Wander for a maximum duration (e.g. 15.0 seconds) before doing another scan
+            wander_start_time = rospy.Time.now()
+            wander_duration = 15.0
+            
+            while not rospy.is_shutdown() and self.searching_tag and (rospy.Time.now() - wander_start_time).to_sec() < wander_duration:
+                # Update robot pose
+                rx, ry, ryaw = self.get_current_robot_pose()
+                self.robot_x = rx
+                self.robot_y = ry
+                self.robot_yaw = ryaw
+                
+                # Check for tag detection
+                with self.lock:
+                    detections_count = len(self.tag_detections) if hasattr(self, 'tag_detections') else 0
+                if detections_count > 0:
+                    rospy.loginfo("[Find Tag] Tag detected while traveling!")
+                    tag_found = True
+                    break
+                    
+                # Project goal 2.5 meters ahead along explore_angle
+                goal_x = rx + 2.5 * math.cos(explore_angle)
+                goal_y = ry + 2.5 * math.sin(explore_angle)
+                
+                self.publish_path_to_goal(goal_x, goal_y)
+                
+                # Check progress every 1.0 second
+                now = rospy.Time.now()
+                if (now - last_progress_time).to_sec() >= 1.0:
+                    dist_moved = math.hypot(rx - last_progress_x, ry - last_progress_y)
+                    if dist_moved >= 0.08:
+                        last_progress_x = rx
+                        last_progress_y = ry
+                        last_progress_time = now
+                    elif (now - last_progress_time).to_sec() > 3.0:
+                        # Stuck against a wall/corner, pick a new direction
+                        explore_angle = random.uniform(-math.pi, math.pi)
+                        rospy.logwarn(f"[Find Tag] Blocked/No progress. Changing heading to {explore_angle:.2f} rad.")
+                        last_progress_x = rx
+                        last_progress_y = ry
+                        last_progress_time = rospy.Time.now()
+                        
+                rate.sleep()
+                
+            if tag_found or not self.searching_tag:
+                break
+                
+        # Cleanup
+        self.searching_tag = False
+        self.stop_search()
+        if tag_found:
+            rospy.loginfo("[Find Tag] Search successfully completed.")
+        else:
+            rospy.loginfo("[Find Tag] Search finished/stopped.")
+
+    def start_navigation_to_tag(self, tag_name):
+        # Cancel any active search
+        self.searching_tag = False
+        
+        # Stop any existing navigation thread
+        self.navigating_to_tag = False
+        if hasattr(self, 'nav_thread') and self.nav_thread.is_alive():
+            self.nav_thread.join(timeout=1.0)
+            
+        self.navigating_to_tag = True
+        self.nav_thread = threading.Thread(target=self.nav_to_tag_thread, args=(tag_name,))
+        self.nav_thread.daemon = True
+        self.nav_thread.start()
+        return True
+
+    def nav_to_tag_thread(self, tag_name):
+        rospy.loginfo(f"[Tag Nav] Starting navigation to landmark {tag_name}...")
+        
+        # Enable C++ planner
+        rospy.set_param("/exploration_state", "EXPLORE")
+        rospy.set_param("/exploration_paused", False)
+        
+        # Get tag pose
+        pose_info = self.tag_true_poses[tag_name]
+        tag_x = pose_info[0]
+        tag_y = pose_info[1]
+        psi_deg = pose_info[2]
+        psi_rad = math.radians(psi_deg)
+        
+        # Offset to stop in front of tag (0.8 meters)
+        offset = 0.8
+        gx = tag_x + offset * math.cos(psi_rad)
+        gy = tag_y + offset * math.sin(psi_rad)
+        gyaw = math.atan2(-math.sin(psi_rad), -math.cos(psi_rad)) # Point at the tag (face opposite to normal)
+        
+        rospy.loginfo(f"[Tag Nav] Target Pose in Map: ({gx:.2f}, {gy:.2f}, heading: {math.degrees(gyaw):.1f}°)")
+        
+        rate = rospy.Rate(10)
+        
+        # Track position for progress check
+        rx, ry, _ = self.get_current_robot_pose()
+        last_progress_x = rx
+        last_progress_y = ry
+        last_progress_time = rospy.Time.now()
+        start_time = rospy.Time.now()
+        
+        while not rospy.is_shutdown() and self.navigating_to_tag:
+            rx, ry, ryaw = self.get_current_robot_pose()
+            self.robot_x = rx
+            self.robot_y = ry
+            self.robot_yaw = ryaw
+            
+            # Distance to the target position
+            dist = math.hypot(rx - gx, ry - gy)
+            
+            # Check if arrived at position
+            if dist < 0.9:
+                # Arrived at position! Wait a bit for alignment
+                rospy.loginfo("[Tag Nav] Arrived at target position. Waiting for alignment...")
+                rospy.sleep(3.0)
+                rospy.loginfo("[Tag Nav] Navigation and alignment completed successfully.")
+                break
+                
+            # Publish path to goal
+            path = Path()
+            path.header.frame_id = "map"
+            path.header.stamp = rospy.Time.now()
+            
+            p0 = PoseStamped()
+            p0.header.frame_id = "map"
+            p0.pose.position.x = rx
+            p0.pose.position.y = ry
+            # Orientation facing target
+            angle_to_goal = math.atan2(gy - ry, gx - rx)
+            q0 = tf.transformations.quaternion_from_euler(0, 0, angle_to_goal)
+            p0.pose.orientation = Quaternion(*q0)
+            path.poses.append(p0)
+            
+            p1 = PoseStamped()
+            p1.header.frame_id = "map"
+            p1.pose.position.x = gx
+            p1.pose.position.y = gy
+            q1 = tf.transformations.quaternion_from_euler(0, 0, gyaw)
+            p1.pose.orientation = Quaternion(*q1)
+            path.poses.append(p1)
+            
+            self.path_pub.publish(path)
+            
+            # Progress check (stuck detection)
+            now = rospy.Time.now()
+            if (now - last_progress_time).to_sec() >= 1.0:
+                dist_moved = math.hypot(rx - last_progress_x, ry - last_progress_y)
+                if dist_moved >= 0.08:
+                    last_progress_x = rx
+                    last_progress_y = ry
+                    last_progress_time = now
+                elif (now - last_progress_time).to_sec() > 8.0:
+                    rospy.logwarn("[Tag Nav] Stuck/No progress made for 8 seconds. Aborting navigation.")
+                    break
+                    
+            if (now - start_time).to_sec() > 45.0:
+                rospy.logwarn("[Tag Nav] Navigation timeout (45 seconds).")
+                break
+                
+            rate.sleep()
+            
+        self.navigating_to_tag = False
+        self.stop_search()
+
+    def choose_random_free_goal(self):
+        rx, ry, _ = self.get_current_robot_pose()
+        
+        with self.lock:
+            grid_map = self.grid_map if hasattr(self, 'grid_map') else None
+            
+        if grid_map is None:
+            # Fallback if map not ready
+            import random
+            angle = random.uniform(0, 2 * math.pi)
+            gx = rx + 2.0 * math.cos(angle)
+            gy = ry + 2.0 * math.sin(angle)
+            return gx, gy
+            
+        width = grid_map.info.width
+        height = grid_map.info.height
+        resolution = grid_map.info.resolution
+        origin = grid_map.info.origin
+        
+        if width == 0 or height == 0:
+            import random
+            angle = random.uniform(0, 2 * math.pi)
+            gx = rx + 2.0 * math.cos(angle)
+            gy = ry + 2.0 * math.sin(angle)
+            return gx, gy
+            
+        import random
+        map_data = np.array(grid_map.data, dtype=np.int8).reshape((height, width))
+        
+        for _ in range(100):
+            angle = random.uniform(0, 2 * math.pi)
+            distance = random.uniform(1.5, 3.5)
+            
+            gx = rx + distance * math.cos(angle)
+            gy = ry + distance * math.sin(angle)
+            
+            col = int((gx - origin.position.x) / resolution)
+            row = int((gy - origin.position.y) / resolution)
+            
+            if 0 <= col < width and 0 <= row < height:
+                if map_data[row, col] == 0:
+                    inflation_ok = True
+                    check_r = 2
+                    for r in range(-check_r, check_r + 1):
+                        for c in range(-check_r, check_r + 1):
+                            nr = row + r
+                            nc = col + c
+                            if 0 <= nc < width and 0 <= nr < height:
+                                if map_data[nr, nc] != 0:
+                                    inflation_ok = False
+                                    break
+                        if not inflation_ok:
+                            break
+                            
+                    if inflation_ok:
+                        return gx, gy
+                        
+        # Final fallback
+        angle = random.uniform(0, 2 * math.pi)
+        gx = rx + 2.0 * math.cos(angle)
+        gy = ry + 2.0 * math.sin(angle)
+        return gx, gy
+
+    def publish_path_to_goal(self, gx, gy):
+        path = Path()
+        path.header.frame_id = "map"
+        path.header.stamp = rospy.Time.now()
+        
+        rx, ry, _ = self.get_current_robot_pose()
+        
+        p0 = PoseStamped()
+        p0.header.frame_id = "map"
+        p0.pose.position.x = rx
+        p0.pose.position.y = ry
+        # Set orientation facing the goal to guide local planner rotation
+        angle_to_goal = math.atan2(gy - ry, gx - rx)
+        q = tf.transformations.quaternion_from_euler(0, 0, angle_to_goal)
+        p0.pose.orientation.x = q[0]
+        p0.pose.orientation.y = q[1]
+        p0.pose.orientation.z = q[2]
+        p0.pose.orientation.w = q[3]
+        path.poses.append(p0)
+        
+        p1 = PoseStamped()
+        p1.header.frame_id = "map"
+        p1.pose.position.x = gx
+        p1.pose.position.y = gy
+        p1.pose.orientation.x = q[0]
+        p1.pose.orientation.y = q[1]
+        p1.pose.orientation.z = q[2]
+        p1.pose.orientation.w = q[3]
+        path.poses.append(p1)
+        
+        self.path_pub.publish(path)
+
+    def stop_search(self):
+        rospy.set_param("/exploration_state", "IDLE")
+        path = Path()
+        path.header.frame_id = "map"
+        path.header.stamp = rospy.Time.now()
+        self.path_pub.publish(path)
+        self.cmd_vel_pub.publish(Twist())
 
 
     def project_store_to_map(self, store):
@@ -423,7 +756,8 @@ class RobotWebServer:
                         name = tag_def[0]
                         x_true = float(tag_def[2])
                         y_true = float(tag_def[3])
-                        self.tag_true_poses[name] = (x_true, y_true)
+                        psi_deg = float(tag_def[5]) if len(tag_def) > 5 else 0.0
+                        self.tag_true_poses[name] = (x_true, y_true, psi_deg)
                 rospy.loginfo(f"Web UI loaded true poses for {len(self.tag_true_poses)} signboards.")
             except Exception as e:
                 rospy.logwarn(f"Failed to load true poses: {e}")
@@ -554,7 +888,7 @@ class RobotWebServer:
                             pt_odom = np.array([tag_pose_odom[0], tag_pose_odom[1], 0.0, 1.0])
                             pt_map = np.dot(T_map_odom, pt_odom)
                             
-                            pts_true.append(self.tag_true_poses[signboard_name])
+                            pts_true.append((self.tag_true_poses[signboard_name][0], self.tag_true_poses[signboard_name][1]))
                             pts_meas.append((pt_map[0], pt_map[1]))
                             
                     # Estimate the transform from ground-truth/world coordinates to current SLAM map coordinates
@@ -664,7 +998,9 @@ def api_status():
         "tags_detected": len(server.detected_tags) if hasattr(server, 'detected_tags') else 0,
         "exploration_status": status_str,
         "exploration_state": explore_state,
-        "has_api_key": has_key
+        "has_api_key": has_key,
+        "searching_tag": server.searching_tag if hasattr(server, 'searching_tag') else False,
+        "navigating_to_tag": server.navigating_to_tag if hasattr(server, 'navigating_to_tag') else False
     }
     return jsonify(status)
 
@@ -705,6 +1041,32 @@ def set_ai_mode():
 def api_detect():
     rospy.loginfo("Detect Mode triggered (Backend placeholder).")
     return jsonify({"status": "success", "message": "Detection triggered (Backend placeholder)."})
+
+@app.route('/api/find_tag', methods=['POST'])
+def api_find_tag():
+    if server.searching_tag:
+        server.searching_tag = False
+        server.stop_search()
+        return jsonify({"status": "cancelled", "message": "Tag search cancelled."})
+    else:
+        server.searching_tag = True
+        server.search_thread = threading.Thread(target=server.find_tag_thread)
+        server.search_thread.daemon = True
+        server.search_thread.start()
+        return jsonify({"status": "started", "message": "Tag search started."})
+
+@app.route('/api/navigate_to_tag', methods=['POST'])
+def api_navigate_to_tag():
+    data = request.json or {}
+    tag_name = data.get('tag_name', '').strip()
+    if not tag_name or tag_name not in server.tag_true_poses:
+        return jsonify({"status": "error", "message": f"Invalid tag name: {tag_name}"}), 400
+        
+    success = server.start_navigation_to_tag(tag_name)
+    if success:
+        return jsonify({"status": "ok", "message": f"Navigating to landmark {tag_name}..."})
+    else:
+        return jsonify({"status": "error", "message": "Failed to start navigation."}), 500
 
 @app.route('/api/delivery/send', methods=['POST'])
 def delivery_send():

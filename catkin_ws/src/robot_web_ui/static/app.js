@@ -38,6 +38,32 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // Emergency Stop Handler
+    const btnEstop = document.getElementById('btn-estop');
+    if (btnEstop) {
+        btnEstop.addEventListener('click', async () => {
+            logConsole("EMERGENCY STOP TRIGGERED!");
+            try {
+                const res = await fetch('/api/stop', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await res.json();
+                logConsole(`System: ${data.message}`);
+                
+                // Visual feedback
+                document.body.style.boxShadow = "inset 0 0 100px rgba(239, 68, 68, 0.5)";
+                setTimeout(() => {
+                    document.body.style.boxShadow = "none";
+                }, 1000);
+
+            } catch (error) {
+                console.error("Failed to trigger emergency stop", error);
+                logConsole("CRITICAL ERROR: Failed to send stop command!");
+            }
+        });
+    }
+
     // Three-Position Tabs Slider Handler
     const tabBtns = document.querySelectorAll('.tab-btn');
     const tabPanels = document.querySelectorAll('.tab-panel');
@@ -492,6 +518,20 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
+    const updateLogs = async () => {
+        try {
+            const response = await fetch('/api/logs');
+            const data = await response.json();
+            if (data.logs && data.logs.length > 0) {
+                data.logs.forEach(log => {
+                    logConsole(log);
+                });
+            }
+        } catch (error) {
+            console.error("Failed to fetch logs", error);
+        }
+    };
+
     const updateLegend = async () => {
         try {
             const res = await fetch('/api/semantic_map');
@@ -565,6 +605,8 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Poll status every 500ms
     setInterval(updateTelemetry, 500);
+    // Poll logs every 500ms
+    setInterval(updateLogs, 500);
     // Poll semantic map legend every 1000ms
     setInterval(updateLegend, 1000);
 });

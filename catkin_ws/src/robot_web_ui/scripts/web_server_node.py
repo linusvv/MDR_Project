@@ -11,8 +11,9 @@ import math
 from flask import Flask, render_template, Response, request, jsonify
 from sensor_msgs.msg import Image, CameraInfo, PointCloud2
 import sensor_msgs.point_cloud2 as pc2
-from geometry_msgs.msg import Twist, PointStamped, PoseStamped
+from geometry_msgs.msg import Twist, PointStamped, PoseStamped, Quaternion
 from nav_msgs.msg import OccupancyGrid, Path
+from rosgraph_msgs.msg import Log
 from cv_bridge import CvBridge
 import tf
 import tf.transformations
@@ -57,6 +58,7 @@ class RobotWebServer:
         self.searching_tag = False
         self.search_thread = None
         self.navigating_to_tag = False
+        self.planner_logs = []
         
         # Set default parameter: Local AI mode active on startup
         rospy.set_param("/use_local_ai", True)
@@ -82,11 +84,33 @@ class RobotWebServer:
         rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.map_cb)
         rospy.Subscriber('/semantic_observations', String, self.semantic_cb)
         rospy.Subscriber('/points/selected_motion', PointCloud2, self.motion_cb)
+        rospy.Subscriber('/rosout', Log, self.rosout_cb)
         
         if AprilTagDetectionArray is not None:
             rospy.Subscriber('/tag_detections', AprilTagDetectionArray, self.tags_cb)
 
         rospy.loginfo("Web Server Node initialized.")
+
+    def stop_robot(self):
+        """Immediately stops all autonomous navigation and the robot movement."""
+        with self.lock:
+            self.searching_tag = False
+            self.navigating_to_tag = False
+        
+        # 1. Stop the global/graph planner
+        rospy.set_param("/exploration_state", "IDLE")
+        
+        # 2. Clear current path to stop local C++ planner
+        empty_path = Path()
+        empty_path.header.frame_id = "map"
+        empty_path.header.stamp = rospy.Time.now()
+        self.path_pub.publish(empty_path)
+        
+        # 3. Publish zero velocity
+        stop_cmd = Twist()
+        self.cmd_vel_pub.publish(stop_cmd)
+        
+        rospy.logwarn("[EMERGENCY STOP] Robot and planners stopped.")
 
     def color_cb(self, msg):
         try:
@@ -135,8 +159,16 @@ class RobotWebServer:
             for detection in msg.detections:
                 if not detection.id:
                     continue
+                
+                # Determine the TF frame name for this detection
+                # If it's a bundle, use the bundle name. Otherwise use tag_ID.
+                ids_tuple = tuple(sorted(detection.id))
+                if ids_tuple in self.bundles:
+                    tag_frame = self.bundles[ids_tuple]['name']
+                else:
+                    tag_frame = f"tag_{detection.id[0]}"
+                
                 tag_id = detection.id[0]
-                tag_frame = f"tag_{tag_id}"
                 
                 # 1. First try to look up the tag's TF frame directly in odom
                 if self.tf_listener.canTransform('odom', tag_frame, rospy.Time(0)):
@@ -177,6 +209,16 @@ class RobotWebServer:
         with self.lock:
             self.selected_motion_pts = pts
             self.selected_motion_frame = msg.header.frame_id
+
+    def rosout_cb(self, msg):
+        """Filters logs to only keep those from the motion planner."""
+        # The node name in launch is /control_space_planner_node
+        if msg.name == "/control_space_planner_node":
+            with self.lock:
+                self.planner_logs.append(msg.msg)
+                # Keep only last 50 logs to avoid memory bloat
+                if len(self.planner_logs) > 50:
+                    self.planner_logs.pop(0)
 
     def draw_path(self, cv_image):
         if not self.selected_motion_pts or self.camera_info is None:
@@ -356,16 +398,28 @@ class RobotWebServer:
         
         # Get tag pose
         pose_info = self.tag_true_poses[tag_name]
-        tag_x = pose_info[0]
-        tag_y = pose_info[1]
+        tag_pt = np.array([pose_info[0], pose_info[1]])
         psi_deg = pose_info[2]
         psi_rad = math.radians(psi_deg)
         
+        # Transform true pose to SLAM map coordinates
+        with self.lock:
+            R = self.R
+            T = self.T
+        
+        tag_map = np.dot(R, tag_pt) + T
+        tag_x, tag_y = tag_map[0], tag_map[1]
+        
+        # Transform heading (psi) to map coordinates
+        # Map heading = True heading + rotation angle from R
+        rot_angle = math.atan2(R[1, 0], R[0, 0])
+        psi_rad_map = psi_rad + rot_angle
+        
         # Offset to stop in front of tag (0.8 meters)
         offset = 0.8
-        gx = tag_x + offset * math.cos(psi_rad)
-        gy = tag_y + offset * math.sin(psi_rad)
-        gyaw = math.atan2(-math.sin(psi_rad), -math.cos(psi_rad)) # Point at the tag (face opposite to normal)
+        gx = tag_x + offset * math.cos(psi_rad_map)
+        gy = tag_y + offset * math.sin(psi_rad_map)
+        gyaw = math.atan2(-math.sin(psi_rad_map), -math.cos(psi_rad_map)) # Point at the tag (face opposite to normal)
         
         rospy.loginfo(f"[Tag Nav] Target Pose in Map: ({gx:.2f}, {gy:.2f}, heading: {math.degrees(gyaw):.1f}°)")
         
@@ -975,6 +1029,13 @@ def video_map():
 def api_status():
     is_paused = rospy.get_param("/exploration_paused", False)
     explore_state = rospy.get_param("/exploration_state", "IDLE")
+
+@app.route('/api/logs')
+def api_logs():
+    with server.lock:
+        logs = list(server.planner_logs)
+        server.planner_logs = []
+    return jsonify({"logs": logs})
     
     # Map raw state to simple status string for UI highlighting: 'play', 'pause', or 'stop'
     status_str = "stop"
@@ -1046,7 +1107,7 @@ def api_detect():
 def api_find_tag():
     if server.searching_tag:
         server.searching_tag = False
-        server.stop_search()
+        server.stop_robot()
         return jsonify({"status": "cancelled", "message": "Tag search cancelled."})
     else:
         server.searching_tag = True
@@ -1054,6 +1115,11 @@ def api_find_tag():
         server.search_thread.daemon = True
         server.search_thread.start()
         return jsonify({"status": "started", "message": "Tag search started."})
+
+@app.route('/api/stop', methods=['POST'])
+def api_stop():
+    server.stop_robot()
+    return jsonify({"status": "success", "message": "Emergency Stop Triggered!"})
 
 @app.route('/api/navigate_to_tag', methods=['POST'])
 def api_navigate_to_tag():

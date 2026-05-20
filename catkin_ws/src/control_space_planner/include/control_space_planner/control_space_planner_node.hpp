@@ -150,7 +150,7 @@ class MotionPlanner
     double MAX_SENSOR_RANGE = 10.0; // [m] maximum sensor range (realsense)
     double WHEELBASE = 0.1; // [m] wheelbase of the vehicle (our RC vehicle is near 0.26 m)
     double DIST_RESOL = 0.1; // [m] distance resolution for control space sampling
-    double TIME_RESOL = 0.2; // [sec] time resolution between each motion (for rollout)
+    double TIME_RESOL = 0.05; // [sec] time resolution between each motion (for rollout)
     double MOTION_VEL = DIST_RESOL / TIME_RESOL; // [m/s] velocity between each motion (for rollout)
     double DELTA_RESOL = 0.2 * (M_PI / 180.0); // [rad] angle resolution for control space sampling
     double MAX_DELTA = 45.0 * (M_PI / 180.0); // [rad] maximum angle for control space sampling
@@ -159,12 +159,12 @@ class MotionPlanner
     double ARRIVAL_THRES = 1.0; // [m] distance threshold for arrival
 
     // - cost weights
-    double W_COST_DIRECTION      = 2.0; // -- decreased heavily to allow the robot to freely turn away from walls
-    double W_COST_TRAVERSABILITY = 40.0; // -- heavily increased to force wide turns away from walls
+    double W_COST_DIRECTION      = 15.0; // -- increased so it strongly prefers following the path direction
+    double W_COST_TRAVERSABILITY = 10.0; // -- online cost
     
     // - collision checking
-    double INFLATION_SIZE = 0.3 / mapResol; // [grid] Tuned to 0.3m for narrow corridor navigation without blocking
-    double LOOKAHEAD_DIST = 0.85; // [m] Increased to look further ahead for dynamic obstacles
+    double INFLATION_SIZE = 0.5 / mapResol; // [grid] inflation size [m] / grid_res [m/grid]. Reduced to allow narrow gaps.
+    double LOOKAHEAD_DIST = 0.7; // [m] lookahead distance for collision cheking
 
     // Motion primitives
     std::vector<std::vector<Node>> motionCandidates;

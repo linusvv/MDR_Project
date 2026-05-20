@@ -46,6 +46,47 @@ html, body {
     gap: 1.5rem;
 }
 
+/* Emergency Stop Button Styling */
+.estop-btn {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    background: #ef4444;
+    color: white;
+    border: none;
+    padding: 0.5rem 1.2rem;
+    border-radius: 6px;
+    font-weight: 700;
+    font-size: 0.9rem;
+    cursor: pointer;
+    box-shadow: 0 4px 12px rgba(239, 68, 68, 0.3);
+    transition: all 0.2s;
+    animation: pulse-red 2s infinite;
+}
+
+.estop-btn:hover {
+    background: #dc2626;
+    transform: translateY(-1px);
+    box-shadow: 0 6px 16px rgba(239, 68, 68, 0.4);
+}
+
+.estop-btn:active {
+    transform: translateY(1px);
+    box-shadow: 0 2px 4px rgba(239, 68, 68, 0.2);
+}
+
+@keyframes pulse-red {
+    0% {
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.4);
+    }
+    70% {
+        box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+    }
+    100% {
+        box-shadow: 0 0 0 0 rgba(239, 68, 68, 0);
+    }
+}
+
 .layout-control-container {
     display: flex;
     align-items: center;

@@ -111,11 +111,8 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
 
   geometry_msgs::Twist command;
   if (motionMinCost.empty()) {
-      // RECOVERY BEHAVIOR: 
-      // If we are completely blocked by a wall, back up slowly and rotate quickly
-      // to clear the obstacle and find an alternative open corridor.
-      command.angular.z = 1.5; 
-      command.linear.x = -0.2; 
+      command.angular.z = 0.0;
+      command.linear.x = 0.0;
       command.linear.y = 0.0;
       pubCommand.publish(command);
       return;
@@ -138,24 +135,9 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
     double trueDistToGoal = sqrt(pow(final_gx - this->ego_x, 2) + pow(final_gy - this->ego_y, 2));
 
     if (trueDistToGoal < this->ARRIVAL_THRES) {
+      command.angular.z = 0.0;
       command.linear.x = 0.0;
       command.linear.y = 0.0;
-      
-      // Rotate in place to align with final goal orientation
-      double final_gyaw;
-      tf2::Quaternion final_goal_quat;
-      double roll, pitch;
-      tf2::convert(this->globalPath.poses.back().pose.orientation, final_goal_quat);
-      tf2::Matrix3x3(final_goal_quat).getRPY(roll, pitch, final_gyaw);
-      
-      double yaw_diff = final_gyaw - this->ego_yaw;
-      yaw_diff = atan2(sin(yaw_diff), cos(yaw_diff)); // normalize to [-pi, pi]
-      
-      if (abs(yaw_diff) > 0.08) {
-          command.angular.z = (yaw_diff > 0 ? 1.0 : -1.0) * std::max(0.3, std::min(1.0, abs(yaw_diff) * 1.5));
-      } else {
-          command.angular.z = 0.0;
-      }
     }
     else if (trueDistToGoal < 2.0 * this->ARRIVAL_THRES) {
       double scale = pow(trueDistToGoal / (2.0 * this->ARRIVAL_THRES), 3.0);
@@ -242,28 +224,6 @@ void MotionPlanner::Plan()
     goalNode.yaw = this->goal_yaw;
     localNode = GlobalToLocalCoordinate(goalNode, this->egoOdom);
     
-    // Rotate in place first if target is behind or to the side (angle > 1.2 rad / 70 deg)
-    double final_gx = this->globalPath.poses.back().pose.position.x;
-    double final_gy = this->globalPath.poses.back().pose.position.y;
-    double trueDistToGoal = sqrt(pow(final_gx - this->ego_x, 2) + pow(final_gy - this->ego_y, 2));
-    if (trueDistToGoal >= this->ARRIVAL_THRES) {
-      double target_angle = atan2(localNode.y, localNode.x);
-      if (abs(target_angle) > 1.2) {
-        geometry_msgs::Twist command;
-        command.linear.x = 0.0;
-        command.linear.y = 0.0;
-        command.angular.z = (target_angle > 0 ? 1.0 : -1.0) * std::max(0.4, std::min(1.2, abs(target_angle) * 1.5));
-        pubCommand.publish(command);
-        
-        // Publish empty selected motion to clear visualization
-        sensor_msgs::PointCloud2 emptyCloud;
-        emptyCloud.header.frame_id = this->frame_id;
-        emptyCloud.header.stamp = ros::Time::now();
-        pubSelectedMotion.publish(emptyCloud);
-        return; // Exit planning early
-      }
-    }
-
     // - compute truncated local node pose within local map
     Node tmpLocalNode;
     memcpy(&tmpLocalNode, &localNode, sizeof(struct Node));
@@ -385,6 +345,10 @@ std::vector<Node> MotionPlanner::RolloutMotion(Node startNode,
       Node collisionPointNode(currMotionNode.x, currMotionNode.y, currMotionNode.z, currMotionNode.yaw, currMotionNode.delta, 0, 0, 0, -1, false);
       Node collisionPointNodeMap = LocalToPlannerCorrdinate(collisionPointNode);
       if (CheckCollision(collisionPointNodeMap, localMap)) {
+        if (motionPrimitive.empty()) {
+          // Ensure we return at least one node to avoid complete array-size crashes and maintain a crawl speed
+          motionPrimitive.push_back(currMotionNode);
+        }
         return motionPrimitive;
       }
 
@@ -434,8 +398,7 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
   if (motionPrimitives.size() != 0) {
     // Iterate all motion primitive (motionPrimitive) in motionPrimitives
     for (auto& motionPrimitive : motionPrimitives) {
-      // Reject any primitives with imminent collisions (collision within 4 nodes / 40cm)
-      if (motionPrimitive.size() < 4) continue;
+      if (motionPrimitive.empty()) continue;
       
       //!1. Calculate cost terms
       double end_x = motionPrimitive.back().x;
@@ -455,16 +418,16 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
       double expected_size = this->MAX_PROGRESS / this->DIST_RESOL;
       double cost_collision_penalty = 0.0;
       if (motionPrimitive.size() < expected_size - 1) {
-          cost_collision_penalty = 10.0 + (expected_size - motionPrimitive.size()) * 500.0; // Heavily penalize any collision to prioritize safety
+          cost_collision_penalty = (expected_size - motionPrimitive.size()) * 2.0; // Scaled down so it doesn't flee entirely backward in panic!
       }
       
       // Extremely heavily penalize primitives that just aim backward (driving away from goal) to survive
+      double cost_total = this->W_COST_TRAVERSABILITY * cost_dist + this->W_COST_DIRECTION * cost_direction + cost_collision_penalty;
+      
       if (cost_direction > M_PI / 1.5) {
-          cost_collision_penalty += 2000.0;
+          cost_total += 5000.0;
       }
 
-      //! 2. Calculate total cost
-      double cost_total = this->W_COST_TRAVERSABILITY * cost_dist + this->W_COST_DIRECTION * cost_direction + cost_collision_penalty;
       motionPrimitive.back().cost_total = cost_total;
 
       //! 3. Compare & Find minimum cost & minimum cost motion
@@ -508,13 +471,14 @@ bool MotionPlanner::CheckCollision(Node goalNodePlanner, nav_msgs::OccupancyGrid
 
   for (int i = 0; i < inflation_size; ++i) {
     for (int j = 0; j < inflation_size; ++j) {
-      double tmp_x = goalNodePlanner.x + i - 0.5 * inflation_size;
-      double tmp_y = goalNodePlanner.y + j - 0.5 * inflation_size;
+      // The grid coordinates are integer-based. We should iterate grid indices directly.
+      int tmp_x = static_cast<int>(goalNodePlanner.x + i - 0.5 * inflation_size);
+      int tmp_y = static_cast<int>(goalNodePlanner.y + j - 0.5 * inflation_size);
       
       if (tmp_x >= 0 && tmp_x < map_width && tmp_y >= 0 && tmp_y < map_height) {
-        int map_index = static_cast<int>(tmp_y) * map_width + static_cast<int>(tmp_x);
+        int map_index = tmp_y * map_width + tmp_x;
         int16_t map_value = static_cast<int16_t>(localMap.data[map_index]);
-        if (map_value > this->OCCUPANCY_THRES || map_value < 0) {
+        if (map_value > this->OCCUPANCY_THRES) {
           return true;
         }
       }

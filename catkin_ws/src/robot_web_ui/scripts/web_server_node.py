@@ -54,6 +54,8 @@ class RobotWebServer:
         self.shop_categories = {}
         self.local_costmap = None
         self.motion_candidates = []
+        self.selected_motion_pts = []
+        self.trunc_target = None
         self.planner_logs = []
         self.R = np.eye(2)
         self.T = np.array([0.0, -3.125])
@@ -61,7 +63,6 @@ class RobotWebServer:
         self.searching_tag = False
         self.search_thread = None
         self.navigating_to_tag = False
-        self.planner_logs = []
         
         # Set default parameter: Local AI mode active on startup
         rospy.set_param("/use_local_ai", True)
@@ -89,6 +90,7 @@ class RobotWebServer:
         rospy.Subscriber('/semantic_observations', String, self.semantic_cb)
         rospy.Subscriber('/points/selected_motion', PointCloud2, self.motion_cb)
         rospy.Subscriber('/points/motion_primitives', PointCloud2, self.motion_candidates_cb)
+        rospy.Subscriber('/car/trunc_target', PoseStamped, self.target_cb)
         rospy.Subscriber('/rosout', Log, self.rosout_cb)
         
         if AprilTagDetectionArray is not None:
@@ -181,7 +183,7 @@ class RobotWebServer:
                 if self.tf_listener.canTransform('odom', tag_frame, rospy.Time(0)):
                     try:
                         (trans, rot) = self.tf_listener.lookupTransform('odom', tag_frame, rospy.Time(0))
-                        self.detected_tags[tag_id] = (trans[0], trans[1])
+                        self.detected_tags[tag_id] = (trans, rot)
                         continue
                     except Exception:
                         pass
@@ -202,10 +204,10 @@ class RobotWebServer:
                         T_cam_tag[:3, 3] = [p.x, p.y, p.z]
                         
                         T_odom_tag = np.dot(T_odom_cam, T_cam_tag)
-                        tx = T_odom_tag[0, 3]
-                        ty = T_odom_tag[1, 3]
+                        trans_ot = T_odom_tag[:3, 3]
+                        rot_ot = tf.transformations.quaternion_from_matrix(T_odom_tag)
                         
-                        self.detected_tags[tag_id] = (tx, ty)
+                        self.detected_tags[tag_id] = (trans_ot, rot_ot)
                     except Exception:
                         pass
 
@@ -238,6 +240,10 @@ class RobotWebServer:
         with self.lock:
             self.motion_candidates = candidates
 
+    def target_cb(self, msg):
+        with self.lock:
+            self.trunc_target = (msg.pose.position.x, msg.pose.position.y)
+
     def rosout_cb(self, msg):
         """Filters logs to only keep those from the motion planner and related safety services."""
         # Relevant nodes for navigation safety
@@ -245,7 +251,10 @@ class RobotWebServer:
             "/control_space_planner_node", 
             "/heightmap_costmap_node",
             "/heightmap_node",
-            "/agent_node"
+            "/agent_node",
+            "/control_space_planner_python",
+            "/teb_planner_node",
+            "/custom_vector_planner"
         ]
         if msg.name in relevant_nodes:
             with self.lock:
@@ -451,25 +460,16 @@ class RobotWebServer:
         rot_angle = math.atan2(R[1, 0], R[0, 0])
         psi_rad_map = psi_rad + rot_angle
         
-        # Offset to stop in front of tag (0.8 meters)
-        offset = 0.8
-        gx = tag_x + offset * math.cos(psi_rad_map)
-        gy = tag_y + offset * math.sin(psi_rad_map)
-        gyaw = math.atan2(-math.sin(psi_rad_map), -math.cos(psi_rad_map)) # Point at the tag (face opposite to normal)
+        # Go directly to signboard position (no offset)
+        offset = 0.0
+        gx = tag_x
+        gy = tag_y
+        gyaw = psi_rad_map
         
         rospy.loginfo(f"[Tag Nav] Target Pose in Map: ({gx:.2f}, {gy:.2f}, heading: {math.degrees(gyaw):.1f}°)")
         
         rate = rospy.Rate(10)
-        
-        # Track position for progress check
-        rx, ry, _ = self.get_current_robot_pose()
-        last_progress_x = rx
-        last_progress_y = ry
-        last_progress_time = rospy.Time.now()
         start_time = rospy.Time.now()
-        
-        use_waypoint = False
-        recovery_waypoint = None
         
         while not rospy.is_shutdown() and self.navigating_to_tag:
             rx, ry, ryaw = self.get_current_robot_pose()
@@ -480,22 +480,11 @@ class RobotWebServer:
             # Distance to the target position
             dist = math.hypot(rx - gx, ry - gy)
             
-            # Check if arrived at position
-            if dist < 0.9:
-                # Arrived at position! Wait a bit for alignment
-                rospy.loginfo("[Tag Nav] Arrived at target position. Waiting for alignment...")
-                rospy.sleep(3.0)
-                rospy.loginfo("[Tag Nav] Navigation and alignment completed successfully.")
+            # Check if arrived at position (under signboard)
+            if dist < 0.5:
+                rospy.loginfo("[Tag Nav] Arrived at target signboard position successfully.")
                 break
                 
-            # If we are close to the waypoint, clear it to resume direct path to goal
-            if use_waypoint and recovery_waypoint is not None:
-                dist_to_wp = math.hypot(rx - recovery_waypoint[0], ry - recovery_waypoint[1])
-                if dist_to_wp < 0.6:
-                    rospy.loginfo("[Tag Nav] Arrived at recovery waypoint. Clearing waypoint.")
-                    use_waypoint = False
-                    recovery_waypoint = None
-                    
             # Publish path to goal
             path = Path()
             path.header.frame_id = "map"
@@ -507,24 +496,11 @@ class RobotWebServer:
             p0.pose.position.y = ry
             
             # Orientation facing next point
-            if use_waypoint and recovery_waypoint is not None:
-                target_x, target_y = recovery_waypoint
-            else:
-                target_x, target_y = gx, gy
-            angle_to_next = math.atan2(target_y - ry, target_x - rx)
+            angle_to_next = math.atan2(gy - ry, gx - rx)
             q0 = tf.transformations.quaternion_from_euler(0, 0, angle_to_next)
             p0.pose.orientation = Quaternion(*q0)
             path.poses.append(p0)
             
-            if use_waypoint and recovery_waypoint is not None:
-                p_wp = PoseStamped()
-                p_wp.header.frame_id = "map"
-                p_wp.pose.position.x = recovery_waypoint[0]
-                p_wp.pose.position.y = recovery_waypoint[1]
-                q_wp = tf.transformations.quaternion_from_euler(0, 0, angle_to_next)
-                p_wp.pose.orientation = Quaternion(*q_wp)
-                path.poses.append(p_wp)
-                
             p1 = PoseStamped()
             p1.header.frame_id = "map"
             p1.pose.position.x = gx
@@ -535,64 +511,7 @@ class RobotWebServer:
             
             self.path_pub.publish(path)
             
-            # Progress check (stuck detection)
             now = rospy.Time.now()
-            if (now - last_progress_time).to_sec() >= 1.0:
-                dist_moved = math.hypot(rx - last_progress_x, ry - last_progress_y)
-                if dist_moved >= 0.08:
-                    last_progress_x = rx
-                    last_progress_y = ry
-                    last_progress_time = now
-                elif (now - last_progress_time).to_sec() > 3.0:
-                    rospy.logwarn("[Tag Nav] Stuck/No progress made for 3 seconds. Initiating recovery sequence...")
-                    
-                    # 1. Disable C++ planner by setting state to RECOVERY
-                    rospy.set_param("/exploration_state", "RECOVERY")
-                    
-                    # 2. Go backwards for 0.5 seconds
-                    backup_end = rospy.Time.now() + rospy.Duration(0.5)
-                    while rospy.Time.now() < backup_end and not rospy.is_shutdown() and self.navigating_to_tag:
-                        twist = Twist()
-                        twist.linear.x = -0.15
-                        twist.angular.z = 0.0
-                        self.cmd_vel_pub.publish(twist)
-                        rospy.sleep(0.05)
-                        
-                    # Stop backup
-                    self.cmd_vel_pub.publish(Twist())
-                    
-                    # 3. Spin in place (turn)
-                    import random
-                    spin_dir = 0.6 if random.random() < 0.5 else -0.6
-                    spin_end = rospy.Time.now() + rospy.Duration(1.5)
-                    while rospy.Time.now() < spin_end and not rospy.is_shutdown() and self.navigating_to_tag:
-                        twist = Twist()
-                        twist.linear.x = 0.0
-                        twist.angular.z = spin_dir
-                        self.cmd_vel_pub.publish(twist)
-                        rospy.sleep(0.05)
-                        
-                    # Stop spin
-                    self.cmd_vel_pub.publish(Twist())
-                    
-                    # Get new pose after spin
-                    rx, ry, ryaw = self.get_current_robot_pose()
-                    
-                    # 4. Try a different way: set a waypoint 1.5m ahead of the new yaw
-                    waypoint_x = rx + 1.5 * math.cos(ryaw)
-                    waypoint_y = ry + 1.5 * math.sin(ryaw)
-                    recovery_waypoint = (waypoint_x, waypoint_y)
-                    use_waypoint = True
-                    rospy.loginfo(f"[Tag Nav] Set recovery waypoint at ({waypoint_x:.2f}, {waypoint_y:.2f})")
-                    
-                    # 5. Re-enable C++ planner
-                    rospy.set_param("/exploration_state", "EXPLORE")
-                    
-                    # Reset progress tracker
-                    last_progress_x = rx
-                    last_progress_y = ry
-                    last_progress_time = rospy.Time.now()
-                    
             if (now - start_time).to_sec() > 120.0:
                 rospy.logwarn("[Tag Nav] Navigation timeout (120 seconds).")
                 break
@@ -910,7 +829,7 @@ class RobotWebServer:
                 rospy.logwarn(f"Failed to load stores in Web UI: {e}")
 
     def load_tag_true_poses(self):
-        active_yaml = "/home/linusv/project_5/catkin_ws/src/AprilTagLocalization/config/2025/re540_n1_room111.yaml"
+        active_yaml = "/home/linusv/project_5/catkin_ws/src/AprilTagLocalization/config/2025/re540_simulation.yaml"
         self.tag_true_poses = {}
         if os.path.exists(active_yaml):
             try:
@@ -927,14 +846,23 @@ class RobotWebServer:
             except Exception as e:
                 rospy.logwarn(f"Failed to load true poses: {e}")
 
-    def estimate_rigid_transform_2d(self, pts_true, pts_meas):
+    def estimate_rigid_transform_2d(self, pts_true, pts_meas, true_yaws=None, meas_yaws=None):
         n = len(pts_true)
         if n == 0:
             return self.R, self.T
         elif n == 1:
-            tx = pts_meas[0][0] - pts_true[0][0]
-            ty = pts_meas[0][1] - pts_true[0][1]
-            return np.eye(2), np.array([tx, ty])
+            if true_yaws is not None and meas_yaws is not None and len(true_yaws) > 0 and len(meas_yaws) > 0:
+                theta = meas_yaws[0] - true_yaws[0]
+                R = np.array([
+                    [np.cos(theta), -np.sin(theta)],
+                    [np.sin(theta),  np.cos(theta)]
+                ])
+                T = np.array(pts_meas[0]) - np.dot(R, np.array(pts_true[0]))
+                return R, T
+            else:
+                tx = pts_meas[0][0] - pts_true[0][0]
+                ty = pts_meas[0][1] - pts_true[0][1]
+                return np.eye(2), np.array([tx, ty])
             
         pts_true = np.array(pts_true)
         pts_meas = np.array(pts_meas)
@@ -1026,10 +954,11 @@ class RobotWebServer:
                                 cv2.arrowedLine(color_map, (r_col, r_row_flipped), (arrow_end_x, arrow_end_y), (255, 255, 255), 2, tipLength=0.3)
                         except Exception:
                             pass
-                        
-                    # Build matched point sets for 2D rigid transform estimation
+                                            # Build matched point sets for 2D rigid transform estimation
                     pts_true = []
                     pts_meas = []
+                    true_yaws = []
+                    meas_yaws = []
                     
                     # Try to lookup transform map -> odom
                     if self.tf_listener.canTransform('map', 'odom', rospy.Time(0)):
@@ -1049,31 +978,49 @@ class RobotWebServer:
                                 signboard_name = bundle['name']
                                 break
                         if signboard_name and signboard_name in self.tag_true_poses:
-                            # Transform tag_pose_odom from odom to map
-                            pt_odom = np.array([tag_pose_odom[0], tag_pose_odom[1], 0.0, 1.0])
-                            pt_map = np.dot(T_map_odom, pt_odom)
+                            # Get true pose position and yaw
+                            x_true, y_true, psi_deg = self.tag_true_poses[signboard_name]
+                            pts_true.append((x_true, y_true))
                             
-                            pts_true.append((self.tag_true_poses[signboard_name][0], self.tag_true_poses[signboard_name][1]))
-                            pts_meas.append((pt_map[0], pt_map[1]))
+                            # True yaw in world frame including orientation correction
+                            q_x90 = tf.transformations.quaternion_about_axis(math.radians(90), [0, 1, 0])
+                            q_y_90 = tf.transformations.quaternion_about_axis(math.radians(-90), [1, 0, 0])
+                            q_correction = tf.transformations.quaternion_multiply(q_x90, q_y_90)
+                            q_heading = tf.transformations.quaternion_about_axis(math.radians(psi_deg), [0, 0, 1])
+                            q_true = tf.transformations.quaternion_multiply(q_heading, q_correction)
+                            yaw_true = tf.transformations.euler_from_quaternion(q_true)[2]
+                            true_yaws.append(yaw_true)
                             
-                    # Estimate the transform from ground-truth/world coordinates to current SLAM map coordinates
-                    R, T = self.estimate_rigid_transform_2d(pts_true, pts_meas)
-                    with self.lock:
-                        self.R = R
-                        self.T = T
-                        
-                    if not hasattr(self, 'last_transform_log_time'):
-                        self.last_transform_log_time = 0.0
-                    now_sec = rospy.Time.now().to_sec()
-                    if now_sec - self.last_transform_log_time > 5.0:
-                        rospy.loginfo(f"[RIGID TRANSFORM] Match count: {len(pts_true)}, T: {T.tolist()}")
-                        self.last_transform_log_time = now_sec
+                            # Measured pose position and yaw in map frame
+                            tag_trans_odom, tag_rot_odom = tag_pose_odom
+                            
+                            # T_odom_tag
+                            T_odom_tag = tf.transformations.quaternion_matrix(tag_rot_odom)
+                            T_odom_tag[:3, 3] = tag_trans_odom
+                            
+                            # T_map_tag = T_map_odom * T_odom_tag
+                            T_map_tag = np.dot(T_map_odom, T_odom_tag)
+                            
+                            pt_map_x = T_map_tag[0, 3]
+                            pt_map_y = T_map_tag[1, 3]
+                            pts_meas.append((pt_map_x, pt_map_y))
+                            
+                            q_meas = tf.transformations.quaternion_from_matrix(T_map_tag)
+                            yaw_meas = tf.transformations.euler_from_quaternion(q_meas)[2]
+                            meas_yaws.append(yaw_meas)
+                            
+                    # Dynamic rigid transform estimation removed for simulation alignment consistency.
+                    # R, T = self.estimate_rigid_transform_2d(pts_true, pts_meas, true_yaws, meas_yaws)
+                    # with self.lock:
+                    #     self.R = R
+                    #     self.T = T
                     
-
+ 
                                         
                     # Draw persistently detected AprilTags
                     for tag_id, tag_pose_odom in self.detected_tags.items():
-                        pt_odom = np.array([tag_pose_odom[0], tag_pose_odom[1], 0.0, 1.0])
+                        tag_trans_odom, tag_rot_odom = tag_pose_odom
+                        pt_odom = np.array([tag_trans_odom[0], tag_trans_odom[1], 0.0, 1.0])
                         pt_map = np.dot(T_map_odom, pt_odom)
                         
                         t_col = int((pt_map[0] - origin.position.x) / resolution)
@@ -1086,6 +1033,25 @@ class RobotWebServer:
                             cv2.rectangle(color_map, (t_col - 5, t_row_flipped - 5), (t_col + 5, t_row_flipped + 5), (255, 255, 255), 1)
                             cv2.putText(color_map, f"T{tag_id}", (t_col + 8, t_row_flipped + 4), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
+
+                    # Draw shops on the SLAM map
+                    for idx, store in enumerate(self.stores):
+                        s_x, s_y = self.project_store_to_map(store)
+                        s_col = int((s_x - origin.position.x) / resolution)
+                        s_row = int((s_y - origin.position.y) / resolution)
+                        s_row_flipped = height - 1 - s_row
+                        
+                        if 0 <= s_col < width and 0 <= s_row_flipped < height:
+                            is_mapped = idx in self.shop_categories
+                            color = (128, 0, 128) if is_mapped else (255, 255, 0) # Purple if mapped, Cyan if unmapped (BGR)
+                            cv2.circle(color_map, (s_col, s_row_flipped), 6, color, -1)
+                            cv2.circle(color_map, (s_col, s_row_flipped), 6, (255, 255, 255), 1)
+                            
+                            label = f"S{idx+1}"
+                            if is_mapped:
+                                label += f": {self.shop_categories[idx]['storefront'][:3]}"
+                            cv2.putText(color_map, label, (s_col + 8, s_row_flipped + 4), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
                                         
                     # Calculate explored area in square meters
                     explored_cells = np.sum((data == 0) | ((data > 0) & (data <= 100)))
@@ -1177,20 +1143,30 @@ class RobotWebServer:
                     pt2 = (int((p2[0] - origin.position.x) / res), height - 1 - int((p2[1] - origin.position.y) / res))
                     cv2.line(viz, pt1, pt2, (255, 255, 0), 2)
                 
+                # Draw local target (Large Yellow Cross)
+                with self.lock:
+                    target = self.trunc_target
+                if target:
+                    tx, ty = target
+                    t_col = int((tx - origin.position.x) / res)
+                    t_row = height - 1 - int((ty - origin.position.y) / res)
+                    if 0 <= t_col < width and 0 <= t_row < height:
+                        cv2.drawMarker(viz, (t_col, t_row), (0, 255, 255), cv2.MARKER_CROSS, 8, 2)
+                        cv2.putText(viz, "GOAL", (t_col + 5, t_row - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+
                 # Draw robot at frame center (0,0 local)
                 r_col = int((0 - origin.position.x) / res)
                 r_row = height - 1 - int((0 - origin.position.y) / res)
-                cv2.circle(viz, (r_col, r_row), 3, (0, 0, 255), -1)
+                cv2.circle(viz, (r_col, r_row), 4, (0, 0, 255), -1)
+                cv2.circle(viz, (r_col, r_row), 4, (255, 255, 255), 1)
                 
                 canvas = viz
             
             if canvas is not None:
                 # Resize and Zoom: Original is usually 200x200 (20m @ 0.1m res). 
-                # We crop the center (robot at origin) and resize to zoom in by factor 2
                 h, w = canvas.shape[:2]
-                ch, cw = h // 4, w // 4 # One quarter of the area is factor 2 zoom
+                ch, cw = h // 4, w // 4 
                 
-                # Find robot position in pixels to center the zoom
                 r_col = int((0 - origin.position.x) / res)
                 r_row = h - 1 - int((0 - origin.position.y) / res)
                 
@@ -1201,6 +1177,16 @@ class RobotWebServer:
                 
                 canvas_zoomed = canvas[y1:y2, x1:x2]
                 disp = cv2.resize(canvas_zoomed, (400, 400), interpolation=cv2.INTER_NEAREST)
+                
+                # Add status text overlay
+                cv2.putText(disp, f"Planner: {rospy.get_param('/local_planner_type', 'control_space')}", (10, 20), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+                if selected:
+                    # heuristic to get velocity from selected path length
+                    path_len = sum([np.hypot(selected[i][0]-selected[i-1][0], selected[i][1]-selected[i-1][1]) for i in range(1, len(selected))])
+                    cv2.putText(disp, f"Moving Path: {path_len:.1f}m", (10, 40), 
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1)
+
                 ret, buffer = cv2.imencode('.jpg', disp)
                 if ret:
                     yield (b'--frame\r\n'
@@ -1264,6 +1250,8 @@ def api_status():
               bool(os.getenv("OPENAI_API_KEY")) or \
               os.path.exists("/home/linusv/project_5/HW4/ChatGPT_API_KEY.txt")
 
+    local_planner = rospy.get_param("/local_planner_type", "control_space")
+
     status = {
         "x": round(server.robot_x, 2) if hasattr(server, 'robot_x') else None,
         "y": round(server.robot_y, 2) if hasattr(server, 'robot_y') else None,
@@ -1275,7 +1263,8 @@ def api_status():
         "exploration_state": explore_state,
         "has_api_key": has_key,
         "searching_tag": server.searching_tag if hasattr(server, 'searching_tag') else False,
-        "navigating_to_tag": server.navigating_to_tag if hasattr(server, 'navigating_to_tag') else False
+        "navigating_to_tag": server.navigating_to_tag if hasattr(server, 'navigating_to_tag') else False,
+        "local_planner": local_planner
     }
     return jsonify(status)
 
@@ -1318,6 +1307,14 @@ def set_ai_mode():
     rospy.set_param("/use_local_ai", use_local)
     rospy.loginfo(f"Set /use_local_ai to {use_local}")
     return jsonify({"status": "success", "mode": mode})
+
+@app.route('/api/set_planner', methods=['POST'])
+def set_planner():
+    data = request.json
+    planner = data.get('planner', 'control_space') # 'control_space' or 'teb'
+    rospy.set_param("/local_planner_type", planner)
+    rospy.loginfo(f"Set /local_planner_type parameter to {planner}")
+    return jsonify({"status": "success", "planner": planner})
 
 @app.route('/api/detect', methods=['POST'])
 def api_detect():

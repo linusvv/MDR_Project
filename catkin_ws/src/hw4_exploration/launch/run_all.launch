@@ -8,7 +8,7 @@
 
     <!-- 3. Start RTAB-Map SLAM (Configured to use stable Wheel Odometry) -->
     <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-        <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 400 --Kp/MaxFeatures 400 --Rtabmap/LoopThr 0.3 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 2 --Grid/MaxObstacleHeight 0.5 --Grid/RayTracing true"/>
+        <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 400 --Kp/MaxFeatures 400 --Rtabmap/LoopThr 0.3 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 2 --Grid/MaxObstacleHeight 0.3 --Grid/RayTracing true"/>
         <arg name="rgb_topic" value="/camera/color/image_raw"/>
         <arg name="depth_topic" value="/camera/depth/image_raw"/>
         <arg name="camera_info_topic" value="/camera/color/camera_info"/>
@@ -27,7 +27,7 @@
 
     <!-- 3.5 Start AprilTag Localization for global pose correction -->
     <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
-        <arg name="tag_file_name" value="2025/re540_n1_room111" />
+        <arg name="tag_file_name" value="2025/re540_simulation" />
         <arg name="camera_name" value="/camera/color" />
         <arg name="image_topic" value="image_raw" />
         <arg name="world_frame_name" value="map" />

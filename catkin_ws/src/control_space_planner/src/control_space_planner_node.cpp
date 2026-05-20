@@ -108,6 +108,9 @@ void MotionPlanner::PublishMotionPrimitives(std::vector<std::vector<Node>> motio
 
 void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
 {
+  std::string planner_type;
+  this->nh_.param<std::string>("/local_planner_type", planner_type, "control_space");
+  if (planner_type != "control_space") return;
 
   geometry_msgs::Twist command;
   if (motionMinCost.empty()) {
@@ -118,10 +121,17 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
       return;
   }
 
+  double speed_norm = motionMinCost.back().v;
+  double steering_angle = motionMinCost.back().delta;
+  double w = motionMinCost.back().w;
+
   // Emergency Brake: If the immediate path is dangerous (too close to a wall)
   // Check the first few nodes of the rollout for high cost values (above 90 indicates wall contact)
-  // We only brake if we are NOT actively steering away (i.e. cost is increasing or staying high)
+  // We bypass the emergency brake if we are actively steering away or executing turn-in-place recovery
   bool recovering = false;
+  if (speed_norm == 0.0) {
+      recovering = true;
+  }
   if (motionMinCost.size() >= 3) {
       if (motionMinCost[2].cost_colli < motionMinCost[0].cost_colli - 2.0) {
           recovering = true;
@@ -136,23 +146,28 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
       }
   }
 
-  // low-level control based on the chosen ackermann-like motion primitive
-  double steering_angle = motionMinCost.back().delta;
-  // Use a constant speed (optionally scaled down very slightly if extremely short to avoid slamming)
-  double scale_factor = (double)motionMinCost.size() / (this->MAX_PROGRESS / this->DIST_RESOL);
-  double speed_norm = this->MOTION_VEL * (scale_factor < 0.2 ? 0.3 : 0.8); 
-  
-  // Safety: If we are turning sharply, reduce linear speed to maintain traction and prevent "death spirals"
-  if (abs(steering_angle) > 30.0 * (M_PI / 180.0)) {
-      speed_norm *= 0.5;
+  // low-level control based on the chosen motion primitive
+  if (speed_norm == 0.0) {
+      // Turn in place
+      command.linear.x = 0.0;
+      command.linear.y = 0.0;
+      command.angular.z = w;
+  } else {
+      // Forward/backward Ackerman command
+      // Scale down velocity very slightly if extremely short to avoid slamming
+      double scale_factor = (double)motionMinCost.size() / (this->MAX_PROGRESS / this->DIST_RESOL);
+      double speed_cmd = speed_norm * (scale_factor < 0.2 ? 0.3 : 0.8);
+
+      // Safety: If we are turning sharply, reduce linear speed to maintain traction and prevent "death spirals"
+      if (abs(steering_angle) > 30.0 * (M_PI / 180.0)) {
+          speed_cmd *= 0.5;
+      }
+
+      double sane_wheelbase = std::max(this->WHEELBASE, 0.20); 
+      command.angular.z = speed_cmd * tan(steering_angle) / sane_wheelbase;
+      command.linear.x  = speed_cmd;
+      command.linear.y  = 0.0;
   }
-  
-  // A forward cmd_vel on differential/Mecanum drive matching the generated paths
-  // We use a "Sane Wheelbase" for the command calculation to prevent division-by-nearly-zero spikes
-  double sane_wheelbase = std::max(this->WHEELBASE, 0.20); 
-  command.angular.z = speed_norm * tan(steering_angle) / sane_wheelbase;
-  command.linear.x  = speed_norm;
-  command.linear.y  = 0.0;
 
   // Hard clamp on angular velocity to prevent the "scary fast" spinning
   double MAX_ANGULAR_VEL = 2.5; // [rad/s] (~143 deg/s) - Sane limit for robot safety
@@ -182,6 +197,10 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
 
 void MotionPlanner::StopRobot()
 {
+  std::string planner_type;
+  this->nh_.param<std::string>("/local_planner_type", planner_type, "control_space");
+  if (planner_type != "control_space") return;
+
   geometry_msgs::Twist command;
   command.linear.x = 0.0;
   command.linear.y = 0.0;
@@ -287,13 +306,6 @@ void MotionPlanner::Plan()
 
 std::vector<std::vector<Node>> MotionPlanner::GenerateMotionPrimitives(nav_msgs::OccupancyGrid localMap)
 {
-  /*
-    TODO: Generate motion primitives
-    - you can change the below process if you need.
-    - you can calculate cost of each motion if you need.
-  */
-
-
   // initialize motion primitives
   std::vector<std::vector<Node>> motionPrimitives;
 
@@ -302,17 +314,20 @@ std::vector<std::vector<Node>> MotionPlanner::GenerateMotionPrimitives(nav_msgs:
 
   // max progress of each motion
   double maxProgress = this->MAX_PROGRESS;
+
+  // 1. Forward Ackermann primitives
   for (int i=0; i<num_candidates+1; i++) {
-    // current steering delta
     double angle_delta = this->MAX_DELTA - i * this->DELTA_RESOL;
-
-    // init start node
     Node startNode(0, 0, 0, 0, angle_delta, 0, 0, 0, -1, false);
-    
-    // rollout to generate motion
-    std::vector<Node> motionPrimitive = RolloutMotion(startNode, maxProgress, this->localMap);
+    std::vector<Node> motionPrimitive = RolloutMotion(startNode, maxProgress, this->MOTION_VEL, 0.0, this->localMap);
+    motionPrimitives.push_back(motionPrimitive);
+  }
 
-    // add current motionPrimitive
+  // 2. Turn-in-place primitives (spinning left & right)
+  double turn_speeds[] = {1.5, -1.5};
+  for (double w : turn_speeds) {
+    Node startNode(0, 0, 0, 0, 0.0, 0, 0, 0, -1, false);
+    std::vector<Node> motionPrimitive = RolloutMotion(startNode, maxProgress, 0.0, w, this->localMap);
     motionPrimitives.push_back(motionPrimitive);
   }
 
@@ -321,17 +336,10 @@ std::vector<std::vector<Node>> MotionPlanner::GenerateMotionPrimitives(nav_msgs:
 
 std::vector<Node> MotionPlanner::RolloutMotion(Node startNode,
                                               double maxProgress,
+                                              double v,
+                                              double w,
                                               nav_msgs::OccupancyGrid localMap)
 {
-  /*
-    TODO: rollout to generate a motion primitive based on the current steering angle
-    - calculate cost terms here if you need
-    - check collision / sensor range if you need
-    1. Update motion node using current steering angle delta based on the vehicle kinematics equation.
-    2. collision checking
-    3. range checking
-  */
-
   // Initialize motionPrimitive
   std::vector<Node> motionPrimitive;
 
@@ -346,18 +354,20 @@ std::vector<Node> MotionPlanner::RolloutMotion(Node startNode,
                        (startNode.y-truncLocalNode.y)*(startNode.y-truncLocalNode.y));
   }
 
-  //! 1. Update motion node using current steering angle delta based on the vehicle kinematics equation
-  // - while loop until maximum progress of a motion
-
   // Loop for rollout
   while (progress < maxProgress) {
-    // x_t+1   := x_t + x_dot * dt
-    // y_t+1   := y_t + y_dot * dt
-    // yaw_t+1 := yaw_t + yaw_dot * dt
-    double speed = this->MOTION_VEL;
-    currMotionNode.x += speed * cos(currMotionNode.yaw) * this->TIME_RESOL;
-    currMotionNode.y += speed * sin(currMotionNode.yaw) * this->TIME_RESOL;
-    currMotionNode.yaw += speed * tan(startNode.delta) / this->WHEELBASE * this->TIME_RESOL;
+    if (v == 0.0) {
+      // Turn in place
+      currMotionNode.yaw += w * this->TIME_RESOL;
+    } else {
+      // Forward/backward Ackerman motion
+      currMotionNode.x += v * cos(currMotionNode.yaw) * this->TIME_RESOL;
+      currMotionNode.y += v * sin(currMotionNode.yaw) * this->TIME_RESOL;
+      currMotionNode.yaw += v * tan(startNode.delta) / this->WHEELBASE * this->TIME_RESOL;
+    }
+    // Store v and w in currMotionNode
+    currMotionNode.v = v;
+    currMotionNode.w = w;
 
     // Calculate minimum distance toward goal
     if (this->bGetLocalNode) {
@@ -369,47 +379,40 @@ std::vector<Node> MotionPlanner::RolloutMotion(Node startNode,
     }
     currMotionNode.minDistGoal = minDistGoal; // save current minDistGoal at current node
     
-    // collision/range chekcing with "lookahead" concept
-    // - lookahead point
-    // double aheadYaw = currMotionNode.yaw + this->MOTION_VEL * tan(startNode.delta) / this->WHEELBASE * this->TIME_RESOL;
+    // Lookahead collision point
     double aheadYaw = currMotionNode.yaw;
-    double aheadX = currMotionNode.x + this->MOTION_VEL * cos(aheadYaw) * this->TIME_RESOL;
-    double aheadY = currMotionNode.y + this->MOTION_VEL * sin(aheadYaw) * this->TIME_RESOL;
+    double aheadX = currMotionNode.x;
+    double aheadY = currMotionNode.y;
+    if (v != 0.0) {
+      aheadX += v * cos(aheadYaw) * this->TIME_RESOL;
+      aheadY += v * sin(aheadYaw) * this->TIME_RESOL;
+    }
 
-      //! 2. collision checking
-      // - local to map coordinate transform
-      Node collisionPointNode(currMotionNode.x, currMotionNode.y, currMotionNode.z, currMotionNode.yaw, currMotionNode.delta, 0, 0, 0, -1, false);
-      Node collisionPointNodeMap = LocalToPlannerCorrdinate(collisionPointNode);
-      
-      int max_occ = GetMaxOccupancy(collisionPointNodeMap, localMap);
-      currMotionNode.cost_colli = (double)max_occ;
+    Node collisionPointNode(aheadX, aheadY, currMotionNode.z, aheadYaw, currMotionNode.delta, 0, 0, 0, -1, false);
+    Node collisionPointNodeMap = LocalToPlannerCorrdinate(collisionPointNode);
+    
+    int max_occ = GetMaxOccupancy(collisionPointNodeMap, localMap);
+    currMotionNode.cost_colli = (double)max_occ;
 
-      if (max_occ > this->OCCUPANCY_THRES) {
-        if (motionPrimitive.empty()) {
-          // Ensure we return at least one node to avoid complete array-size crashes and maintain a crawl speed
-          currMotionNode.collision = true;
-          motionPrimitive.push_back(currMotionNode);
-        } else {
-          motionPrimitive.back().collision = true;
-        }
+    if (max_occ > this->OCCUPANCY_THRES) {
+      if (motionPrimitive.empty()) {
+        // Ensure we return at least one node to avoid complete array-size crashes and maintain a crawl speed
+        currMotionNode.collision = true;
+        motionPrimitive.push_back(currMotionNode);
+      } else {
+        motionPrimitive.back().collision = true;
+      }
+      return motionPrimitive;
+    }
+
+    // Range checking (only for forward primitives, since backward/turn-in-place don't go forward in FOV)
+    if (v > 0.0) {
+      double LOS_DIST = sqrt(currMotionNode.x * currMotionNode.x + currMotionNode.y * currMotionNode.y);
+      double LOS_YAW = atan2(currMotionNode.y, currMotionNode.x);
+      if (LOS_DIST > this->MAX_SENSOR_RANGE || abs(LOS_YAW) > this->FOV*0.5) {
         return motionPrimitive;
       }
-
-    //! 3. range checking
-    // - if you want to filter out motion points out of the sensor range, calculate the Line-Of-Sight (LOS) distance & yaw angle of the node
-    // - LOS distance := sqrt(x^2 + y^2)
-    // - LOS yaw := atan2(y, x)
-    // - if LOS distance > MAX_SENSOR_RANGE or abs(LOS_yaw) > FOV*0.5 <-- outside of sensor range 
-    // - if LOS distance <= MAX_SENSOR_RANGE and abs(LOS_yaw) <= FOV*0.5 <-- inside of sensor range
-    // - use params in header file (MAX_SENSOR_RANGE, FOV)
-    double LOS_DIST = sqrt(currMotionNode.x * currMotionNode.x + currMotionNode.y * currMotionNode.y);
-    double LOS_YAW = atan2(currMotionNode.y, currMotionNode.x);
-    if (LOS_DIST > this->MAX_SENSOR_RANGE || abs(LOS_YAW) > this->FOV*0.5) {
-      // -- do some process when out-of-range occurs.
-      // -- you can break and return current motion primitive or keep generate rollout.
-
-      return motionPrimitive;
-    } 
+    }
 
     // append collision-free motion in the current motionPrimitive
     motionPrimitive.push_back(currMotionNode);
@@ -483,6 +486,11 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
       double wall_penalty = (max_traversability_cost * max_traversability_cost) / 10.0;
       double cost_total = this->W_COST_TRAVERSABILITY * wall_penalty + this->W_COST_DIRECTION * cost_direction + cost_collision_penalty + cost_dist;
       
+      // Enforce forward preference: heavily penalize turn-in-place primitives so they are only chosen when forward primitives collide
+      if (motionPrimitive.back().v == 0.0) {
+          cost_total += 20000.0;
+      }
+
       if (cost_direction > M_PI / 1.5) {
           cost_total += 5000.0;
       }

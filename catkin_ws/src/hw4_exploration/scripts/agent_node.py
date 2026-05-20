@@ -144,45 +144,6 @@ class AgentNode:
                 else:
                     self.publish_local_path(1.5, 0.0, 0.0) # publish point 1.5m straight ahead
                     
-                    # Stuck detection
-                    if curr_x is not None and curr_y is not None:
-                        if self.stuck_start_pos is None:
-                            self.stuck_start_pos = (curr_x, curr_y)
-                            self.stuck_check_time = rospy.Time.now()
-                        else:
-                            dist_moved = math.sqrt((curr_x - self.stuck_start_pos[0])**2 + (curr_y - self.stuck_start_pos[1])**2)
-                            if dist_moved > 0.15:
-                                self.stuck_start_pos = (curr_x, curr_y)
-                                self.stuck_check_time = rospy.Time.now()
-                            elif (rospy.Time.now() - self.stuck_check_time) > rospy.Duration(3.0):
-                                rospy.logwarn("Robot stuck / dead end detected! Initiating recovery sequence.")
-                                self.stop_robot()
-                                self.set_state("RECOVERY")
-                                self.recovery_stage = 1 # Back up
-                                self.recovery_end_time = rospy.Time.now() + rospy.Duration(2.0)
-                                self.recovery_spin_speed = 0.6 if random.random() < 0.5 else -0.6
-                                self.stuck_start_pos = None
-                                
-            elif self.state == "RECOVERY":
-                if rospy.Time.now() > self.recovery_end_time:
-                    if self.recovery_stage == 1:
-                        rospy.loginfo("Recovery Stage 1 (Backup) complete. Starting Stage 2 (Spin).")
-                        self.recovery_stage = 2
-                        self.recovery_end_time = rospy.Time.now() + rospy.Duration(2.6)
-                    else:
-                        rospy.loginfo("Recovery complete. Resuming exploration.")
-                        self.last_shop_check_time = rospy.Time.now()
-                        self.set_state("EXPLORE")
-                else:
-                    twist = Twist()
-                    if self.recovery_stage == 1:
-                        twist.linear.x = -0.15 # back up
-                        twist.angular.z = 0.0
-                    else:
-                        twist.linear.x = 0.0
-                        twist.angular.z = self.recovery_spin_speed # spin left or right 90 degrees
-                    self.cmd_pub.publish(twist)
-                    
             elif self.state == "READ_SIGN":
                 self.stop_robot()
                 rospy.sleep(1.5) # stabilize camera blur

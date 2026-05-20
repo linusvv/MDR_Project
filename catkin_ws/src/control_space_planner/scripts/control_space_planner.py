@@ -1,8 +1,7 @@
-#!/usr/bin/env python3
-
 import rospy
 import math
 import numpy as np
+import tf
 from nav_msgs.msg import OccupancyGrid, Odometry, Path
 from geometry_msgs.msg import PoseStamped, Twist
 from sensor_msgs.msg import PointCloud2, PointField
@@ -11,7 +10,11 @@ from std_msgs.msg import Header
 import tf.transformations as tf_trans
 
 def normalize_pi_to_pi(angle):
-    return (angle + math.pi) % (2 * math.pi) - math.pi
+    while angle > math.pi:
+        angle -= 2.0 * math.pi
+    while angle < -math.pi:
+        angle += 2.0 * math.pi
+    return angle
 
 class Node:
     def __init__(self, x=0.0, y=0.0, z=0.0, yaw=0.0, delta=0.0, 
@@ -33,10 +36,11 @@ class Node:
 class MotionPlanner:
     def __init__(self):
         rospy.init_node('control_space_planner_python')
+        self.tf_listener = tf.TransformListener()
 
         # DWA local planner mapped weights
-        self.W_COST_DIRECTION = 3.0
-        self.W_COST_TRAVERSABILITY = 2.0
+        self.W_COST_DIRECTION = 4.5  # Increased to prioritize heading to goal
+        self.W_COST_TRAVERSABILITY = 3.5
         self.W_COST_STEERING = 1.0
 
         self.mapMinX = -5.0
@@ -44,7 +48,7 @@ class MotionPlanner:
         self.mapMinY = -10.0
         self.mapMaxY = 10.0
         self.mapResol = 0.1
-        self.OCCUPANCY_THRES = 50
+        self.OCCUPANCY_THRES = 40
 
         self.origin_x = 0.0
         self.origin_y = 0.0
@@ -54,9 +58,9 @@ class MotionPlanner:
         self.MAX_SENSOR_RANGE = 10.0
         self.WHEELBASE = 0.1
         self.DIST_RESOL = 0.1
-        self.TIME_RESOL = 0.1
-        self.ARRIVAL_THRES = 0.5
-        self.INFLATION_SIZE = int(0.15 / self.mapResol)  # Increased from 0.1m to 0.15m for safety
+        self.TIME_RESOL = 0.2
+        self.ARRIVAL_THRES = 0.4
+        self.INFLATION_SIZE = int(0.20 / self.mapResol)
 
         self.bGetMap = False
         self.bGetGoal = False
@@ -67,30 +71,28 @@ class MotionPlanner:
         self.egoOdom = None
         self.goalPose = None
         self.global_path = []
-        self.LOOKAHEAD_DIST = 1.2  # Revert to original for better target selection
+        self.LOOKAHEAD_DIST = 1.0  # Slightly shorter for tighter following
         self.prev_w = 0.0
         self.recovery_time = 0
         self.recovery_w = 1.5
         self.search_multiplier = 1.0
         
-        # Odometry smoothing buffers for visual odom stability
+        # Pose smoothing buffers
         self.odom_buffer_size = 5
         self.odom_x_buffer = []
         self.odom_y_buffer = []
-        self.odom_yaw_buffer = []
+        self.odom_sin_buffer = []
+        self.odom_cos_buffer = []
 
-        # Short-lived obstacle memory to avoid "forgetting" walls when sensors occlude them
-        # Maps planner map index -> last seen time (seconds)
+        # ... (rest of init)
         self.obstacle_memory = {}
-        self.obstacle_memory_duration = 3.0  # seconds to keep obstacles in memory
-        
-        # Velocity smoothing
+        self.obstacle_memory_duration = 2.0
         self.prev_v = 0.0
-        self.v_smooth_alpha = 0.8  # new_cmd = alpha*new + (1-alpha)*prev
-
+        self.v_smooth_alpha = 0.6
+        self.last_log_time = 0
+        
         # Sub/Pub
         rospy.Subscriber("/map/local_map/obstacle", OccupancyGrid, self.cb_occupancy_grid)
-        rospy.Subscriber("/odom", Odometry, self.cb_ego_odom)
         rospy.Subscriber("/graph_planner/path/global_path", Path, self.cb_global_path)
         rospy.Subscriber("/move_base_simple/goal", PoseStamped, self.cb_goal_point)
 
@@ -98,6 +100,39 @@ class MotionPlanner:
         self.pubTruncTarget = rospy.Publisher("/car/trunc_target", PoseStamped, queue_size=1)
         self.pubSelectedMotion = rospy.Publisher("/points/selected_motion", PointCloud2, queue_size=1)
         self.pubMotionPrimitives = rospy.Publisher("/points/motion_primitives", PointCloud2, queue_size=1)
+
+    def update_ego_pose(self):
+        """Uses TF to get robot pose in the map frame instead of raw odom."""
+        try:
+            # We want the robot pose in the frame that the path is tracking (usually 'map')
+            path_frame = "map"
+            if self.global_path:
+                path_frame = self.global_path[0].header.frame_id
+            
+            (trans, rot) = self.tf_listener.lookupTransform(path_frame, 'base_footprint', rospy.Time(0))
+            raw_x, raw_y = trans[0], trans[1]
+            euler = tf_trans.euler_from_quaternion(rot)
+            raw_yaw = euler[2]
+
+            self.odom_x_buffer.append(raw_x)
+            self.odom_y_buffer.append(raw_y)
+            self.odom_sin_buffer.append(math.sin(raw_yaw))
+            self.odom_cos_buffer.append(math.cos(raw_yaw))
+            
+            if len(self.odom_x_buffer) > self.odom_buffer_size:
+                self.odom_x_buffer.pop(0)
+                self.odom_y_buffer.pop(0)
+                self.odom_sin_buffer.pop(0)
+                self.odom_cos_buffer.pop(0)
+            
+            self.ego_x = np.mean(self.odom_x_buffer)
+            self.ego_y = np.mean(self.odom_y_buffer)
+            # Correct angular averaging using sin/cos components
+            self.ego_yaw = math.atan2(np.mean(self.odom_sin_buffer), np.mean(self.odom_cos_buffer))
+            
+            self.bGetEgoOdom = True
+        except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+            pass
 
     def cb_occupancy_grid(self, msg):
         self.localMap = msg
@@ -166,46 +201,22 @@ class MotionPlanner:
             self.goal_yaw = yaw
             self.bGetGoal = True
 
-    def cb_ego_odom(self, msg):
-        self.egoOdom = msg
-        raw_x = msg.pose.pose.position.x
-        raw_y = msg.pose.pose.position.y
-        q = [msg.pose.pose.orientation.x, msg.pose.pose.orientation.y, msg.pose.pose.orientation.z, msg.pose.pose.orientation.w]
-        _, _, raw_yaw = tf_trans.euler_from_quaternion(q)
-        
-        # Smooth odometry to reduce visual odom jitter
-        self.odom_x_buffer.append(raw_x)
-        self.odom_y_buffer.append(raw_y)
-        self.odom_yaw_buffer.append(raw_yaw)
-        
-        if len(self.odom_x_buffer) > self.odom_buffer_size:
-            self.odom_x_buffer.pop(0)
-            self.odom_y_buffer.pop(0)
-            self.odom_yaw_buffer.pop(0)
-        
-        self.ego_x = np.mean(self.odom_x_buffer)
-        self.ego_y = np.mean(self.odom_y_buffer)
-        self.ego_yaw = np.mean(self.odom_yaw_buffer)
-        
-        self.bGetEgoOdom = True
-
     def global_to_local_node(self, globalNode):
         delX = globalNode.x - self.ego_x
         delY = globalNode.y - self.ego_y
-        delZ = globalNode.z - self.egoOdom.pose.pose.position.z
 
         newX = math.cos(-self.ego_yaw) * delX - math.sin(-self.ego_yaw) * delY
         newY = math.sin(-self.ego_yaw) * delX + math.cos(-self.ego_yaw) * delY
         newYaw = normalize_pi_to_pi(globalNode.yaw - self.ego_yaw)
 
-        return Node(newX, newY, delZ, newYaw)
+        return Node(newX, newY, globalNode.z, newYaw)
 
     def local_to_planner_coordinate(self, localNode):
         mapX = (localNode.x - self.origin_x) / self.mapResol
         mapY = (localNode.y - self.origin_y) / self.mapResol
         return Node(mapX, mapY, localNode.z, localNode.yaw)
 
-    def check_collision_and_dist(self, mapNode):
+    def check_collision_and_dist(self, map_pt):
         w = self.localMap.info.width
         h = self.localMap.info.height
         r = self.INFLATION_SIZE
@@ -213,16 +224,25 @@ class MotionPlanner:
         is_col = False
         min_dist = float('inf')
         
-        search_radius = r + 5  # Expanded search to compute clearance
+        # Reduced search radius for performance
+        search_radius = r + 2 
         try:
             now = rospy.Time.now().to_sec()
         except Exception:
             now = rospy.get_time()
 
-        for i in range(search_radius * 2 + 1):
-            for j in range(search_radius * 2 + 1):
-                tx = int(mapNode.x + i - search_radius)
-                ty = int(mapNode.y + j - search_radius)
+        # Optimization: first check if the point itself is occupied (including memory)
+        tx_center = int(map_pt.x)
+        ty_center = int(map_pt.y)
+        
+        # Bounds check
+        if tx_center < 0 or tx_center >= w or ty_center < 0 or ty_center >= h:
+            return True, 0.0 # Out of bounds is collision
+
+        for i in range(-search_radius, search_radius + 1):
+            for j in range(-search_radius, search_radius + 1):
+                tx = tx_center + i
+                ty = ty_center + j
                 if 0 <= tx < w and 0 <= ty < h:
                     idx = ty * w + tx
                     val = self.localMap.data[idx]
@@ -230,13 +250,13 @@ class MotionPlanner:
                     if val > self.OCCUPANCY_THRES:
                         occupied = True
                     else:
-                        # consult memory: if this index was seen occupied recently, treat as occupied
+                        # consult memory
                         last_seen = self.obstacle_memory.get(idx, None)
                         if last_seen is not None and (now - last_seen) <= self.obstacle_memory_duration:
                             occupied = True
 
                     if occupied:
-                        dist = math.hypot(i - search_radius, j - search_radius) * self.mapResol
+                        dist = math.hypot(i, j) * self.mapResol
                         if dist < min_dist:
                             min_dist = dist
                         if dist <= self.INFLATION_SIZE * self.mapResol:
@@ -248,7 +268,7 @@ class MotionPlanner:
         motion = []
         curr = Node(x=0.0, y=0.0, yaw=0.0, v=v, w=w)
         
-        sim_time = 1.2 * self.search_multiplier  # Decreased from 2.0 to prevent over-cautious wall avoidance
+        sim_time = 1.0  # Reduced to reduce computation
         dt = self.TIME_RESOL
         t = 0.0
         
@@ -272,11 +292,8 @@ class MotionPlanner:
             minDistObstacle = min(minDistObstacle, dist_obs)
             
             if is_col:
-                if t < 0.6:  # Imminent collision requires braking
-                    curr.collision = True
-                else:  # Far collision, safe to proceed for now and brake later
-                    curr.collision = False
-                motion.append(Node(curr.x, curr.y, curr.z, curr.yaw, v=v, w=w, collision=curr.collision, minDistGoal=curr.minDistGoal))
+                curr.collision = True
+                motion.append(Node(curr.x, curr.y, curr.z, curr.yaw, v=v, w=w, collision=True, minDistGoal=curr.minDistGoal))
                 motion[-1].minDistObstacle = minDistObstacle
                 return motion
 
@@ -288,47 +305,59 @@ class MotionPlanner:
 
     def generate_motion_primitives(self):
         primitives = []
-        # Sample velocities including higher speeds so planner can choose faster motions
-        velocities = np.concatenate([np.linspace(0.0, 0.3, 8), np.linspace(0.4, 1.2, 14)])
-        omegas = np.linspace(-2.0, 2.0, 25)
+        # Significantly reduced sampling for performance
+        velocities = np.linspace(0.0, 0.8, 6) 
+        omegas = np.linspace(-1.5, 1.5, 11)
+        
+        self.total_primitives = 0
         for v in velocities:
             for w in omegas:
                 if v == 0.0 and w == 0.0:
                     continue
+                self.total_primitives += 1
                 motion = self.rollout_motion(v, w)
                 if motion:
                     primitives.append(motion)
+        return primitives
         return primitives
 
     def select_motion(self, primitives):
         minCost = float('inf')
         bestMotion = []
         
+        self.collision_free_primitives = 0
         for pm in primitives:
             if not pm or pm[-1].collision:
                 continue
             
+            self.collision_free_primitives += 1
             endNode = pm[-1]
             distGoal = endNode.minDistGoal
             
+            # Goal direction: aim at target idx on global path
             goal_yaw = math.atan2(self.truncLocalNode.y - endNode.y, self.truncLocalNode.x - endNode.x)
             yaw_diff = abs(normalize_pi_to_pi(goal_yaw - endNode.yaw))
             
-            # Relaxed consistency cost to allow sharp turns in tight spaces
+            # Consistency
             consistency_cost = abs(endNode.w - self.prev_w)
 
-            # Calculate clearance cost
+            # Clearance
             clearance_cost = 0.0
             if hasattr(endNode, 'minDistObstacle') and endNode.minDistObstacle < float('inf'):
                 clearance_cost = 1.0 / (endNode.minDistObstacle + 0.01)
 
-            # Adjusted DWA cost function for proper navigation behavior
-            # Balance: strong heading pull, distance pull, and moderate velocity preference
-            cost = (3.0 * yaw_diff + 
+            # Balanced DWA cost
+            # Stronger heading pull (5.0) and moderate velocity preference (2.5)
+            # Added a penalty for being stationary to prevent wiggling in place
+            v_cost = -3.0 * endNode.v
+            if endNode.v < 0.05:
+                v_cost += 1.0 # Penalty for near-zero velocity
+
+            cost = (5.0 * yaw_diff + 
                     2.0 * distGoal + 
                     0.2 * consistency_cost +
-                    2.5 * clearance_cost - 
-                    4.0 * endNode.v)  # Increased velocity weight for smoother acceleration
+                    3.5 * clearance_cost +
+                    v_cost)
             
             endNode.cost_total = cost
             
@@ -341,29 +370,28 @@ class MotionPlanner:
     def publish_command(self, motion):
         cmd = Twist()
         
-        if not motion or motion[-1].v == 0.0:
-            self.recovery_time += 1
-            if self.recovery_time == 1:
-                if motion and motion[-1].w != 0.0:
-                    self.recovery_w = 1.5 if motion[-1].w > 0 else -1.5
-                else:
-                    self.recovery_w = 1.5
-            elif self.recovery_time > 150:  # Very patient: 3 seconds before recovery
-                self.recovery_w *= -1.0
-                self.search_multiplier = min(self.search_multiplier + 0.3, 3.0)  # Cap at 3.0
-                self.recovery_time = 2
-            
-            cmd.angular.z = self.recovery_w
+        now = rospy.get_time()
+        should_log = (now - self.last_log_time > 1.0)
+        
+        if not motion:
+            cmd.angular.z = 0.0
             cmd.linear.x = 0.0
-            rospy.loginfo_throttle(1.0, f"[Stuck] Turning {cmd.angular.z} rad/s | Multiplier: {self.search_multiplier:.1f}")
+            if should_log:
+                rospy.logwarn(f"[ControlSpace] NO FEASIBLE PATH! (Checked {self.total_primitives} samples, 0 collision-free)")
+                self.last_log_time = now
+        elif motion[-1].v == 0.0:
+            cmd.angular.z = 0.0
+            cmd.linear.x = 0.0
+            if should_log:
+                rospy.loginfo(f"[ControlSpace] Chosen motion has v=0 (Progress blocked). Free: {self.collision_free_primitives}/{self.total_primitives}")
+                self.last_log_time = now
         else:
             self.recovery_time = 0
             self.search_multiplier = 1.0
             
             bestNode = motion[-1]
-            # apply light smoothing so we don't instantly cut speed between cycles
-            raw_v = bestNode.v
-            cmd.linear.x = (self.v_smooth_alpha * raw_v) + ((1.0 - self.v_smooth_alpha) * self.prev_v)
+            # Smooth velocity
+            cmd.linear.x = (self.v_smooth_alpha * bestNode.v) + ((1.0 - self.v_smooth_alpha) * self.prev_v)
             cmd.angular.z = bestNode.w
 
             if self.bGetGoal and self.global_path:
@@ -372,18 +400,20 @@ class MotionPlanner:
                 if dist < self.ARRIVAL_THRES:
                     cmd.angular.z = 0.0
                     cmd.linear.x = 0.0
+                    if should_log:
+                        rospy.loginfo("[ControlSpace] Arrived at goal.")
+                        self.last_log_time = now
 
-            rospy.loginfo_throttle(1.0, f"Command | v: {cmd.linear.x:.2f} | w: {cmd.angular.z:.2f} | cost: {bestNode.cost_total:.2f}")
+            if should_log:
+                rospy.loginfo(f"[ControlSpace] Moving | v: {cmd.linear.x:.2f} | w: {cmd.angular.z:.2f} | Cost: {bestNode.cost_total:.2f} | Free: {self.collision_free_primitives}/{self.total_primitives}")
+                self.last_log_time = now
 
         self.prev_w = cmd.angular.z
-        # update prev_v for next smoothing step
-        try:
-            self.prev_v = cmd.linear.x
-        except Exception:
-            self.prev_v = 0.0
+        self.prev_v = cmd.linear.x
         self.pubCommand.publish(cmd)
 
     def plan(self):
+        self.update_ego_pose()
         if not (self.bGetMap and self.bGetGoal and self.bGetEgoOdom):
             return
             
@@ -395,9 +425,6 @@ class MotionPlanner:
                 if d < closest_dist:
                     closest_dist = d
                     closest_idx = i
-                elif d > closest_dist + 0.5:
-                    # Break to prevent snapping to the other side of a hairpin wall
-                    break
 
             target_idx = closest_idx
             accumulated_dist = 0.0
@@ -417,8 +444,6 @@ class MotionPlanner:
             q = [target.pose.orientation.x, target.pose.orientation.y, target.pose.orientation.z, target.pose.orientation.w]
             _, _, self.goal_yaw = tf_trans.euler_from_quaternion(q)
             
-            rospy.loginfo_throttle(1.0, f"Tracking Path | Ego: ({self.ego_x:.2f}, {self.ego_y:.2f}) | Closest Idx: {closest_idx} | Target Idx: {target_idx}/{len(self.global_path)} | Goal: ({self.goal_x:.2f}, {self.goal_y:.2f})")
-
         gNode = Node(self.goal_x, self.goal_y, 0, self.goal_yaw)
         self.localNode = self.global_to_local_node(gNode)
         
@@ -432,10 +457,23 @@ class MotionPlanner:
 
         primitives = self.generate_motion_primitives()
         best = self.select_motion(primitives)
+        
+        # Publish selected motion for visualization
+        if best:
+            header = Header()
+            header.stamp = rospy.Time.now()
+            header.frame_id = "base_link"
+            pts = [[p.x, p.y, 0.0] for p in best]
+            try:
+                msg = pc2.create_cloud_xyz32(header, pts)
+                self.pubSelectedMotion.publish(msg)
+            except:
+                pass
+
         self.publish_command(best)
 
     def run(self):
-        rate = rospy.Rate(50.0)
+        rate = rospy.Rate(15.0) # Reduced from 50Hz to 15Hz for Python performance
         while not rospy.is_shutdown():
             self.plan()
             rate.sleep()

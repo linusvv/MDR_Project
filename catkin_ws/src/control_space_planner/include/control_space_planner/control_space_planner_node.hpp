@@ -59,11 +59,11 @@ class Node
 {
     public:
         // The default constructor for 3D array initialization
-        Node(): Node(0, 0, 0, 0, 0, 0, 0, 0, -1, false) {}
+        Node(): Node(0, 0, 0, 0, 0, 0, 0, 0, -1, false, 0.0, 0.0) {}
         // Constructor for a node with the given arguments
         Node(double x, double y, double z, double yaw, double delta,
              double cost_control, double cost_colli, double cost_total,
-             int idx, bool collision) {
+             int idx, bool collision, double v = 0.0, double w = 0.0) {
             this->x = x;
             this->y = y;
             this->z = z;
@@ -74,6 +74,8 @@ class Node
             this->cost_total = cost_total;
             this->idx = idx;
             this->collision = collision;
+            this->v = v;
+            this->w = w;
         }
 
         // the x position
@@ -98,6 +100,8 @@ class Node
         int idx;
         // flag for collision
         bool collision;
+        double v;
+        double w;
 };
 
 class MotionPlanner
@@ -120,7 +124,7 @@ class MotionPlanner
     // Algorithms
     void Plan();
     std::vector<std::vector<Node>> GenerateMotionPrimitives(nav_msgs::OccupancyGrid localMap);
-    std::vector<Node> RolloutMotion(Node startNode, double maxProgress, nav_msgs::OccupancyGrid localMap);
+    std::vector<Node> RolloutMotion(Node startNode, double maxProgress, double v, double w, nav_msgs::OccupancyGrid localMap);
     std::vector<Node> SelectMotion(std::vector<std::vector<Node>> motionPrimitives);
     bool CheckCollision(Node goalNode, nav_msgs::OccupancyGrid localMap);
     int GetMaxOccupancy(Node goalNode, nav_msgs::OccupancyGrid localMap);

@@ -12,6 +12,8 @@
 #include <string>
 #include <ros/ros.h>
 #include <pcl_ros/point_cloud.h>
+#include <tf/transform_listener.h>
+#include <pcl_ros/transforms.h>
 
 namespace local_costmap_generator {
 
@@ -62,6 +64,8 @@ private:
   ros::Subscriber velodyne_scan_;
   ros::Publisher obstacle_publisher_;
   ros::Publisher clear_publisher_;
+
+  tf::TransformListener tf_listener_;
 };
 
 } // namespace local_costmap_generator

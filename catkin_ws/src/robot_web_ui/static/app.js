@@ -124,6 +124,32 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // Local Planner Select Handler
+    const plannerSelect = document.getElementById('planner-select');
+    
+    if (plannerSelect) {
+        plannerSelect.addEventListener('change', async (e) => {
+            const planner = e.target.value;
+            try {
+                const res = await fetch('/api/set_planner', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ planner })
+                });
+                await res.json();
+                
+                let plannerName = "Control Space Planner";
+                if (planner === "teb") plannerName = "TEB Local Planner";
+                if (planner === "custom_vector") plannerName = "Custom Vector Planner";
+                
+                logConsole(`Local Planner changed to: ${plannerName}`);
+            } catch (error) {
+                console.error("Failed to set planner", error);
+                logConsole("Error: Failed to change active local planner");
+            }
+        });
+    }
+
     // Detect Mode controls
     const btnDetect = document.getElementById('btn-detect');
     if (btnDetect) {
@@ -512,6 +538,12 @@ document.addEventListener('DOMContentLoaded', () => {
                     apiKeyStatus.textContent = "No session key loaded. (Remote AI disabled)";
                     apiKeyStatus.className = "api-key-status missing-key";
                 }
+            }
+
+            // Dynamic Planner Select UI updates
+            const plannerSelect = document.getElementById('planner-select');
+            if (plannerSelect && data.local_planner && document.activeElement !== plannerSelect) {
+                plannerSelect.value = data.local_planner;
             }
         } catch (error) {
             console.error("Failed to fetch telemetry status", error);

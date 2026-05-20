@@ -1,0 +1,75 @@
+<launch>
+    <!-- Standalone node to run the TEB Local Planner wrapper parallel to/instead of control_space_planner_node -->
+    <node pkg="control_space_planner" type="teb_planner_node" name="teb_planner_node" output="screen">
+        
+        <!-- local_costmap configurations needed by TEB -->
+        <rosparam>
+            local_costmap:
+                global_frame: odom
+                robot_base_frame: base_footprint
+                update_frequency: 30.0
+                publish_frequency: 30.0
+                rolling_window: true
+                width: 10.0
+                height: 10.0
+                resolution: 0.1
+                plugins:
+                 - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
+                obstacle_layer:
+                    observation_sources: point_cloud_sensor
+                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: -1.0, max_obstacle_height: 2.0}
+            
+            TebLocalPlannerROS:
+                odom_topic: /odom
+                map_frame: odom
+                
+                # Trajectory Configuration
+                teb_autosize: True
+                dt_ref: 0.15
+                dt_hysteresis: 0.05
+                max_samples: 50
+                global_plan_overwrite_orientation: True
+                allow_init_with_backwards_motion: False
+                max_global_plan_lookahead_dist: 1.0 # Short lookahead to focus on immediate path
+                global_plan_viapoint_sep: 0.1 # Relaxed via-point spacing to avoid oscillation at start
+                weight_kinematics_nh: 10
+                weight_kinematics_forward_drive: 15
+                weight_kinematics_turning_radius: 15
+                weight_optimaltime: 0.5
+                
+                # Robot Configuration
+                max_vel_x: 1.3
+                max_vel_y: 0.3     # Soft sideways sliding to drift corners
+                max_vel_theta: 1.5 # High turn speed for quick corrections
+                acc_lim_x: 2.5
+                acc_lim_y: 0.8
+                acc_lim_theta: 2.0
+                min_turning_radius: 0.0 # Re-enable differential turning to prevent math locks
+                wheelbase: 0.26
+                cmd_angle_instead_rotvel: False  
+                footprint_model:
+                    type: "circular"
+                    radius: 0.2
+
+                # Goal Tolerance
+                xy_goal_tolerance: 0.5
+                yaw_goal_tolerance: 0.5
+                free_goal_vel: False
+
+                # Obstacles
+                min_obstacle_dist: 0.25 # Reduced from 0.5 to allow navigating narrow corridors
+                inflation_dist: 0.4 # Reduced from 0.6 to match standard costmap margin
+                include_costmap_obstacles: True
+                costmap_obstacles_behind_robot_dist: 1.0
+                obstacle_poses_affected: 30
+                
+                # Optimization
+                no_inner_iterations: 15
+                no_outer_iterations: 6
+                penalty_epsilon: 0.1
+                weight_obstacle: 60 # STRONGLY prioritize obstacle avoidance
+                weight_viopoint: 80 # Heavy path following
+                weight_adapt_factor: 2.0
+        </rosparam>
+    </node>
+</launch>

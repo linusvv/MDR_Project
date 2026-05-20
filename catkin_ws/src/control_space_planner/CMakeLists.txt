@@ -56,7 +56,8 @@ install(DIRECTORY launch/
     )
 
 
-## Removed targets for teb_planner_node and dwa_planner_node because
-## the corresponding source files are not present in this repository.
-## If you add src/teb_planner_node.cpp or src/dwa_planner_node.cpp,
-## re-enable the targets below.
+add_executable(teb_planner_node src/teb_planner_node.cpp)
+add_dependencies(teb_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(teb_planner_node
+  ${catkin_LIBRARIES}
+)

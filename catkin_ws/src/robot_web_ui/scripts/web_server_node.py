@@ -75,6 +75,11 @@ class RobotWebServer:
         self.bundles = self.load_bundles(self.yaml_path)
         self.load_stores_from_txt()
         self.load_tag_true_poses()
+        self.sign_database = self.load_sign_database()
+
+        # Complex Action State
+        self.active_delivery_task = None
+        self.task_thread = None
 
         # ROS Publishers
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
@@ -420,8 +425,9 @@ class RobotWebServer:
             rospy.loginfo("[Find Tag] Search finished/stopped.")
 
     def start_navigation_to_tag(self, tag_name):
-        # Cancel any active search
+        # Cancel any active search or delivery tasks
         self.searching_tag = False
+        self.active_delivery_task = None
         
         # Stop any existing navigation thread
         self.navigating_to_tag = False
@@ -433,6 +439,90 @@ class RobotWebServer:
         self.nav_thread.daemon = True
         self.nav_thread.start()
         return True
+
+    def start_delivery_search(self, category):
+        """Starts the complex workflow: Find sign -> Go to sign -> Align -> Crab search."""
+        self.stop_robot() # Reset all states
+        
+        self.active_delivery_task = category.upper()
+        self.task_thread = threading.Thread(target=self.delivery_search_workflow, args=(self.active_delivery_task,))
+        self.task_thread.daemon = True
+        self.task_thread.start()
+        return True
+
+    def delivery_search_workflow(self, target_category):
+        rospy.loginfo(f"[Delivery Task] Starting workflow for: {target_category}")
+        
+        # 1. FIND CLOSEST CROSSROAD SIGN (among known signs that point to this category)
+        rx, ry, _ = self.get_current_robot_pose()
+        best_tag = None
+        min_dist = float('inf')
+        target_dir = 0.0
+        
+        for entry in self.sign_database:
+            if target_category in entry['category']:
+                tag_name = entry['tag']
+                if tag_name in self.tag_true_poses:
+                    # In this simulation, tag_true_poses (non-STORE) are in world coords, need map projection or using current transform
+                    # To simplify for robust choice, assume we want closest in ESTIMATED map position
+                    pose_info = self.tag_true_poses[tag_name]
+                    # Project to map using current R/T
+                    with self.lock: R, T = self.R, self.T
+                    tag_map = np.dot(R, np.array([pose_info[0], pose_info[1]])) + T
+                    dist = np.hypot(rx - tag_map[0], ry - tag_map[1])
+                    
+                    if dist < min_dist:
+                        min_dist = dist
+                        best_tag = tag_name
+                        target_dir = entry['direction']
+                        
+        if not best_tag:
+            rospy.logwarn(f"[Delivery Task] No sign found for {target_category} in database.")
+            return
+
+        # 2. GO TO THE APRITAG (using motion planner)
+        rospy.loginfo(f"[Delivery Task] Step 1: Navigating to {best_tag} (dist: {min_dist:.2f}m)")
+        self.start_navigation_to_tag(best_tag)
+        
+        # Wait until arrived (navigation logic sets navigating_to_tag to False on arrival)
+        while not rospy.is_shutdown() and self.navigating_to_tag and self.active_delivery_task:
+            rospy.sleep(0.5)
+            
+        if not self.active_delivery_task: return # Task cancelled
+
+        # 3. ALIGN TO THE DIRECTION FROM THE ROAD SIGN
+        # First align to the tag's heading, then add the sign's relative direction
+        rospy.loginfo(f"[Delivery Task] Step 2: Aligning to sign direction ({target_dir} deg)")
+        _, _, tag_true_yaw_deg = self.tag_true_poses[best_tag]
+        # Map yaw = true_yaw + rotation from R
+        with self.lock: rot_angle = math.atan2(self.R[1, 0], self.R[0, 0])
+        target_yaw = math.radians(tag_true_yaw_deg) + rot_angle + math.radians(target_dir)
+        
+        self.rotate_to_yaw(target_yaw)
+        
+        # 4. YOLO CRAB MODE (Placeholder for next implementation)
+        rospy.loginfo(f"[Delivery Task] Step 3: Entering Crab Search Mode for {target_category} storefront...")
+        # ... logic to follow wall and use YOLO ...
+        
+        rospy.loginfo(f"[Delivery Task] SUCCESS: Arrived at {target_category}!")
+        self.active_delivery_task = None
+
+    def rotate_to_yaw(self, target_yaw):
+        """Simple proportional controller for rotation in-place."""
+        rate = rospy.Rate(10)
+        while not rospy.is_shutdown():
+            _, _, ryaw = self.get_current_robot_pose()
+            diff = (target_yaw - ryaw + math.pi) % (2 * math.pi) - math.pi
+            if abs(diff) < 0.05: break
+            
+            cmd = Twist()
+            cmd.angular.z = 1.0 * diff # P controller
+            # Clamp
+            if cmd.angular.z > 0.6: cmd.angular.z = 0.6
+            if cmd.angular.z < -0.6: cmd.angular.z = -0.6
+            self.cmd_vel_pub.publish(cmd)
+            rate.sleep()
+        self.cmd_vel_pub.publish(Twist()) # Stop
 
     def nav_to_tag_thread(self, tag_name):
         rospy.loginfo(f"[Tag Nav] Starting navigation to landmark {tag_name}...")
@@ -447,24 +537,27 @@ class RobotWebServer:
         psi_deg = pose_info[2]
         psi_rad = math.radians(psi_deg)
         
-        # Transform true pose to SLAM map coordinates
-        with self.lock:
-            R = self.R
-            T = self.T
-        
-        tag_map = np.dot(R, tag_pt) + T
-        tag_x, tag_y = tag_map[0], tag_map[1]
-        
-        # Transform heading (psi) to map coordinates
-        # Map heading = True heading + rotation angle from R
-        rot_angle = math.atan2(R[1, 0], R[0, 0])
-        psi_rad_map = psi_rad + rot_angle
-        
-        # Go directly to signboard position (no offset)
-        offset = 0.0
-        gx = tag_x
-        gy = tag_y
-        gyaw = psi_rad_map
+        if "STORE_" in tag_name:
+            # Store coordinates are already in Map frame
+            gx = tag_pt[0]
+            gy = tag_pt[1]
+            gyaw = psi_rad
+        else:
+            # AprilTag signboards are in World frame, transformed via R, T
+            with self.lock:
+                R = self.R
+                T = self.T
+            
+            tag_map = np.dot(R, tag_pt) + T
+            tag_x, tag_y = tag_map[0], tag_map[1]
+            
+            # Transform heading (psi) to map coordinates
+            rot_angle = math.atan2(R[1, 0], R[0, 0])
+            psi_rad_map = psi_rad + rot_angle
+            
+            gx = tag_x
+            gy = tag_y
+            gyaw = psi_rad_map
         
         rospy.loginfo(f"[Tag Nav] Target Pose in Map: ({gx:.2f}, {gy:.2f}, heading: {math.degrees(gyaw):.1f}°)")
         
@@ -845,6 +938,36 @@ class RobotWebServer:
                 rospy.loginfo(f"Web UI loaded true poses for {len(self.tag_true_poses)} signboards.")
             except Exception as e:
                 rospy.logwarn(f"Failed to load true poses: {e}")
+        
+        # Manually add the store coordinates to navigation list
+        store_names = ["STORE_1", "STORE_2", "STORE_3", "STORE_4", "STORE_5", "STORE_6", "STORE_7", "STORE_8"]
+        for idx, coord in enumerate(self.stores):
+            if idx < len(store_names):
+                name = store_names[idx]
+                # In simulation, these provided coordinates are actually already in the Map frame
+                # They are not true-world GPS coords that need R/T transformation.
+                self.tag_true_poses[name] = (coord[0], coord[1], 0.0)
+
+    def load_sign_database(self):
+        db = []
+        path = "/home/linusv/project_5/HW4/sign_list.txt"
+        if os.path.exists(path):
+            try:
+                with open(path, 'r') as f:
+                    for line in f:
+                        line = line.strip()
+                        if not line or line.startswith("#"): continue
+                        parts = [p.strip() for p in line.split(',')]
+                        if len(parts) >= 3:
+                            db.append({
+                                "tag": parts[0],
+                                "category": parts[1].upper(),
+                                "direction": float(parts[2])
+                            })
+                rospy.loginfo(f"Loaded {len(db)} sign entries from {path}")
+            except Exception as e:
+                rospy.logerr(f"Error loading sign database: {e}")
+        return db
 
     def estimate_rigid_transform_2d(self, pts_true, pts_meas, true_yaws=None, meas_yaws=None):
         n = len(pts_true)
@@ -1036,7 +1159,8 @@ class RobotWebServer:
 
                     # Draw shops on the SLAM map
                     for idx, store in enumerate(self.stores):
-                        s_x, s_y = self.project_store_to_map(store)
+                        # Store coords are directly in Map frame
+                        s_x, s_y = store[0], store[1]
                         s_col = int((s_x - origin.position.x) / resolution)
                         s_row = int((s_y - origin.position.y) / resolution)
                         s_row_flipped = height - 1 - s_row
@@ -1373,7 +1497,7 @@ def delivery_send():
             f"BLUE CAFE, BLUE STORE, GREEN STORE, ORANGE CAFE, RED BURGER, RED PHARMACY, WHITE CAFE, YELLOW BURGER.\n"
             f"Business Category categories are Cafe, Convenience store, Fast-food restaurant, Pharmacy.\n"
             f"Determine what they want, and return ONLY a raw JSON object with two keys:\n"
-            f"1. 'target' (string, the exact target category or store name, e.g. 'Café' or 'BLUE CAFE' or 'RED BURGER')\n"
+            f"1. 'target' (string, the exact target category or store name, e.g. 'Café' or 'BLUE CAFE' or 'STORE_1')\n"
             f"2. 'reply' (string, a cute, polite conversational response to display to the user, explaining where you will go to get this)."
         )
         
@@ -1417,6 +1541,13 @@ def delivery_send():
     resolved_tag = None
     if target:
         target_upper = target.upper().strip()
+        
+        # Check if we should use the complex sign-to-store workflow
+        if any(target_upper in entry['category'] for entry in server.sign_database):
+            rospy.loginfo(f"[Delivery API] Starting complex workflow for category: {target_upper}")
+            server.start_delivery_search(target_upper)
+            return jsonify({"reply": reply, "target": target})
+
         target_key = target_upper.replace(" ", "_")
         if target_key in server.tag_true_poses:
             resolved_tag = target_key

@@ -148,23 +148,23 @@ class MotionPlanner
     // Parameters
     double FOV = 85.2 * (M_PI / 180.0); // [rad] FOV of point cloud (realsense)
     double MAX_SENSOR_RANGE = 10.0; // [m] maximum sensor range (realsense)
-    double WHEELBASE = 0.1; // [m] wheelbase of the vehicle (our RC vehicle is near 0.26 m)
+    double WHEELBASE = 0.05; // [m] Reduced virtual wheelbase to allow tighter turning arcs
     double DIST_RESOL = 0.1; // [m] distance resolution for control space sampling
     double TIME_RESOL = 0.05; // [sec] time resolution between each motion (for rollout)
     double MOTION_VEL = DIST_RESOL / TIME_RESOL; // [m/s] velocity between each motion (for rollout)
-    double DELTA_RESOL = 0.2 * (M_PI / 180.0); // [rad] angle resolution for control space sampling
-    double MAX_DELTA = 45.0 * (M_PI / 180.0); // [rad] maximum angle for control space sampling
-    double MAX_PROGRESS = 5.0; // [m] max progress of motion
+    double DELTA_RESOL = 2.0 * (M_PI / 180.0); // [rad] increased angle resolution to sample more steering angles
+    double MAX_DELTA = 75.0 * (M_PI / 180.0); // [rad] increased maximum steering angle for U-turns
+    double MAX_PROGRESS = 3.0; // [m] reduced max progress for more frequent planning in tight spaces
 
-    double ARRIVAL_THRES = 1.0; // [m] distance threshold for arrival
+    double ARRIVAL_THRES = 0.3; // [m] further reduced for tighter targets
 
     // - cost weights
-    double W_COST_DIRECTION      = 15.0; // -- increased so it strongly prefers following the path direction
-    double W_COST_TRAVERSABILITY = 10.0; // -- online cost
+    double W_COST_DIRECTION      = 10.0; // -- slightly reduced to allow more deviation for obstacle avoidance
+    double W_COST_TRAVERSABILITY = 45.0; // -- significantly increased to prevent cutting corners and favor safety
     
     // - collision checking
-    double INFLATION_SIZE = 0.5 / mapResol; // [grid] inflation size [m] / grid_res [m/grid]. Reduced to allow narrow gaps.
-    double LOOKAHEAD_DIST = 0.7; // [m] lookahead distance for collision cheking
+    double INFLATION_SIZE = 0.35 / mapResol; // Increased to ~3.5 cells to represent robot footprint and prevent corner clipping
+    double LOOKAHEAD_DIST = 0.3; // [m] reduced lookahead to allow robot to see around sharp corners better
 
     // Motion primitives
     std::vector<std::vector<Node>> motionCandidates;

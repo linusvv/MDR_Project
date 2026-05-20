@@ -33,7 +33,10 @@ public:
     float MAP_MIN_Y = -10; // map min y position
     float MAP_MAX_Y =  10; // map max y position
 
-    float INFLATION_RADIUS = 0.4; // [m] size of inflation
+    float MIN_OBSTACLE_HEIGHT = 0.05; // [m] ignore ground points
+    float MAX_OBSTACLE_HEIGHT = 0.35; // [m] ignore elevated signboards/ceilings
+
+    float INFLATION_RADIUS = 0.1; // Reduced for thin walls and tight maze navigation
     float INFLATION_RES    = RESOLUTION_; // [m] resolution of inflation
     int INFLATION_BINS     = (INFLATION_RADIUS * 2) / INFLATION_RES + 1;
 
@@ -105,8 +108,11 @@ void HeightmapToCostMap::generate_costmap()
         // Generating cost map w.r.t. obstacles
         for (pcl::PointCloud<pcl::PointXYZ>::iterator it = cloud_xyz->begin(); it != cloud_xyz->end(); it++)
         {
-            // check for nan points && min/max points
-            if ((!(isnan(it->x) | isnan(it->y))) && (it->x > MAP_MIN_X && it->x < MAP_MAX_X) && (it->y > MAP_MIN_Y && it->y < MAP_MAX_Y))
+            // check for nan points && min/max points && height filtering (ignore signboards in air)
+            if ((!(isnan(it->x) | isnan(it->y))) && 
+                (it->x > MAP_MIN_X && it->x < MAP_MAX_X) && 
+                (it->y > MAP_MIN_Y && it->y < MAP_MAX_Y) &&
+                (it->z > MIN_OBSTACLE_HEIGHT && it->z < MAX_OBSTACLE_HEIGHT))
             {
                 int x = int((it->x - MAP_MIN_X) / RESOLUTION_);
                 int y = int((it->y - MAP_MIN_Y) / RESOLUTION_);

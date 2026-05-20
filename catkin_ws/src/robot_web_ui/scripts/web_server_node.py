@@ -52,6 +52,9 @@ class RobotWebServer:
         self.stores = []
         self.detected_tags = {}
         self.shop_categories = {}
+        self.local_costmap = None
+        self.motion_candidates = []
+        self.planner_logs = []
         self.R = np.eye(2)
         self.T = np.array([0.0, -3.125])
         self.T_map_odom = np.eye(4)
@@ -82,8 +85,10 @@ class RobotWebServer:
         rospy.Subscriber('/camera/depth/image_raw', Image, self.depth_cb)
         rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.cam_info_cb)
         rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.map_cb)
+        rospy.Subscriber('/map/local_map/obstacle', OccupancyGrid, self.local_map_cb)
         rospy.Subscriber('/semantic_observations', String, self.semantic_cb)
         rospy.Subscriber('/points/selected_motion', PointCloud2, self.motion_cb)
+        rospy.Subscriber('/points/motion_primitives', PointCloud2, self.motion_candidates_cb)
         rospy.Subscriber('/rosout', Log, self.rosout_cb)
         
         if AprilTagDetectionArray is not None:
@@ -210,12 +215,41 @@ class RobotWebServer:
             self.selected_motion_pts = pts
             self.selected_motion_frame = msg.header.frame_id
 
+    def motion_candidates_cb(self, msg):
+        candidates = []
+        # Motion primitives are published as a point cloud where each point's intensity (Z) is the same for a primitive
+        last_primitive_id = None
+        current_primitive = []
+        
+        for p in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            pid = p[2]
+            if last_primitive_id is not None and pid != last_primitive_id:
+                candidates.append(current_primitive)
+                current_primitive = []
+            
+            current_primitive.append((p[0], p[1]))
+            last_primitive_id = pid
+            
+        if current_primitive:
+            candidates.append(current_primitive)
+            
+        with self.lock:
+            self.motion_candidates = candidates
+
     def rosout_cb(self, msg):
-        """Filters logs to only keep those from the motion planner."""
-        # The node name in launch is /control_space_planner_node
-        if msg.name == "/control_space_planner_node":
+        """Filters logs to only keep those from the motion planner and related safety services."""
+        # Relevant nodes for navigation safety
+        relevant_nodes = [
+            "/control_space_planner_node", 
+            "/heightmap_costmap_node",
+            "/heightmap_node",
+            "/agent_node"
+        ]
+        if msg.name in relevant_nodes:
             with self.lock:
-                self.planner_logs.append(msg.msg)
+                # Format: [NodeName] Message
+                log_entry = f"[{msg.name.split('/')[-1]}] {msg.msg}"
+                self.planner_logs.append(log_entry)
                 # Keep only last 50 logs to avoid memory bloat
                 if len(self.planner_logs) > 50:
                     self.planner_logs.pop(0)
@@ -781,6 +815,10 @@ class RobotWebServer:
         with self.lock:
             self.grid_map = msg
 
+    def local_map_cb(self, msg):
+        with self.lock:
+            self.local_costmap = msg
+
     def load_stores_from_txt(self):
         file_path = "/home/linusv/project_5/HW4/Store coordinates.txt"
         if os.path.exists(file_path):
@@ -1004,6 +1042,75 @@ class RobotWebServer:
                            b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
             rate.sleep()
 
+    def generate_local_planner_frames(self):
+        """Renders local occupancy grid and motion primitives."""
+        rate = rospy.Rate(10)
+        while not rospy.is_shutdown():
+            canvas = None
+            with self.lock:
+                grid = self.local_costmap
+                candidates = list(self.motion_candidates)
+                selected = list(self.selected_motion_pts)
+            
+            if grid is not None:
+                width = grid.info.width
+                height = grid.info.height
+                res = grid.info.resolution
+                origin = grid.info.origin
+                
+                # Render local costmap data
+                data = np.array(grid.data, dtype=np.int8).reshape((height, width))
+                # 0 (free) -> dark blue [30, 20, 10]
+                # 100 (obs) -> light gray [200, 200, 200]
+                # Unknown (-1) -> black
+                viz = np.zeros((height, width, 3), dtype=np.uint8)
+                viz[data == 0] = [30, 20, 10]
+                viz[(data > 0)] = [200, 200, 200]
+                viz[data == -1] = [5, 5, 5]
+                viz = cv2.flip(viz, 0) # Base link frame usually has X forward (up in image)
+                
+                # Draw motion primitives (all candidates in dim green)
+                for primitive in candidates:
+                    for i in range(1, len(primitive)):
+                        p1 = primitive[i-1]
+                        p2 = primitive[i]
+                        # Convert local meters to pixel coordinates (centered on robot at origin)
+                        # Local origin in heightmap is usually bottom-left
+                        pt1 = (int((p1[0] - origin.position.x) / res), height - 1 - int((p1[1] - origin.position.y) / res))
+                        pt2 = (int((p2[0] - origin.position.x) / res), height - 1 - int((p2[1] - origin.position.y) / res))
+                        cv2.line(viz, pt1, pt2, (0, 100, 0), 1)
+                
+                # Draw selected path (thick cyan)
+                for i in range(1, len(selected)):
+                    p1 = selected[i-1]
+                    p2 = selected[i]
+                    pt1 = (int((p1[0] - origin.position.x) / res), height - 1 - int((p1[1] - origin.position.y) / res))
+                    pt2 = (int((p2[0] - origin.position.x) / res), height - 1 - int((p2[1] - origin.position.y) / res))
+                    cv2.line(viz, pt1, pt2, (255, 255, 0), 2)
+                
+                # Draw robot at frame center (0,0 local)
+                r_col = int((0 - origin.position.x) / res)
+                r_row = height - 1 - int((0 - origin.position.y) / res)
+                cv2.circle(viz, (r_col, r_row), 3, (0, 0, 255), -1)
+                
+                canvas = viz
+            
+            if canvas is not None:
+                # Resize for display
+                disp = cv2.resize(canvas, (400, 400), interpolation=cv2.INTER_NEAREST)
+                ret, buffer = cv2.imencode('.jpg', disp)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            else:
+                placeholder = np.zeros((400, 400, 3), dtype=np.uint8)
+                cv2.putText(placeholder, "No Local Grid", (120, 200), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (100, 100, 100), 1)
+                ret, buffer = cv2.imencode('.jpg', placeholder)
+                if ret:
+                    yield (b'--frame\r\n'
+                           b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+            rate.sleep()
+
 
 # Flask Routes
 @app.route('/')
@@ -1023,6 +1130,11 @@ def video_depth():
 @app.route('/video_map')
 def video_map():
     return Response(server.generate_map_frames(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/video_local_planner')
+def video_local_planner():
+    return Response(server.generate_local_planner_frames(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 @app.route('/api/status')

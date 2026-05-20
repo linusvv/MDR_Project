@@ -119,9 +119,17 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
   }
 
   // Emergency Brake: If the immediate path is dangerous (too close to a wall)
-  // Check the first few nodes of the rollout for high cost values (above 85 indicates <10cm with 60cm inflation)
+  // Check the first few nodes of the rollout for high cost values (above 90 indicates wall contact)
+  // We only brake if we are NOT actively steering away (i.e. cost is increasing or staying high)
+  bool recovering = false;
+  if (motionMinCost.size() >= 3) {
+      if (motionMinCost[2].cost_colli < motionMinCost[0].cost_colli - 2.0) {
+          recovering = true;
+      }
+  }
+
   for (size_t i = 0; i < std::min(motionMinCost.size(), (size_t)3); ++i) {
-      if (motionMinCost[i].cost_colli > 85) {
+      if (motionMinCost[i].cost_colli >= 90 && !recovering) {
           ROS_WARN_THROTTLE(1, "EMERGENCY BRAKE: Wall proximity detected (Cost: %f)", motionMinCost[i].cost_colli);
           this->StopRobot();
           return;
@@ -212,7 +220,7 @@ void MotionPlanner::Plan()
       this->last_closest_idx = closest_idx;
 
       // Dynamically adjust lookahead based on our deviation so the target is always ahead!
-      double lookahead = std::max(1.5, min_dist + 0.5);
+      double lookahead = std::max(2.5, min_dist + 1.0);
 
       // Find lookahead index starting from closest
       int target_idx = this->globalPath.poses.size() - 1;
@@ -379,7 +387,10 @@ std::vector<Node> MotionPlanner::RolloutMotion(Node startNode,
       if (max_occ > this->OCCUPANCY_THRES) {
         if (motionPrimitive.empty()) {
           // Ensure we return at least one node to avoid complete array-size crashes and maintain a crawl speed
+          currMotionNode.collision = true;
           motionPrimitive.push_back(currMotionNode);
+        } else {
+          motionPrimitive.back().collision = true;
         }
         return motionPrimitive;
       }
@@ -449,8 +460,16 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
       // This forces the planner to steer away from obstacles and pick longer surviving trajectories!
       double expected_size = this->MAX_PROGRESS / this->DIST_RESOL;
       double cost_collision_penalty = 0.0;
-      if (motionPrimitive.size() < expected_size - 1) {
-          cost_collision_penalty = (expected_size - motionPrimitive.size()) * 2.0; // Scaled down so it doesn't flee entirely backward in panic!
+      bool has_collision = false;
+      for (const auto& node : motionPrimitive) {
+          if (node.collision) {
+              has_collision = true;
+              break;
+          }
+      }
+      if (has_collision || motionPrimitive.size() < expected_size - 1) {
+          // Enormous penalty for trajectories that collide or terminate early
+          cost_collision_penalty = 10000000.0 + (expected_size - motionPrimitive.size()) * 100000.0;
       }
       
       // Use maximum occupancy encountered as the traversability cost
@@ -564,7 +583,7 @@ bool MotionPlanner::CheckRunCondition()
 
   std::string state = "IDLE";
   ros::param::getCached("/exploration_state", state);
-  if (state == "IDLE" || state == "STOP") {
+  if (state == "IDLE" || state == "STOP" || state == "RECOVERY") {
     return false;
   }
 

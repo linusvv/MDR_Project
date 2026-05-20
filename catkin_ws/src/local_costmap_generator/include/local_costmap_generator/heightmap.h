@@ -52,6 +52,7 @@ private:
   double m_per_cell_;
   double height_diff_threshold_;
   bool full_clouds_;
+  double max_obstacle_height_;
 
   // Point clouds generated in processData
   VPointCloud obstacle_cloud_;            

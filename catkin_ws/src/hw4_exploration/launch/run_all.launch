@@ -62,7 +62,7 @@
     <node name="tag_visualizer" pkg="hw4_exploration" type="tag_visualizer.py" output="screen" />
 
     <!-- 10. Start the Stage Handler Agent Brain -->
-    <node name="agent_node" pkg="hw4_exploration" type="agent_node.py" output="screen" />
+    <!-- <node name="agent_node" pkg="hw4_exploration" type="agent_node.py" output="screen" /> -->
 
     <group if="$(arg use_rviz)">
         <node pkg="rviz" type="rviz" name="rviz_display" args="-d $(find hw4_exploration)/rviz/ee478_rtabmap.rviz" output="screen" />

@@ -140,7 +140,7 @@ class MotionPlanner
     double mapMinY = -10.0;
     double mapMaxY = 10.0;
     double mapResol = 0.1; // [m / grid]
-    int OCCUPANCY_THRES = 50;
+    int OCCUPANCY_THRES = 90;
 
     double origin_x = 0.0;
     double origin_y = 0.0;
@@ -151,7 +151,7 @@ class MotionPlanner
     double MAX_SENSOR_RANGE = 10.0; // [m] maximum sensor range (realsense)
     double WHEELBASE = 0.05; // [m] Reduced virtual wheelbase to allow tighter turning arcs
     double DIST_RESOL = 0.1; // [m] distance resolution for control space sampling
-    double TIME_RESOL = 0.1; // [sec] Doubled time resolution to halve velocity to 1.0 m/s
+    double TIME_RESOL = 0.2; // [sec] Doubled time resolution to halve velocity to 0.5 m/s
     double MOTION_VEL = DIST_RESOL / TIME_RESOL; // [m/s] velocity between each motion (for rollout)
     double DELTA_RESOL = 4.0 * (M_PI / 180.0); // Doubled resolution to increase search speed & stability
     double MAX_DELTA = 75.0 * (M_PI / 180.0); // [rad] increased maximum steering angle for U-turns
@@ -164,8 +164,8 @@ class MotionPlanner
     double W_COST_TRAVERSABILITY = 800.0; // Increased to prioritize wall avoidance above all else
     
     // - collision checking
-    double INFLATION_SIZE = 1; // Only check the center axis; let the cost gradient handle wall avoidance
-    double LOOKAHEAD_DIST = 0.3; // [m] reduced lookahead to allow robot to see around sharp corners better
+    double INFLATION_SIZE = 3; // 3x3 footprint (30cm) to account for robot physical width
+    double LOOKAHEAD_DIST = 2.5; // [m] increased lookahead for smoother tracking
 
     // Motion primitives
     std::vector<std::vector<Node>> motionCandidates;

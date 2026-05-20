@@ -33,8 +33,8 @@ public:
     float MAP_MIN_Y = -10; // map min y position
     float MAP_MAX_Y =  10; // map max y position
 
-    float MIN_OBSTACLE_HEIGHT = 0.05; // [m] ignore ground points
-    float MAX_OBSTACLE_HEIGHT = 0.80; // [m] Increased to 80cm to capture walls (must overlap with heightmap.cpp's 0.25m threshold)
+    float MIN_OBSTACLE_HEIGHT = 0.04; // [m] ignore ground points
+    float MAX_OBSTACLE_HEIGHT = 0.20; // [m] Limit to 20cm to allow passing under floating signboards
 
     float INFLATION_RADIUS = 0.6; // [m] Increased to 1.5x (0.4m -> 0.6m) for a larger dangerous zone
     float INFLATION_RES    = RESOLUTION_; // [m] resolution of inflation
@@ -106,7 +106,7 @@ void HeightmapToCostMap::generate_costmap()
                 if ((!(isnan(it->x) | isnan(it->y))) && 
                     (it->x >= MAP_MIN_X && it->x < MAP_MAX_X) && 
                     (it->y >= MAP_MIN_Y && it->y < MAP_MAX_Y) &&
-                    (it->z > MIN_OBSTACLE_HEIGHT && it->z < MAX_OBSTACLE_HEIGHT))
+                    (it->z >= MIN_OBSTACLE_HEIGHT && it->z < MAX_OBSTACLE_HEIGHT))
                 {
                     int x = int((it->x - MAP_MIN_X) / RESOLUTION_);
                     int y = int((it->y - MAP_MIN_Y) / RESOLUTION_);

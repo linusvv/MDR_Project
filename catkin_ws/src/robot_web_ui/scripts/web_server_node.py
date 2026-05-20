@@ -126,7 +126,9 @@ class RobotWebServer:
                 if self.camera_info is not None and len(self.tag_detections) > 0:
                     cv_image = self.draw_tags(cv_image)
                     
-                if hasattr(self, 'selected_motion_pts') and self.camera_info is not None:
+                is_paused = rospy.get_param("/exploration_paused", False)
+                explore_state = rospy.get_param("/exploration_state", "IDLE")
+                if not is_paused and explore_state == "EXPLORE" and hasattr(self, 'selected_motion_pts') and self.camera_info is not None:
                     cv_image = self.draw_path(cv_image)
                     
             self.color_image = cv_image
@@ -466,6 +468,9 @@ class RobotWebServer:
         last_progress_time = rospy.Time.now()
         start_time = rospy.Time.now()
         
+        use_waypoint = False
+        recovery_waypoint = None
+        
         while not rospy.is_shutdown() and self.navigating_to_tag:
             rx, ry, ryaw = self.get_current_robot_pose()
             self.robot_x = rx
@@ -483,6 +488,14 @@ class RobotWebServer:
                 rospy.loginfo("[Tag Nav] Navigation and alignment completed successfully.")
                 break
                 
+            # If we are close to the waypoint, clear it to resume direct path to goal
+            if use_waypoint and recovery_waypoint is not None:
+                dist_to_wp = math.hypot(rx - recovery_waypoint[0], ry - recovery_waypoint[1])
+                if dist_to_wp < 0.6:
+                    rospy.loginfo("[Tag Nav] Arrived at recovery waypoint. Clearing waypoint.")
+                    use_waypoint = False
+                    recovery_waypoint = None
+                    
             # Publish path to goal
             path = Path()
             path.header.frame_id = "map"
@@ -492,12 +505,26 @@ class RobotWebServer:
             p0.header.frame_id = "map"
             p0.pose.position.x = rx
             p0.pose.position.y = ry
-            # Orientation facing target
-            angle_to_goal = math.atan2(gy - ry, gx - rx)
-            q0 = tf.transformations.quaternion_from_euler(0, 0, angle_to_goal)
+            
+            # Orientation facing next point
+            if use_waypoint and recovery_waypoint is not None:
+                target_x, target_y = recovery_waypoint
+            else:
+                target_x, target_y = gx, gy
+            angle_to_next = math.atan2(target_y - ry, target_x - rx)
+            q0 = tf.transformations.quaternion_from_euler(0, 0, angle_to_next)
             p0.pose.orientation = Quaternion(*q0)
             path.poses.append(p0)
             
+            if use_waypoint and recovery_waypoint is not None:
+                p_wp = PoseStamped()
+                p_wp.header.frame_id = "map"
+                p_wp.pose.position.x = recovery_waypoint[0]
+                p_wp.pose.position.y = recovery_waypoint[1]
+                q_wp = tf.transformations.quaternion_from_euler(0, 0, angle_to_next)
+                p_wp.pose.orientation = Quaternion(*q_wp)
+                path.poses.append(p_wp)
+                
             p1 = PoseStamped()
             p1.header.frame_id = "map"
             p1.pose.position.x = gx
@@ -516,12 +543,58 @@ class RobotWebServer:
                     last_progress_x = rx
                     last_progress_y = ry
                     last_progress_time = now
-                elif (now - last_progress_time).to_sec() > 8.0:
-                    rospy.logwarn("[Tag Nav] Stuck/No progress made for 8 seconds. Aborting navigation.")
-                    break
+                elif (now - last_progress_time).to_sec() > 3.0:
+                    rospy.logwarn("[Tag Nav] Stuck/No progress made for 3 seconds. Initiating recovery sequence...")
                     
-            if (now - start_time).to_sec() > 45.0:
-                rospy.logwarn("[Tag Nav] Navigation timeout (45 seconds).")
+                    # 1. Disable C++ planner by setting state to RECOVERY
+                    rospy.set_param("/exploration_state", "RECOVERY")
+                    
+                    # 2. Go backwards for 0.5 seconds
+                    backup_end = rospy.Time.now() + rospy.Duration(0.5)
+                    while rospy.Time.now() < backup_end and not rospy.is_shutdown() and self.navigating_to_tag:
+                        twist = Twist()
+                        twist.linear.x = -0.15
+                        twist.angular.z = 0.0
+                        self.cmd_vel_pub.publish(twist)
+                        rospy.sleep(0.05)
+                        
+                    # Stop backup
+                    self.cmd_vel_pub.publish(Twist())
+                    
+                    # 3. Spin in place (turn)
+                    import random
+                    spin_dir = 0.6 if random.random() < 0.5 else -0.6
+                    spin_end = rospy.Time.now() + rospy.Duration(1.5)
+                    while rospy.Time.now() < spin_end and not rospy.is_shutdown() and self.navigating_to_tag:
+                        twist = Twist()
+                        twist.linear.x = 0.0
+                        twist.angular.z = spin_dir
+                        self.cmd_vel_pub.publish(twist)
+                        rospy.sleep(0.05)
+                        
+                    # Stop spin
+                    self.cmd_vel_pub.publish(Twist())
+                    
+                    # Get new pose after spin
+                    rx, ry, ryaw = self.get_current_robot_pose()
+                    
+                    # 4. Try a different way: set a waypoint 1.5m ahead of the new yaw
+                    waypoint_x = rx + 1.5 * math.cos(ryaw)
+                    waypoint_y = ry + 1.5 * math.sin(ryaw)
+                    recovery_waypoint = (waypoint_x, waypoint_y)
+                    use_waypoint = True
+                    rospy.loginfo(f"[Tag Nav] Set recovery waypoint at ({waypoint_x:.2f}, {waypoint_y:.2f})")
+                    
+                    # 5. Re-enable C++ planner
+                    rospy.set_param("/exploration_state", "EXPLORE")
+                    
+                    # Reset progress tracker
+                    last_progress_x = rx
+                    last_progress_y = ry
+                    last_progress_time = rospy.Time.now()
+                    
+            if (now - start_time).to_sec() > 120.0:
+                rospy.logwarn("[Tag Nav] Navigation timeout (120 seconds).")
                 break
                 
             rate.sleep()
@@ -1172,13 +1245,12 @@ def api_status():
     is_paused = rospy.get_param("/exploration_paused", False)
     explore_state = rospy.get_param("/exploration_state", "IDLE")
 
-@app.route('/api/logs')
-def api_logs():
-    with server.lock:
-        logs = list(server.planner_logs)
-        server.planner_logs = []
-    return jsonify({"logs": logs})
-    
+    # Update robot's pose from TF to ensure status has the absolute latest pose
+    rx, ry, ryaw = server.get_current_robot_pose()
+    server.robot_x = rx
+    server.robot_y = ry
+    server.robot_yaw = ryaw
+
     # Map raw state to simple status string for UI highlighting: 'play', 'pause', or 'stop'
     status_str = "stop"
     if explore_state in ["EXPLORE", "READ_SIGN", "TURN", "CHECK_SHOP"]:
@@ -1206,6 +1278,13 @@ def api_logs():
         "navigating_to_tag": server.navigating_to_tag if hasattr(server, 'navigating_to_tag') else False
     }
     return jsonify(status)
+
+@app.route('/api/logs')
+def api_logs():
+    with server.lock:
+        logs = list(server.planner_logs)
+        server.planner_logs = []
+    return jsonify({"logs": logs})
 
 @app.route('/api/set_api_key', methods=['POST'])
 def set_api_key():
@@ -1283,6 +1362,9 @@ def delivery_send():
     if not message:
         return jsonify({"reply": "I did not receive a message. Please say something!"})
         
+    target = ""
+    reply = ""
+    
     # Call the /llm_query service of the stateless client to parse the user's intent!
     try:
         rospy.wait_for_service("llm_query", timeout=2.0)
@@ -1314,20 +1396,12 @@ def delivery_send():
         target = parsed.get("target", "")
         reply = parsed.get("reply", "Understood! Moving to target.")
         
-        if target:
-            msg = String()
-            msg.data = target
-            server.user_prompt_pub.publish(msg)
-            
-        return jsonify({"reply": reply, "target": target})
-        
     except Exception as e:
         rospy.logwarn(f"LLM Query failed or timed out: {e}")
         # Standard local backup parser for simple keywords
         reply = "I'm in offline Local Mode. Let me parse that... "
-        target = ""
         m = message.lower()
-        if "burger" in m or "food" in m or "burger" in m or "restaurant" in m:
+        if "burger" in m or "food" in m or "restaurant" in m:
             target = "Fast-food restaurant"
             reply += "Ah! You want a burger. I will navigate to the Fast-food restaurant!"
         elif "coffee" in m or "cafe" in m or "drink" in m:
@@ -1342,12 +1416,34 @@ def delivery_send():
         else:
             reply = "I'm not sure which storefront matches that request. Try asking for coffee, a burger, medicine, or the convenience store!"
             
-        if target:
-            msg = String()
-            msg.data = target
-            server.user_prompt_pub.publish(msg)
-            
-        return jsonify({"reply": reply, "target": target})
+    # Direct navigation resolution
+    resolved_tag = None
+    if target:
+        target_upper = target.upper().strip()
+        target_key = target_upper.replace(" ", "_")
+        if target_key in server.tag_true_poses:
+            resolved_tag = target_key
+        else:
+            # Check if it matches a category value in server.shop_categories (mapped store category)
+            for store_name, category in server.shop_categories.items():
+                if category.upper().strip() == target_upper or target_upper in category.upper().strip():
+                    store_key = store_name.upper().replace(" ", "_")
+                    if store_key in server.tag_true_poses:
+                        resolved_tag = store_key
+                        break
+                        
+            # If still not found, try partial match in store names
+            if not resolved_tag:
+                for k in server.tag_true_poses.keys():
+                    if k in target_key or target_key in k:
+                        resolved_tag = k
+                        break
+                        
+    if resolved_tag:
+        rospy.loginfo(f"[Delivery API] Starting direct navigation to resolved landmark: {resolved_tag}")
+        server.start_navigation_to_tag(resolved_tag)
+        
+    return jsonify({"reply": reply, "target": target})
 
 @app.route('/api/semantic_map')
 def api_semantic_map():

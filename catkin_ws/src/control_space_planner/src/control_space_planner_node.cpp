@@ -344,7 +344,11 @@ std::vector<Node> MotionPlanner::RolloutMotion(Node startNode,
       // - local to map coordinate transform
       Node collisionPointNode(currMotionNode.x, currMotionNode.y, currMotionNode.z, currMotionNode.yaw, currMotionNode.delta, 0, 0, 0, -1, false);
       Node collisionPointNodeMap = LocalToPlannerCorrdinate(collisionPointNode);
-      if (CheckCollision(collisionPointNodeMap, localMap)) {
+      
+      int max_occ = GetMaxOccupancy(collisionPointNodeMap, localMap);
+      currMotionNode.cost_colli = (double)max_occ;
+
+      if (max_occ > this->OCCUPANCY_THRES) {
         if (motionPrimitive.empty()) {
           // Ensure we return at least one node to avoid complete array-size crashes and maintain a crawl speed
           motionPrimitive.push_back(currMotionNode);
@@ -421,8 +425,14 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
           cost_collision_penalty = (expected_size - motionPrimitive.size()) * 2.0; // Scaled down so it doesn't flee entirely backward in panic!
       }
       
-      // Extremely heavily penalize primitives that just aim backward (driving away from goal) to survive
-      double cost_total = this->W_COST_TRAVERSABILITY * cost_dist + this->W_COST_DIRECTION * cost_direction + cost_collision_penalty;
+      // Use maximum occupancy encountered as the traversability cost
+      double max_traversability_cost = 0;
+      for(const auto& node : motionPrimitive) {
+          if(node.cost_colli > max_traversability_cost) max_traversability_cost = node.cost_colli;
+      }
+
+      // Final Cost formulation: massive penalty for high occupancy (wall proximity)
+      double cost_total = this->W_COST_TRAVERSABILITY * (cost_dist + (max_traversability_cost * max_traversability_cost)/100.0) + this->W_COST_DIRECTION * cost_direction + cost_collision_penalty;
       
       if (cost_direction > M_PI / 1.5) {
           cost_total += 5000.0;
@@ -442,6 +452,30 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
 }
 
 /* ----- Util Functions ----- */
+
+int MotionPlanner::GetMaxOccupancy(Node goalNodePlanner, nav_msgs::OccupancyGrid localMap)
+{
+  int inflation_size = static_cast<int>(this->INFLATION_SIZE);
+  int map_width = localMap.info.width;
+  int map_height = localMap.info.height;
+  int max_occ = 0;
+
+  for (int i = 0; i < inflation_size; ++i) {
+    for (int j = 0; j < inflation_size; ++j) {
+      int tmp_x = static_cast<int>(goalNodePlanner.x + i - 0.5 * inflation_size);
+      int tmp_y = static_cast<int>(goalNodePlanner.y + j - 0.5 * inflation_size);
+      
+      if (tmp_x >= 0 && tmp_x < map_width && tmp_y >= 0 && tmp_y < map_height) {
+        int map_index = tmp_y * map_width + tmp_x;
+        int16_t map_value = static_cast<int16_t>(localMap.data[map_index]);
+        if (map_value > max_occ) {
+          max_occ = map_value;
+        }
+      }
+    }
+  }
+  return max_occ;
+}
 
 bool MotionPlanner::CheckCollision(Node goalNodePlanner, nav_msgs::OccupancyGrid localMap)
 {

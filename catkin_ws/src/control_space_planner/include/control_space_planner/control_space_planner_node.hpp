@@ -123,6 +123,7 @@ class MotionPlanner
     std::vector<Node> RolloutMotion(Node startNode, double maxProgress, nav_msgs::OccupancyGrid localMap);
     std::vector<Node> SelectMotion(std::vector<std::vector<Node>> motionPrimitives);
     bool CheckCollision(Node goalNode, nav_msgs::OccupancyGrid localMap);
+    int GetMaxOccupancy(Node goalNode, nav_msgs::OccupancyGrid localMap);
     bool CheckRunCondition();
     Node GlobalToLocalCoordinate(Node globalNode, nav_msgs::Odometry egoOdom);
     geometry_msgs::PoseStamped GlobalToLocalCoordinate(geometry_msgs::PoseStamped poseGlobal, nav_msgs::Odometry egoOdom);
@@ -154,16 +155,16 @@ class MotionPlanner
     double MOTION_VEL = DIST_RESOL / TIME_RESOL; // [m/s] velocity between each motion (for rollout)
     double DELTA_RESOL = 2.0 * (M_PI / 180.0); // [rad] increased angle resolution to sample more steering angles
     double MAX_DELTA = 75.0 * (M_PI / 180.0); // [rad] increased maximum steering angle for U-turns
-    double MAX_PROGRESS = 3.0; // [m] reduced max progress for more frequent planning in tight spaces
+    double MAX_PROGRESS = 2.0; // Reduced for even more reactive planning in extremely tight corridors
 
     double ARRIVAL_THRES = 0.3; // [m] further reduced for tighter targets
 
     // - cost weights
-    double W_COST_DIRECTION      = 10.0; // -- slightly reduced to allow more deviation for obstacle avoidance
-    double W_COST_TRAVERSABILITY = 45.0; // -- significantly increased to prevent cutting corners and favor safety
+    double W_COST_DIRECTION      = 1.0; // -- Heavily reduced to allow any angle needed for safety
+    double W_COST_TRAVERSABILITY = 300.0; // -- Massive multiplier to make the robot highly allergic to walls
     
     // - collision checking
-    double INFLATION_SIZE = 0.35 / mapResol; // Increased to ~3.5 cells to represent robot footprint and prevent corner clipping
+    double INFLATION_SIZE = 1; // Only check the center axis; let the cost gradient handle wall avoidance
     double LOOKAHEAD_DIST = 0.3; // [m] reduced lookahead to allow robot to see around sharp corners better
 
     // Motion primitives

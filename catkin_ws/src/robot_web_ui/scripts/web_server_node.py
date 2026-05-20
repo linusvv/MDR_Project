@@ -1058,15 +1058,22 @@ class RobotWebServer:
                 res = grid.info.resolution
                 origin = grid.info.origin
                 
-                # Render local costmap data
-                data = np.array(grid.data, dtype=np.int8).reshape((height, width))
-                # 0 (free) -> dark blue [30, 20, 10]
-                # 100 (obs) -> light gray [200, 200, 200]
-                # Unknown (-1) -> black
-                viz = np.zeros((height, width, 3), dtype=np.uint8)
-                viz[data == 0] = [30, 20, 10]
-                viz[(data > 0)] = [200, 200, 200]
-                viz[data == -1] = [5, 5, 5]
+                # Render local costmap data with continuous gradient
+                data = np.array(grid.data, dtype=np.uint8).reshape((height, width))
+                # Base view: Dark background for free space
+                viz = np.full((height, width, 3), (30, 20, 10), dtype=np.uint8)
+                
+                # Apply heat map to visualize the 40cm continuous gradient
+                # map_value 100 is solid wall, <100 is the repulsive field
+                mask_gradient = (data > 0)
+                # Map occupancy (0-100) to a red-tinted hazard gradient
+                viz[mask_gradient, 2] = np.clip(viz[mask_gradient, 2].astype(np.int16) + data[mask_gradient] * 2, 0, 255) # Red channel
+                viz[mask_gradient, 1] = np.clip(viz[mask_gradient, 1].astype(np.int16) + data[mask_gradient], 0, 255)     # Green channel (yellowish tint)
+                
+                # Solid walls (data == 100) are white/light gray
+                viz[data >= 100] = [200, 200, 200]
+                viz[data == 255] = [5, 5, 5] # Handle signed/unsigned wrap for -1 unknown
+                
                 viz = cv2.flip(viz, 0) # Base link frame usually has X forward (up in image)
                 
                 # Draw motion primitives (all candidates in dim green)

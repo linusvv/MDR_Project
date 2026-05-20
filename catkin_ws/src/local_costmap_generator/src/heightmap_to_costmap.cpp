@@ -34,9 +34,9 @@ public:
     float MAP_MAX_Y =  10; // map max y position
 
     float MIN_OBSTACLE_HEIGHT = 0.05; // [m] ignore ground points
-    float MAX_OBSTACLE_HEIGHT = 0.35; // [m] ignore elevated signboards/ceilings
+    float MAX_OBSTACLE_HEIGHT = 0.20; // [m] ignore elevated signboards/ceilings (Strictly 20cm)
 
-    float INFLATION_RADIUS = 0.1; // Reduced for thin walls and tight maze navigation
+    float INFLATION_RADIUS = 0.4; // [m] Radius for the continuous gradient field
     float INFLATION_RES    = RESOLUTION_; // [m] resolution of inflation
     int INFLATION_BINS     = (INFLATION_RADIUS * 2) / INFLATION_RES + 1;
 
@@ -131,7 +131,11 @@ void HeightmapToCostMap::generate_costmap()
                                 double dx = i * INFLATION_RES - INFLATION_RADIUS;
                                 double dy = j * INFLATION_RES - INFLATION_RADIUS;
                                 double dist = sqrt(pow(dx, 2.0) + pow(dy, 2.0));
-                                double map_value = 100 - std::min(50.0, 20 * dist);
+                                
+                                if (dist > INFLATION_RADIUS) continue; 
+
+                                // Continuous linear gradient from 100 at center to 0 at 0.4m
+                                double map_value = 100.0 * (1.0 - (dist / INFLATION_RADIUS));
 
                                 double padded_x = current_x + dx;
                                 double padded_y = current_y + dy;

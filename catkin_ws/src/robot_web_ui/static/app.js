@@ -42,20 +42,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const tabBtns = document.querySelectorAll('.tab-btn');
     const tabPanels = document.querySelectorAll('.tab-panel');
     
-    async function sendExplorationCmd(command) {
-        try {
-            const res = await fetch('/api/exploration/control', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ command })
-            });
-            await res.json();
-            logConsole(`Exploration Command: ${command.toUpperCase()}`);
-        } catch (error) {
-            console.error("Failed to send exploration command", error);
-            logConsole(`Error: Failed to execute ${command} control`);
-        }
-    }
+
 
     tabBtns.forEach(btn => {
         btn.addEventListener('click', () => {
@@ -64,10 +51,7 @@ document.addEventListener('DOMContentLoaded', () => {
             
             const targetTab = btn.dataset.tab;
             
-            // Automatically stop exploration if switching to RC mode or Delivery mode
-            if (targetTab === 'rc' || targetTab === 'delivery') {
-                sendExplorationCmd('stop');
-            }
+
             
             tabPanels.forEach(panel => {
                 if (panel.id === `panel-${targetTab}`) {
@@ -114,14 +98,27 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Exploration Mode controls (Play, Pause, Stop)
-    const expPlay = document.getElementById('exp-play');
-    const expPause = document.getElementById('exp-pause');
-    const expStop = document.getElementById('exp-stop');
-    
-    if (expPlay) expPlay.addEventListener('click', () => sendExplorationCmd('play'));
-    if (expPause) expPause.addEventListener('click', () => sendExplorationCmd('pause'));
-    if (expStop) expStop.addEventListener('click', () => sendExplorationCmd('stop'));
+    // Detect Mode controls
+    const btnDetect = document.getElementById('btn-detect');
+    if (btnDetect) {
+        btnDetect.addEventListener('click', async () => {
+            logConsole("Triggering shopfront detection...");
+            btnDetect.disabled = true;
+            try {
+                const res = await fetch('/api/detect', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await res.json();
+                logConsole(`System: ${data.message || 'Detection command sent.'}`);
+            } catch (error) {
+                console.error("Failed to trigger detection", error);
+                logConsole("Error: Failed to connect to detection backend.");
+            } finally {
+                btnDetect.disabled = false;
+            }
+        });
+    }
 
     // OpenAI API Key Submission Form Logic
     const apiKeyInput = document.getElementById('openai-api-key');
@@ -392,26 +389,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 tagsCountEl.textContent = `${data.tags_detected} tags`;
             }
             
-            // Highlight active exploration buttons
-            if (data.exploration_status) {
-                const expPlay = document.getElementById('exp-play');
-                const expPause = document.getElementById('exp-pause');
-                const expStop = document.getElementById('exp-stop');
-                
-                if (expPlay && expPause && expStop) {
-                    expPlay.classList.remove('active');
-                    expPause.classList.remove('active');
-                    expStop.classList.remove('active');
-                    
-                    if (data.exploration_status === 'play') {
-                        expPlay.classList.add('active');
-                    } else if (data.exploration_status === 'pause') {
-                        expPause.classList.add('active');
-                    } else if (data.exploration_status === 'stop') {
-                        expStop.classList.add('active');
-                    }
-                }
-            }
+
 
             // Dynamic API Key Status Update
             if (apiKeyStatus && document.activeElement !== apiKeyInput) {

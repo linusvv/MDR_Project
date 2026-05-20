@@ -215,20 +215,18 @@ input:checked + .slider:before{transform:translateX(24px);}
     font-size: 0.8rem;
 }
 
-/* Exploration Buttons */
-.exploration-controls {
+/* Detect Mode Buttons */
+.detect-controls {
     display: flex;
-    gap: 0.5rem;
-    justify-content: space-around;
     padding: 1rem 0.5rem;
 }
-.exp-btn {
+.detect-btn {
     display: flex;
     align-items: center;
     gap: 0.4rem;
     border: none;
     border-radius: 8px;
-    padding: 0.6rem 1rem;
+    padding: 0.8rem 1.5rem;
     color: #fff;
     font-size: 0.85rem;
     font-weight: 600;
@@ -236,32 +234,18 @@ input:checked + .slider:before{transform:translateX(24px);}
     transition: all 0.2s;
     flex: 1;
     justify-content: center;
+    background: #3b82f6;
 }
-.exp-btn.play {
-    background: #10b981;
+.detect-btn:hover {
+    background: #2563eb;
+    box-shadow: 0 0 10px rgba(59, 130, 246, 0.4);
 }
-.exp-btn.play:hover {
-    background: #059669;
-    box-shadow: 0 0 10px rgba(16, 185, 129, 0.4);
+.detect-btn:active {
+    transform: scale(0.98);
 }
-.exp-btn.pause {
-    background: #f59e0b;
-}
-.exp-btn.pause:hover {
-    background: #d97706;
-    box-shadow: 0 0 10px rgba(245, 158, 11, 0.4);
-}
-.exp-btn.stop {
-    background: #ef4444;
-}
-.exp-btn.stop:hover {
-    background: #dc2626;
-    box-shadow: 0 0 10px rgba(239, 68, 68, 0.4);
-}
-.exp-btn.active {
-    border: 2px solid rgba(255, 255, 255, 0.9);
-    box-shadow: 0 0 15px currentColor;
-    transform: scale(1.04);
+.detect-btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
 }
 
 /* Exploration Map Legend */

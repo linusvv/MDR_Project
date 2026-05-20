@@ -53,6 +53,7 @@ class RobotWebServer:
         self.shop_categories = {}
         self.R = np.eye(2)
         self.T = np.array([0.0, -3.125])
+        self.T_map_odom = np.eye(4)
         
         # Set default parameter: Local AI mode active on startup
         rospy.set_param("/use_local_ai", True)
@@ -133,16 +134,19 @@ class RobotWebServer:
                 tag_id = detection.id[0]
                 tag_frame = f"tag_{tag_id}"
                 
-                try:
-                    # 1. First try to look up the tag's TF frame directly in odom
-                    self.tf_listener.waitForTransform('odom', tag_frame, rospy.Time(0), rospy.Duration(0.1))
-                    (trans, rot) = self.tf_listener.lookupTransform('odom', tag_frame, rospy.Time(0))
-                    self.detected_tags[tag_id] = (trans[0], trans[1])
-                except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
-                    # 2. If the tag frame is not directly broadcast, compute it using the camera's TF in odom
+                # 1. First try to look up the tag's TF frame directly in odom
+                if self.tf_listener.canTransform('odom', tag_frame, rospy.Time(0)):
                     try:
-                        frame_id = detection.pose.header.frame_id
-                        self.tf_listener.waitForTransform('odom', frame_id, rospy.Time(0), rospy.Duration(0.1))
+                        (trans, rot) = self.tf_listener.lookupTransform('odom', tag_frame, rospy.Time(0))
+                        self.detected_tags[tag_id] = (trans[0], trans[1])
+                        continue
+                    except Exception:
+                        pass
+                
+                # 2. If the tag frame is not directly broadcast, compute it using the camera's TF in odom
+                frame_id = detection.pose.header.frame_id
+                if self.tf_listener.canTransform('odom', frame_id, rospy.Time(0)):
+                    try:
                         (trans, rot) = self.tf_listener.lookupTransform('odom', frame_id, rospy.Time(0))
                         
                         p = detection.pose.pose.pose.position
@@ -178,9 +182,7 @@ class RobotWebServer:
         cam_frame = self.camera_info.header.frame_id
         source_frame = self.selected_motion_frame
         
-        try:
-            self.tf_listener.waitForTransform(cam_frame, source_frame, rospy.Time(0), rospy.Duration(0.1))
-        except (tf.Exception, tf.LookupException, tf.ConnectivityException):
+        if not self.tf_listener.canTransform(cam_frame, source_frame, rospy.Time(0)):
             return cv_image
             
         pts_2d = []
@@ -257,44 +259,7 @@ class RobotWebServer:
         except Exception as e:
             rospy.logerr(f"Error in web server semantic_cb: {e}")
 
-    def check_and_classify_stores(self):
-        # Prevent running if we don't have stores loaded yet
-        if not self.stores:
-            return
-            
-        now = rospy.get_time()
-        # Initialize last classification time tracker if not present
-        if not hasattr(self, 'last_classification_time'):
-            self.last_classification_time = {}
-            
-        # Check distance to each store
-        for idx, store in enumerate(self.stores):
-            # If already mapped, skip
-            if idx in self.shop_categories:
-                continue
-                
-            s_x, s_y = self.project_store_to_map(store)
-            dist = np.hypot(self.robot_x - s_x, self.robot_y - s_y)
-            if dist < 1.0:
-                # If we tried to classify this store recently, skip to prevent spamming
-                if now - self.last_classification_time.get(idx, 0.0) < 10.0:
-                    continue
-                    
-                self.last_classification_time[idx] = now
-                rospy.loginfo(f"Robot close to Store S{idx+1} (Dist: {dist:.2f}m). Triggering classification...")
-                
-                # Call /detect_shopfront in a background thread to prevent blocking the map generator
-                threading.Thread(target=self._call_store_classification, args=(idx,)).start()
-                
-    def _call_store_classification(self, idx):
-        try:
-            rospy.wait_for_service('/detect_shopfront', timeout=2.0)
-            detect_shop_srv = rospy.ServiceProxy('/detect_shopfront', DetectShopfront)
-            req = DetectShopfrontRequest()
-            req.target_shop = "EXPLORE"
-            detect_shop_srv(req)
-        except Exception as e:
-            rospy.logwarn(f"Failed to trigger storefront classification for Store S{idx+1}: {e}")
+
 
     def load_bundles(self, yaml_path):
         # Try multiple potential paths
@@ -466,7 +431,7 @@ class RobotWebServer:
     def estimate_rigid_transform_2d(self, pts_true, pts_meas):
         n = len(pts_true)
         if n == 0:
-            return np.eye(2), np.array([0.0, -3.125])
+            return self.R, self.T
         elif n == 1:
             tx = pts_meas[0][0] - pts_true[0][0]
             ty = pts_meas[0][1] - pts_true[0][1]
@@ -521,63 +486,62 @@ class RobotWebServer:
                     color_map = cv2.flip(color_map, 0)
                     
                     # Try to lookup robot's pose in map frame
-                    try:
-                        self.tf_listener.waitForTransform('map', 'base_footprint', rospy.Time(0), rospy.Duration(0.1))
-                        (trans, rot) = self.tf_listener.lookupTransform('map', 'base_footprint', rospy.Time(0))
-                        rx, ry = trans[0], trans[1]
-                        euler = tf.transformations.euler_from_quaternion(rot)
-                        yaw = euler[2]
-                        
-                        # Save robot pose for stats API
-                        self.robot_x = rx
-                        self.robot_y = ry
-                        self.robot_yaw = yaw
-                        
-                        # Trigger automated storefront classification in manual RC/other modes
-                        self.check_and_classify_stores()
-                        
-                        # Translate to pixel coordinates
-                        r_col = int((rx - origin.position.x) / resolution)
-                        r_row = int((ry - origin.position.y) / resolution)
-                        r_row_flipped = height - 1 - r_row
-                        
-                        if 0 <= r_col < width and 0 <= r_row_flipped < height:
-                            # Path Trail trajectory
-                            if not hasattr(self, 'trail'):
-                                self.trail = []
-                            self.trail.append((r_col, r_row_flipped))
-                            if len(self.trail) > 1000:
-                                self.trail.pop(0)
-                                
-                            # Draw Trail (slate-500 line)
-                            for j in range(1, len(self.trail)):
-                                cv2.line(color_map, self.trail[j-1], self.trail[j], (100, 116, 139), 1)
-                                
-                            # Draw robot body (solid rose-red circle)
-                            cv2.circle(color_map, (r_col, r_row_flipped), 8, (68, 68, 239), -1)
-                            cv2.circle(color_map, (r_col, r_row_flipped), 8, (255, 255, 255), 1)
+                    if self.tf_listener.canTransform('map', 'base_footprint', rospy.Time(0)):
+                        try:
+                            (trans, rot) = self.tf_listener.lookupTransform('map', 'base_footprint', rospy.Time(0))
+                            rx, ry = trans[0], trans[1]
+                            euler = tf.transformations.euler_from_quaternion(rot)
+                            yaw = euler[2]
                             
-                            # Draw heading indicator
-                            render_yaw = -yaw
-                            arrow_len = 12
-                            arrow_end_x = int(r_col + arrow_len * np.cos(render_yaw))
-                            arrow_end_y = int(r_row_flipped + arrow_len * np.sin(render_yaw))
-                            cv2.arrowedLine(color_map, (r_col, r_row_flipped), (arrow_end_x, arrow_end_y), (255, 255, 255), 2, tipLength=0.3)
-                    except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
-                        pass
+                            # Save robot pose for stats API
+                            self.robot_x = rx
+                            self.robot_y = ry
+                            self.robot_yaw = yaw
+                            
+                            # Translate to pixel coordinates
+                            r_col = int((rx - origin.position.x) / resolution)
+                            r_row = int((ry - origin.position.y) / resolution)
+                            r_row_flipped = height - 1 - r_row
+                            
+                            if 0 <= r_col < width and 0 <= r_row_flipped < height:
+                                # Path Trail trajectory
+                                if not hasattr(self, 'trail'):
+                                    self.trail = []
+                                self.trail.append((r_col, r_row_flipped))
+                                if len(self.trail) > 1000:
+                                    self.trail.pop(0)
+                                    
+                                # Draw Trail (slate-500 line)
+                                for j in range(1, len(self.trail)):
+                                    cv2.line(color_map, self.trail[j-1], self.trail[j], (100, 116, 139), 1)
+                                    
+                                # Draw robot body (solid rose-red circle)
+                                cv2.circle(color_map, (r_col, r_row_flipped), 8, (68, 68, 239), -1)
+                                cv2.circle(color_map, (r_col, r_row_flipped), 8, (255, 255, 255), 1)
+                                
+                                # Draw heading indicator
+                                render_yaw = -yaw
+                                arrow_len = 12
+                                arrow_end_x = int(r_col + arrow_len * np.cos(render_yaw))
+                                arrow_end_y = int(r_row_flipped + arrow_len * np.sin(render_yaw))
+                                cv2.arrowedLine(color_map, (r_col, r_row_flipped), (arrow_end_x, arrow_end_y), (255, 255, 255), 2, tipLength=0.3)
+                        except Exception:
+                            pass
                         
                     # Build matched point sets for 2D rigid transform estimation
                     pts_true = []
                     pts_meas = []
                     
                     # Try to lookup transform map -> odom
-                    try:
-                        self.tf_listener.waitForTransform('map', 'odom', rospy.Time(0), rospy.Duration(0.1))
-                        (trans_mo, rot_mo) = self.tf_listener.lookupTransform('map', 'odom', rospy.Time(0))
-                        T_map_odom = tf.transformations.quaternion_matrix(rot_mo)
-                        T_map_odom[:3, 3] = trans_mo
-                    except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
-                        T_map_odom = np.eye(4)
+                    if self.tf_listener.canTransform('map', 'odom', rospy.Time(0)):
+                        try:
+                            (trans_mo, rot_mo) = self.tf_listener.lookupTransform('map', 'odom', rospy.Time(0))
+                            T_map_odom = tf.transformations.quaternion_matrix(rot_mo)
+                            T_map_odom[:3, 3] = trans_mo
+                            self.T_map_odom = T_map_odom
+                        except Exception:
+                            pass
+                    T_map_odom = self.T_map_odom
                         
                     for tag_id, tag_pose_odom in self.detected_tags.items():
                         signboard_name = None
@@ -606,37 +570,7 @@ class RobotWebServer:
                         rospy.loginfo(f"[RIGID TRANSFORM] Match count: {len(pts_true)}, T: {T.tolist()}")
                         self.last_transform_log_time = now_sec
                     
-                    # Draw shops projected into current SLAM map coordinates
-                    for idx, store in enumerate(self.stores):
-                        s_x, s_y = self.project_store_to_map(store)
-                        
-                        s_col = int((s_x - origin.position.x) / resolution)
-                        s_row = int((s_y - origin.position.y) / resolution)
-                        s_row_flipped = height - 1 - s_row
-                        
-                        if 0 <= s_col < width and 0 <= s_row_flipped < height:
-                            # Choose color based on category:
-                            # Convenience store: Yellow (36, 191, 251)
-                            # Café: Brown (14, 77, 133)
-                            # Fast-food restaurant (Burger): Red (68, 68, 239)
-                            # Pharmacy: Purple (246, 92, 139)
-                            # Unmapped: Cyan (255, 255, 0)
-                            color = (255, 255, 0) # default Cyan
-                            if idx in self.shop_categories:
-                                cat = self.shop_categories[idx].get("category", "Unknown")
-                                if cat == "Convenience store":
-                                    color = (36, 191, 251) # Yellow
-                                elif cat == "Café":
-                                    color = (14, 77, 133) # Brown
-                                elif cat == "Fast-food restaurant":
-                                    color = (68, 68, 239) # Red
-                                elif cat == "Pharmacy":
-                                    color = (246, 92, 139) # Purple
-                                    
-                            cv2.circle(color_map, (s_col, s_row_flipped), 6, color, -1)
-                            cv2.circle(color_map, (s_col, s_row_flipped), 6, (255, 255, 255), 1)
-                            cv2.putText(color_map, f"S{idx+1}", (s_col + 8, s_row_flipped + 4), 
-                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+
                                         
                     # Draw persistently detected AprilTags
                     for tag_id, tag_pose_odom in self.detected_tags.items():
@@ -767,25 +701,10 @@ def set_ai_mode():
     rospy.loginfo(f"Set /use_local_ai to {use_local}")
     return jsonify({"status": "success", "mode": mode})
 
-@app.route('/api/exploration/control', methods=['POST'])
-def exploration_control():
-    data = request.json
-    cmd = data.get('command', 'play').lower()
-    
-    if cmd == 'play':
-        rospy.set_param("/exploration_paused", False)
-        msg = String()
-        msg.data = "EXPLORE"
-        server.user_prompt_pub.publish(msg)
-    elif cmd == 'pause':
-        rospy.set_param("/exploration_paused", True)
-    elif cmd == 'stop':
-        rospy.set_param("/exploration_paused", False)
-        msg = String()
-        msg.data = "STOP"
-        server.user_prompt_pub.publish(msg)
-        
-    return jsonify({"status": "success", "command": cmd})
+@app.route('/api/detect', methods=['POST'])
+def api_detect():
+    rospy.loginfo("Detect Mode triggered (Backend placeholder).")
+    return jsonify({"status": "success", "message": "Detection triggered (Backend placeholder)."})
 
 @app.route('/api/delivery/send', methods=['POST'])
 def delivery_send():

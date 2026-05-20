@@ -1059,22 +1059,31 @@ class RobotWebServer:
                 origin = grid.info.origin
                 
                 # Render local costmap data with continuous gradient
-                data = np.array(grid.data, dtype=np.uint8).reshape((height, width))
-                # Base view: Dark background for free space
-                viz = np.full((height, width, 3), (30, 20, 10), dtype=np.uint8)
-                
-                # Apply heat map to visualize the 40cm continuous gradient
-                # map_value 100 is solid wall, <100 is the repulsive field
-                mask_gradient = (data > 0)
-                # Map occupancy (0-100) to a red-tinted hazard gradient
-                viz[mask_gradient, 2] = np.clip(viz[mask_gradient, 2].astype(np.int16) + data[mask_gradient] * 2, 0, 255) # Red channel
-                viz[mask_gradient, 1] = np.clip(viz[mask_gradient, 1].astype(np.int16) + data[mask_gradient], 0, 255)     # Green channel (yellowish tint)
-                
-                # Solid walls (data == 100) are white/light gray
-                viz[data >= 100] = [200, 200, 200]
-                viz[data == 255] = [5, 5, 5] # Handle signed/unsigned wrap for -1 unknown
-                
-                viz = cv2.flip(viz, 0) # Base link frame usually has X forward (up in image)
+                try:
+                    # ROS OccupancyGrid data is int8 (-1 unknown, 0-100 occupancy)
+                    raw_data = np.array(grid.data, dtype=np.int8).reshape((height, width))
+                    
+                    # Base view: Dark background for free space
+                    viz = np.full((height, width, 3), (30, 20, 10), dtype=np.uint8)
+                    
+                    # 1. Unknown space (-1) -> very dark
+                    viz[raw_data == -1] = [5, 5, 5]
+                    
+                    # 2. Gradient space (0 < data < 100)
+                    # We use a orange/red tint for the repulsion field
+                    mask_gradient = (raw_data > 0) & (raw_data < 100)
+                    if np.any(mask_gradient):
+                        occ_vals = raw_data[mask_gradient].astype(np.float32)
+                        viz[mask_gradient, 2] = np.clip(occ_vals * 2.5, 0, 255).astype(np.uint8) # Red
+                        viz[mask_gradient, 1] = np.clip(occ_vals * 1.5, 0, 255).astype(np.uint8) # Green (Orange tint)
+                    
+                    # 3. Solid walls (data >= 100) -> White
+                    viz[raw_data >= 100] = [220, 220, 220]
+                    
+                    viz = cv2.flip(viz, 0) # Flip to match robot orientation (Up is forward)
+                except Exception as e:
+                    rospy.logerr(f"Local Planner Rendering Error: {e}")
+                    viz = np.zeros((height, width, 3), dtype=np.uint8)
                 
                 # Draw motion primitives (all candidates in dim green)
                 for primitive in candidates:
@@ -1103,8 +1112,22 @@ class RobotWebServer:
                 canvas = viz
             
             if canvas is not None:
-                # Resize for display
-                disp = cv2.resize(canvas, (400, 400), interpolation=cv2.INTER_NEAREST)
+                # Resize and Zoom: Original is usually 200x200 (20m @ 0.1m res). 
+                # We crop the center (robot at origin) and resize to zoom in by factor 2
+                h, w = canvas.shape[:2]
+                ch, cw = h // 4, w // 4 # One quarter of the area is factor 2 zoom
+                
+                # Find robot position in pixels to center the zoom
+                r_col = int((0 - origin.position.x) / res)
+                r_row = h - 1 - int((0 - origin.position.y) / res)
+                
+                y1 = max(0, r_row - ch)
+                y2 = min(h, r_row + ch)
+                x1 = max(0, r_col - cw)
+                x2 = min(w, r_col + cw)
+                
+                canvas_zoomed = canvas[y1:y2, x1:x2]
+                disp = cv2.resize(canvas_zoomed, (400, 400), interpolation=cv2.INTER_NEAREST)
                 ret, buffer = cv2.imencode('.jpg', disp)
                 if ret:
                     yield (b'--frame\r\n'

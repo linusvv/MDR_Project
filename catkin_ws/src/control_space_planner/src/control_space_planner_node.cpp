@@ -117,16 +117,39 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
       pubCommand.publish(command);
       return;
   }
+
+  // Emergency Brake: If the immediate path is dangerous (too close to a wall)
+  // Check the first few nodes of the rollout for high cost values (above 85 indicates <10cm with 60cm inflation)
+  for (size_t i = 0; i < std::min(motionMinCost.size(), (size_t)3); ++i) {
+      if (motionMinCost[i].cost_colli > 85) {
+          ROS_WARN_THROTTLE(1, "EMERGENCY BRAKE: Wall proximity detected (Cost: %f)", motionMinCost[i].cost_colli);
+          this->StopRobot();
+          return;
+      }
+  }
+
   // low-level control based on the chosen ackermann-like motion primitive
   double steering_angle = motionMinCost.back().delta;
   // Use a constant speed (optionally scaled down very slightly if extremely short to avoid slamming)
   double scale_factor = (double)motionMinCost.size() / (this->MAX_PROGRESS / this->DIST_RESOL);
-  double speed_norm = this->MOTION_VEL * (scale_factor < 0.2 ? 0.3 : 0.8); // Maintain turn speed to push through tight corners
+  double speed_norm = this->MOTION_VEL * (scale_factor < 0.2 ? 0.3 : 0.8); 
+  
+  // Safety: If we are turning sharply, reduce linear speed to maintain traction and prevent "death spirals"
+  if (abs(steering_angle) > 30.0 * (M_PI / 180.0)) {
+      speed_norm *= 0.5;
+  }
   
   // A forward cmd_vel on differential/Mecanum drive matching the generated paths
-  command.angular.z = speed_norm * tan(steering_angle) / this->WHEELBASE;
+  // We use a "Sane Wheelbase" for the command calculation to prevent division-by-nearly-zero spikes
+  double sane_wheelbase = std::max(this->WHEELBASE, 0.20); 
+  command.angular.z = speed_norm * tan(steering_angle) / sane_wheelbase;
   command.linear.x  = speed_norm;
-  command.linear.y  = 0.0; // The primitives assumed non-holonomic generation (pure arcs). So do not slide laterally.
+  command.linear.y  = 0.0;
+
+  // Hard clamp on angular velocity to prevent the "scary fast" spinning
+  double MAX_ANGULAR_VEL = 2.5; // [rad/s] (~143 deg/s) - Sane limit for robot safety
+  if (command.angular.z > MAX_ANGULAR_VEL) command.angular.z = MAX_ANGULAR_VEL;
+  if (command.angular.z < -MAX_ANGULAR_VEL) command.angular.z = -MAX_ANGULAR_VEL;
 
   // arrival rule
   if (bGetGoal && !this->globalPath.poses.empty()) {
@@ -204,6 +227,11 @@ void MotionPlanner::Plan()
               target_idx = i;
               break;
           }
+      }
+
+      // If we are significantly off-course, prioritize safety and pick a closer point to recover
+      if (min_dist > 1.0) {
+          target_idx = std::min((int)this->globalPath.poses.size() - 1, closest_idx + 5);
       }
 
       this->goalPose = this->globalPath.poses[target_idx];
@@ -432,7 +460,9 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
       }
 
       // Final Cost formulation: massive penalty for high occupancy (wall proximity)
-      double cost_total = this->W_COST_TRAVERSABILITY * (cost_dist + (max_traversability_cost * max_traversability_cost)/100.0) + this->W_COST_DIRECTION * cost_direction + cost_collision_penalty;
+      // We normalize max_traversability_cost to square it, making walls exponentially more expensive
+      double wall_penalty = (max_traversability_cost * max_traversability_cost) / 10.0;
+      double cost_total = this->W_COST_TRAVERSABILITY * wall_penalty + this->W_COST_DIRECTION * cost_direction + cost_collision_penalty + cost_dist;
       
       if (cost_direction > M_PI / 1.5) {
           cost_total += 5000.0;
@@ -462,8 +492,9 @@ int MotionPlanner::GetMaxOccupancy(Node goalNodePlanner, nav_msgs::OccupancyGrid
 
   for (int i = 0; i < inflation_size; ++i) {
     for (int j = 0; j < inflation_size; ++j) {
-      int tmp_x = static_cast<int>(goalNodePlanner.x + i - 0.5 * inflation_size);
-      int tmp_y = static_cast<int>(goalNodePlanner.y + j - 0.5 * inflation_size);
+      // Re-center search to cover the robot footprint
+      int tmp_x = static_cast<int>(goalNodePlanner.x + i - inflation_size / 2);
+      int tmp_y = static_cast<int>(goalNodePlanner.y + j - inflation_size / 2);
       
       if (tmp_x >= 0 && tmp_x < map_width && tmp_y >= 0 && tmp_y < map_height) {
         int map_index = tmp_y * map_width + tmp_x;

@@ -34,9 +34,9 @@ public:
     float MAP_MAX_Y =  10; // map max y position
 
     float MIN_OBSTACLE_HEIGHT = 0.05; // [m] ignore ground points
-    float MAX_OBSTACLE_HEIGHT = 0.20; // [m] ignore elevated signboards/ceilings (Strictly 20cm)
+    float MAX_OBSTACLE_HEIGHT = 0.80; // [m] Increased to 80cm to capture walls (must overlap with heightmap.cpp's 0.25m threshold)
 
-    float INFLATION_RADIUS = 0.4; // [m] Radius for the continuous gradient field
+    float INFLATION_RADIUS = 0.6; // [m] Increased to 1.5x (0.4m -> 0.6m) for a larger dangerous zone
     float INFLATION_RES    = RESOLUTION_; // [m] resolution of inflation
     int INFLATION_BINS     = (INFLATION_RADIUS * 2) / INFLATION_RES + 1;
 
@@ -51,6 +51,7 @@ private:
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_xyz;
 
     bool bGetPoint = false;
+    std::vector<int8_t> grid_data;
 };
 
 HeightmapToCostMap::HeightmapToCostMap() : cloud_topic_("/points/velodyne_obstacles"), map_topic_("/map/local_map/obstacle")
@@ -74,101 +75,87 @@ void HeightmapToCostMap::cloud_cb(const sensor_msgs::PointCloud2ConstPtr &cloud_
 
 void HeightmapToCostMap::generate_costmap()
 {
-    // Generate costmap after getting point cloud data
-    if (bGetPoint)
-    {
-        // get bounds
-        Eigen::Vector4f min_pt;
-        Eigen::Vector4f max_pt;
-
-        int width_ = int(MAP_MAX_X - MAP_MIN_X + 0.5f);
-        width_ = int(width_ / RESOLUTION_ + 0.5f);
-
-        int height_ = int(MAP_MAX_Y - MAP_MIN_Y + 0.5f);
-        height_ = int(height_ / RESOLUTION_ + 0.5f);
-
-        // ROS_INFO_THROTTLE(0.5, "Image Dimensions w %d x h %d", width_, height_);
-        nav_msgs::MapMetaData mapMeta;
-
-        mapMeta.resolution = RESOLUTION_;
-        mapMeta.width = width_;
-        mapMeta.height = height_;
-
-        geometry_msgs::Pose oPose;
-        oPose.position.x = MAP_MIN_X - RESOLUTION_/2;
-        oPose.position.y = MAP_MIN_Y - RESOLUTION_/2;
-        mapMeta.origin = oPose;
-
-        nav_msgs::OccupancyGrid oMap;
-        oMap.info = mapMeta;
-        oMap.data.resize(width_ * height_);
-        oMap.header.frame_id = cloud_xyz->header.frame_id; // base_link cloud_xyz->header.frame_id
-        oMap.header.stamp = ros::Time::now();
-
-        // Generating cost map w.r.t. obstacles
-        for (pcl::PointCloud<pcl::PointXYZ>::iterator it = cloud_xyz->begin(); it != cloud_xyz->end(); it++)
+        if (bGetPoint)
         {
-            // check for nan points && min/max points && height filtering (ignore signboards in air)
-            if ((!(isnan(it->x) | isnan(it->y))) && 
-                (it->x > MAP_MIN_X && it->x < MAP_MAX_X) && 
-                (it->y > MAP_MIN_Y && it->y < MAP_MAX_Y) &&
-                (it->z > MIN_OBSTACLE_HEIGHT && it->z < MAX_OBSTACLE_HEIGHT))
+            int width_ = int(MAP_MAX_X - MAP_MIN_X + 0.5f);
+            width_ = int(width_ / RESOLUTION_ + 0.5f);
+
+            int height_ = int(MAP_MAX_Y - MAP_MIN_Y + 0.5f);
+            height_ = int(height_ / RESOLUTION_ + 0.5f);
+
+            nav_msgs::MapMetaData mapMeta;
+            mapMeta.resolution = RESOLUTION_;
+            mapMeta.width = width_;
+            mapMeta.height = height_;
+
+            geometry_msgs::Pose oPose;
+            oPose.position.x = MAP_MIN_X - RESOLUTION_/2;
+            oPose.position.y = MAP_MIN_Y - RESOLUTION_/2;
+            mapMeta.origin = oPose;
+
+            nav_msgs::OccupancyGrid oMap;
+            oMap.info = mapMeta;
+            oMap.data.assign(width_ * height_, 0); 
+            oMap.header.frame_id = cloud_xyz->header.frame_id; 
+            oMap.header.stamp = ros::Time::now();
+
+            int point_count = 0;
+            // Pass 1: Mark direct hits
+            for (pcl::PointCloud<pcl::PointXYZ>::iterator it = cloud_xyz->begin(); it != cloud_xyz->end(); it++)
             {
-                int x = int((it->x - MAP_MIN_X) / RESOLUTION_);
-                int y = int((it->y - MAP_MIN_Y) / RESOLUTION_);
-                // ROS_INFO("X %d, Y %d, x %f ,y %f", x, y, it->x, it->y);
-                if (x < width_ && y < height_)
+                if ((!(isnan(it->x) | isnan(it->y))) && 
+                    (it->x >= MAP_MIN_X && it->x < MAP_MAX_X) && 
+                    (it->y >= MAP_MIN_Y && it->y < MAP_MAX_Y) &&
+                    (it->z > MIN_OBSTACLE_HEIGHT && it->z < MAX_OBSTACLE_HEIGHT))
                 {
-                    if (DO_INFLATION)
+                    int x = int((it->x - MAP_MIN_X) / RESOLUTION_);
+                    int y = int((it->y - MAP_MIN_Y) / RESOLUTION_);
+                    
+                    if (x < width_ && x >= 0 && y < height_ && y >= 0)
                     {
-                        double current_x = it->x;
-                        double current_y = it->y;
+                        oMap.data[MAP_IDX(width_, x, y)] = 100;
+                        point_count++;
+                    }
+                }
+            }
 
-                        for (int i=0; i < INFLATION_BINS; i++)
-                        {
-                            for (int j=0; j < INFLATION_BINS; j++)
-                            {
-                                double dx = i * INFLATION_RES - INFLATION_RADIUS;
-                                double dy = j * INFLATION_RES - INFLATION_RADIUS;
-                                double dist = sqrt(pow(dx, 2.0) + pow(dy, 2.0));
-                                
-                                if (dist > INFLATION_RADIUS) continue; 
+            if (point_count > 0 && DO_INFLATION)
+            {
+                // Pass 2: Continuous Gradient Inflation
+                std::vector<int> obs_indices;
+                for(int i=0; i < oMap.data.size(); ++i) {
+                    if(oMap.data[i] == 100) obs_indices.push_back(i);
+                }
 
-                                // Continuous linear gradient from 100 at center to 0 at 0.4m
-                                double map_value = 100.0 * (1.0 - (dist / INFLATION_RADIUS));
+                int rad_cells = static_cast<int>(INFLATION_RADIUS / RESOLUTION_);
+                for(int idx : obs_indices) {
+                    int ox = idx % width_;
+                    int oy = idx / width_;
 
-                                double padded_x = current_x + dx;
-                                double padded_y = current_y + dy;
-
-                                double padded_map_x = int((padded_x - MAP_MIN_X) / RESOLUTION_);
-                                double padded_map_y = int((padded_y - MAP_MIN_Y) / RESOLUTION_);
-                                if (padded_map_x < width_ && padded_map_x >= 0 && padded_map_y < height_ && padded_map_y >= 0)
-                                {
-                                    // update to larger map value
-                                    double current_map_value = oMap.data[MAP_IDX(width_, padded_map_x, padded_map_y)];
-                                    oMap.data[MAP_IDX(width_, padded_map_x, padded_map_y)] = std::max(map_value, current_map_value);
+                    for(int dy = -rad_cells; dy <= rad_cells; ++dy) {
+                        for(int dx = -rad_cells; dx <= rad_cells; ++dx) {
+                            int tx = ox + dx;
+                            int ty = oy + dy;
+                            if(tx >= 0 && tx < width_ && ty >= 0 && ty < height_) {
+                                double d = sqrt(dx*dx + dy*dy) * RESOLUTION_;
+                                if(d <= INFLATION_RADIUS) {
+                                    int8_t val = static_cast<int8_t>(100.0 * (1.0 - (d / INFLATION_RADIUS)));
+                                    int tidx = MAP_IDX(width_, tx, ty);
+                                    if(val > oMap.data[tidx]) oMap.data[tidx] = val;
                                 }
                             }
                         }
                     }
-                    // No inflation
-                    else
-                    {
-                        oMap.data[MAP_IDX(width_, x, y)] = 100;
-                    }
-                    
                 }
             }
+
+            cost_map_pub_.publish(oMap);
+            if (point_count == 0) ROS_INFO_THROTTLE(2, "[HeightmapToCostMap] Published empty map: 0 points survived filter (MIN: %f, MAX: %f)", MIN_OBSTACLE_HEIGHT, MAX_OBSTACLE_HEIGHT);
         }
-
-        // Publish cost map
-        cost_map_pub_.publish(oMap);
-    }
-
-    else
-    {
-        ROS_INFO("No point cloud yet!!!");
-    }
+        else
+        {
+            ROS_INFO_THROTTLE(5, "No point cloud yet!!!");
+        }
 }
 
 int main(int argc, char **argv)

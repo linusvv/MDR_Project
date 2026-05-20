@@ -135,10 +135,10 @@ class MotionPlanner
     
     // TODO: define necessary parameters below
     // Parameters (Map)
-    double mapMinX = -5;
-    double mapMaxX =  15;
-    double mapMinY = -10;
-    double mapMaxY =  10;
+    double mapMinX = -5.0;  // Match heightmap_to_costmap exactly
+    double mapMaxX = 15.0;
+    double mapMinY = -10.0;
+    double mapMaxY = 10.0;
     double mapResol = 0.1; // [m / grid]
     int OCCUPANCY_THRES = 50;
 
@@ -151,17 +151,17 @@ class MotionPlanner
     double MAX_SENSOR_RANGE = 10.0; // [m] maximum sensor range (realsense)
     double WHEELBASE = 0.05; // [m] Reduced virtual wheelbase to allow tighter turning arcs
     double DIST_RESOL = 0.1; // [m] distance resolution for control space sampling
-    double TIME_RESOL = 0.05; // [sec] time resolution between each motion (for rollout)
+    double TIME_RESOL = 0.1; // [sec] Doubled time resolution to halve velocity to 1.0 m/s
     double MOTION_VEL = DIST_RESOL / TIME_RESOL; // [m/s] velocity between each motion (for rollout)
-    double DELTA_RESOL = 2.0 * (M_PI / 180.0); // [rad] increased angle resolution to sample more steering angles
+    double DELTA_RESOL = 4.0 * (M_PI / 180.0); // Doubled resolution to increase search speed & stability
     double MAX_DELTA = 75.0 * (M_PI / 180.0); // [rad] increased maximum steering angle for U-turns
     double MAX_PROGRESS = 2.0; // Reduced for even more reactive planning in extremely tight corridors
 
     double ARRIVAL_THRES = 0.3; // [m] further reduced for tighter targets
 
     // - cost weights
-    double W_COST_DIRECTION      = 1.0; // -- Heavily reduced to allow any angle needed for safety
-    double W_COST_TRAVERSABILITY = 300.0; // -- Massive multiplier to make the robot highly allergic to walls
+    double W_COST_DIRECTION      = 0.5; // Reduced further to favor safety over heading
+    double W_COST_TRAVERSABILITY = 800.0; // Increased to prioritize wall avoidance above all else
     
     // - collision checking
     double INFLATION_SIZE = 1; // Only check the center axis; let the cost gradient handle wall avoidance

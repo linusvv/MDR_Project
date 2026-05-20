@@ -5,7 +5,7 @@ MotionPlanner::MotionPlanner(ros::NodeHandle& nh) : nh_(nh)
 {
   // Subscriber
   subOccupancyGrid = nh.subscribe("/map/local_map/obstacle",1, &MotionPlanner::CallbackOccupancyGrid, this);
-  subEgoOdom = nh.subscribe("/odom",1, &MotionPlanner::CallbackEgoOdom, this);
+  subEgoOdom = nh.subscribe("/map_odom",1, &MotionPlanner::CallbackEgoOdom, this);
   subGoalPoint = nh.subscribe("/graph_planner/path/global_path",1, &MotionPlanner::CallbackGoalPoint, this);
   // Publisher
   pubSelectedMotion = nh_.advertise<sensor_msgs::PointCloud2>("/points/selected_motion", 1, true);
@@ -112,9 +112,9 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
   geometry_msgs::Twist command;
   if (motionMinCost.empty()) {
       // RECOVERY BEHAVIOR: 
-      // If we are completely blocked (e.g. by another dynamic robot in a corridor), 
-      // back up slowly and rotate to find an alternative escape route.
-      command.angular.z = 0.5; 
+      // If we are completely blocked by a wall, back up slowly and rotate quickly
+      // to clear the obstacle and find an alternative open corridor.
+      command.angular.z = 1.5; 
       command.linear.x = -0.2; 
       command.linear.y = 0.0;
       pubCommand.publish(command);
@@ -150,6 +150,21 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
   }
 
   pubCommand.publish(command);
+}
+
+void MotionPlanner::StopRobot()
+{
+  geometry_msgs::Twist command;
+  command.linear.x = 0.0;
+  command.linear.y = 0.0;
+  command.angular.z = 0.0;
+  pubCommand.publish(command);
+
+  // Clear the selected motion path visualization
+  sensor_msgs::PointCloud2 emptyCloud;
+  emptyCloud.header.frame_id = this->frame_id;
+  emptyCloud.header.stamp = ros::Time::now();
+  pubSelectedMotion.publish(emptyCloud);
 }
 
 /* ----- Algorithm Functions ----- */
@@ -332,10 +347,6 @@ std::vector<Node> MotionPlanner::RolloutMotion(Node startNode,
       Node collisionPointNode(currMotionNode.x, currMotionNode.y, currMotionNode.z, currMotionNode.yaw, currMotionNode.delta, 0, 0, 0, -1, false);
       Node collisionPointNodeMap = LocalToPlannerCorrdinate(collisionPointNode);
       if (CheckCollision(collisionPointNodeMap, localMap)) {
-        if (motionPrimitive.empty()) {
-          // Ensure we return at least one node to avoid complete array-size crashes and maintain a crawl speed
-          motionPrimitive.push_back(currMotionNode);
-        }
         return motionPrimitive;
       }
 
@@ -385,7 +396,8 @@ std::vector<Node> MotionPlanner::SelectMotion(std::vector<std::vector<Node>> mot
   if (motionPrimitives.size() != 0) {
     // Iterate all motion primitive (motionPrimitive) in motionPrimitives
     for (auto& motionPrimitive : motionPrimitives) {
-      if (motionPrimitive.empty()) continue;
+      // Reject any primitives with imminent collisions (collision within 4 nodes / 40cm)
+      if (motionPrimitive.size() < 4) continue;
       
       //!1. Calculate cost terms
       double end_x = motionPrimitive.back().x;
@@ -477,12 +489,22 @@ bool MotionPlanner::CheckCollision(Node goalNodePlanner, nav_msgs::OccupancyGrid
 
 bool MotionPlanner::CheckRunCondition()
 {
-  if (this->bGetMap && this->bGetGoal) {
-  // if (this->bGetMap) {
+  bool is_paused = false;
+  ros::param::getCached("/exploration_paused", is_paused);
+  if (is_paused) {
+    return false;
+  }
+
+  std::string state = "IDLE";
+  ros::param::getCached("/exploration_state", state);
+  if (state == "IDLE" || state == "STOP") {
+    return false;
+  }
+
+  if (this->bGetMap && this->bGetGoal && !this->globalPath.poses.empty()) {
     return true;
   }
   else {
-    std::cout << "Run condition is not satisfied!!!" << "bGetMap : " << bGetMap << " bGetGoal : " << bGetGoal << std::endl;
     return false;
   }
 }
@@ -620,9 +642,18 @@ int main(int argc, char* argv[])
       // Spin ROS
       ros::spinOnce();
       // check run condition
-      if (MotionPlanner.CheckRunCondition()) {
+      static bool was_running = false;
+      bool is_running = MotionPlanner.CheckRunCondition();
+      if (is_running) {
         // Run algorithm
         MotionPlanner.Plan();
+        was_running = true;
+      } else {
+        // Publish zero velocity stop command ONCE when run condition turns false
+        if (was_running) {
+          MotionPlanner.StopRobot();
+          was_running = false;
+        }
       }
       rate.sleep();
   }

@@ -8,7 +8,7 @@
 
     <!-- 3. Start RTAB-Map SLAM (Configured to use stable Wheel Odometry) -->
     <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-        <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 1000 --Kp/MaxFeatures 1000 --Rtabmap/LoopThr 0.3 --Rtabmap/DetectionRate 2"/>
+        <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 400 --Kp/MaxFeatures 400 --Rtabmap/LoopThr 0.3 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 2 --Grid/MaxObstacleHeight 0.5 --Grid/RayTracing true"/>
         <arg name="rgb_topic" value="/camera/color/image_raw"/>
         <arg name="depth_topic" value="/camera/depth/image_raw"/>
         <arg name="camera_info_topic" value="/camera/color/camera_info"/>
@@ -43,9 +43,26 @@
 
     <!-- 4. Start Graph Planner for generating the global path on the map (DISABLED FOR AGENTIC NAVIGATION) -->
     <!-- <include file="$(find graph_planner)/launch/graph_planner.launch" /> -->
+    
+    <node name="map_odom_publisher" pkg="hw4_exploration" type="map_odom_publisher.py" output="screen" />
 
     <!-- 5. Start the existing Python Motion Primitives Planner -->
     <include file="$(find control_space_planner)/launch/run.launch" />
+
+    <!-- 6. Start LLM Client Node (Crash-free Startup) -->
+    <node name="simple_llm_client" pkg="gpt_llm_client" type="simple_llm_client.py" output="screen" />
+    
+    <!-- 7. Start Vision Perception Services -->
+    <node name="vision_perception_node" pkg="hw4_exploration" type="vision_perception_node.py" output="screen" />
+    
+    <!-- 8. Start Store Coordinator (Map Anchor Points) -->
+    <node name="store_coordinator_node" pkg="hw4_exploration" type="store_coordinator_node.py" output="screen" />
+    
+    <!-- 9. Start AprilTag Visualizer -->
+    <node name="tag_visualizer" pkg="hw4_exploration" type="tag_visualizer.py" output="screen" />
+
+    <!-- 10. Start the Stage Handler Agent Brain -->
+    <node name="agent_node" pkg="hw4_exploration" type="agent_node.py" output="screen" />
 
     <group if="$(arg use_rviz)">
         <node pkg="rviz" type="rviz" name="rviz_display" args="-d $(find hw4_exploration)/rviz/ee478_rtabmap.rviz" output="screen" />

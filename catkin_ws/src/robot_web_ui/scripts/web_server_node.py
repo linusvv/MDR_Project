@@ -7,13 +7,21 @@ import threading
 import yaml
 import os
 import re
+import math
 from flask import Flask, render_template, Response, request, jsonify
-from sensor_msgs.msg import Image, CameraInfo
-from geometry_msgs.msg import Twist
+from sensor_msgs.msg import Image, CameraInfo, PointCloud2
+import sensor_msgs.point_cloud2 as pc2
+from geometry_msgs.msg import Twist, PointStamped
 from nav_msgs.msg import OccupancyGrid
 from cv_bridge import CvBridge
 import tf
 import tf.transformations
+
+import json
+from std_msgs.msg import String
+from gpt_llm_client.srv import LLMQuery, LLMQueryRequest
+from std_srvs.srv import Empty as EmptySrv
+from hw4_exploration.srv import DetectShopfront, DetectShopfrontRequest
 
 try:
     from apriltag_ros.msg import AprilTagDetectionArray
@@ -33,12 +41,21 @@ class RobotWebServer:
         self.camera_info = None
         self.tag_detections = []
         self.grid_map = None
+        self.selected_motion_pts = []
+        self.selected_motion_frame = "map"
         
         self.robot_x = 0.0
         self.robot_y = 0.0
         self.robot_yaw = 0.0
         self.map_coverage_m2 = 0.0
         self.stores = []
+        self.detected_tags = {}
+        self.shop_categories = {}
+        self.R = np.eye(2)
+        self.T = np.array([0.0, -3.125])
+        
+        # Set default parameter: Local AI mode active on startup
+        rospy.set_param("/use_local_ai", True)
         
         self.lock = threading.Lock()
         self.tf_listener = tf.TransformListener()
@@ -47,15 +64,19 @@ class RobotWebServer:
         self.yaml_path = "/home/linusv/project_5/HW4/tags.yaml"
         self.bundles = self.load_bundles(self.yaml_path)
         self.load_stores_from_txt()
+        self.load_tag_true_poses()
 
         # ROS Publishers
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
+        self.user_prompt_pub = rospy.Publisher('/user_prompt', String, queue_size=5)
 
         # ROS Subscribers
         rospy.Subscriber('/camera/color/image_raw', Image, self.color_cb)
         rospy.Subscriber('/camera/depth/image_raw', Image, self.depth_cb)
         rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.cam_info_cb)
         rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.map_cb)
+        rospy.Subscriber('/semantic_observations', String, self.semantic_cb)
+        rospy.Subscriber('/points/selected_motion', PointCloud2, self.motion_cb)
         
         if AprilTagDetectionArray is not None:
             rospy.Subscriber('/tag_detections', AprilTagDetectionArray, self.tags_cb)
@@ -70,6 +91,9 @@ class RobotWebServer:
             with self.lock:
                 if self.camera_info is not None and len(self.tag_detections) > 0:
                     cv_image = self.draw_tags(cv_image)
+                    
+                if hasattr(self, 'selected_motion_pts') and self.camera_info is not None:
+                    cv_image = self.draw_path(cv_image)
                     
             self.color_image = cv_image
         except Exception as e:
@@ -97,11 +121,180 @@ class RobotWebServer:
     def cam_info_cb(self, msg):
         with self.lock:
             if self.camera_info is None:
-                self.camera_info = msg.K # 3x3 intrinsic matrix
+                self.camera_info = msg
 
     def tags_cb(self, msg):
         with self.lock:
             self.tag_detections = msg.detections
+            
+            for detection in msg.detections:
+                if not detection.id:
+                    continue
+                tag_id = detection.id[0]
+                tag_frame = f"tag_{tag_id}"
+                
+                try:
+                    # 1. First try to look up the tag's TF frame directly in odom
+                    self.tf_listener.waitForTransform('odom', tag_frame, rospy.Time(0), rospy.Duration(0.1))
+                    (trans, rot) = self.tf_listener.lookupTransform('odom', tag_frame, rospy.Time(0))
+                    self.detected_tags[tag_id] = (trans[0], trans[1])
+                except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                    # 2. If the tag frame is not directly broadcast, compute it using the camera's TF in odom
+                    try:
+                        frame_id = detection.pose.header.frame_id
+                        self.tf_listener.waitForTransform('odom', frame_id, rospy.Time(0), rospy.Duration(0.1))
+                        (trans, rot) = self.tf_listener.lookupTransform('odom', frame_id, rospy.Time(0))
+                        
+                        p = detection.pose.pose.pose.position
+                        q = detection.pose.pose.pose.orientation
+                        
+                        T_odom_cam = tf.transformations.quaternion_matrix(rot)
+                        T_odom_cam[:3, 3] = trans
+                        
+                        T_cam_tag = tf.transformations.quaternion_matrix([q.x, q.y, q.z, q.w])
+                        T_cam_tag[:3, 3] = [p.x, p.y, p.z]
+                        
+                        T_odom_tag = np.dot(T_odom_cam, T_cam_tag)
+                        tx = T_odom_tag[0, 3]
+                        ty = T_odom_tag[1, 3]
+                        
+                        self.detected_tags[tag_id] = (tx, ty)
+                    except Exception:
+                        pass
+
+    def motion_cb(self, msg):
+        pts = []
+        for p in pc2.read_points(msg, field_names=("x", "y", "z"), skip_nans=True):
+            pts.append((p[0], p[1], p[2]))
+        with self.lock:
+            self.selected_motion_pts = pts
+            self.selected_motion_frame = msg.header.frame_id
+
+    def draw_path(self, cv_image):
+        if not self.selected_motion_pts or self.camera_info is None:
+            return cv_image
+            
+        K = np.array(self.camera_info.K).reshape((3, 3))
+        cam_frame = self.camera_info.header.frame_id
+        source_frame = self.selected_motion_frame
+        
+        try:
+            self.tf_listener.waitForTransform(cam_frame, source_frame, rospy.Time(0), rospy.Duration(0.1))
+        except (tf.Exception, tf.LookupException, tf.ConnectivityException):
+            return cv_image
+            
+        pts_2d = []
+        for (x, y, z) in self.selected_motion_pts:
+            ps = PointStamped()
+            ps.header.frame_id = source_frame
+            ps.header.stamp = rospy.Time(0)
+            ps.point.x = x
+            ps.point.y = y
+            ps.point.z = 0.2  # Approximate height of the path above ground
+            
+            try:
+                ps_cam = self.tf_listener.transformPoint(cam_frame, ps)
+                if ps_cam.point.z > 0.1: # Point is in front of camera
+                    u = int(K[0,0] * ps_cam.point.x / ps_cam.point.z + K[0,2])
+                    v = int(K[1,1] * ps_cam.point.y / ps_cam.point.z + K[1,2])
+                    
+                    if 0 <= u < cv_image.shape[1] and 0 <= v < cv_image.shape[0]:
+                        pts_2d.append((u, v))
+            except tf.Exception:
+                pass
+                
+        # Draw lines connecting the points
+        for i in range(len(pts_2d) - 1):
+            cv2.line(cv_image, pts_2d[i], pts_2d[i+1], (0, 255, 0), 4)
+            
+        return cv_image
+
+
+    def project_store_to_map(self, store):
+        store_pt = np.array([store[0], store[1]])
+        with self.lock:
+            R = self.R
+            T = self.T
+        store_map = np.dot(R, store_pt) + T
+        return store_map[0], store_map[1]
+
+    def semantic_cb(self, msg):
+        try:
+            obs = json.loads(msg.data)
+            if not obs.get("has_signboard", False):
+                category = obs.get("category", "Unknown")
+                storefront = obs.get("storefront", category)
+                
+                # Find the closest store among the 8 loaded store coordinates
+                with self.lock:
+                    rx, ry, yaw = self.robot_x, self.robot_y, self.robot_yaw
+                    
+                closest_idx = -1
+                best_score = float('inf')
+                
+                for idx, store in enumerate(self.stores):
+                    s_x, s_y = self.project_store_to_map(store)
+                    dist = np.hypot(rx - s_x, ry - s_y)
+                    if dist < 1.5:
+                        angle_to_store = math.atan2(s_y - ry, s_x - rx)
+                        # Normalize angle diff to [-pi, pi]
+                        angle_diff = (angle_to_store - yaw + math.pi) % (2 * math.pi) - math.pi
+                        angle_diff = abs(angle_diff)
+                        
+                        # Score prioritizes stores we are directly looking at
+                        score = dist + 2.0 * angle_diff
+                        
+                        if score < best_score:
+                            best_score = score
+                            closest_idx = idx
+                            
+                if closest_idx != -1 and best_score < 3.0:
+                    self.shop_categories[closest_idx] = {
+                        "storefront": storefront,
+                        "category": category
+                    }
+                    rospy.loginfo(f"Successfully mapped Shop S{closest_idx+1} to storefront {storefront} ({category})")
+        except Exception as e:
+            rospy.logerr(f"Error in web server semantic_cb: {e}")
+
+    def check_and_classify_stores(self):
+        # Prevent running if we don't have stores loaded yet
+        if not self.stores:
+            return
+            
+        now = rospy.get_time()
+        # Initialize last classification time tracker if not present
+        if not hasattr(self, 'last_classification_time'):
+            self.last_classification_time = {}
+            
+        # Check distance to each store
+        for idx, store in enumerate(self.stores):
+            # If already mapped, skip
+            if idx in self.shop_categories:
+                continue
+                
+            s_x, s_y = self.project_store_to_map(store)
+            dist = np.hypot(self.robot_x - s_x, self.robot_y - s_y)
+            if dist < 1.0:
+                # If we tried to classify this store recently, skip to prevent spamming
+                if now - self.last_classification_time.get(idx, 0.0) < 10.0:
+                    continue
+                    
+                self.last_classification_time[idx] = now
+                rospy.loginfo(f"Robot close to Store S{idx+1} (Dist: {dist:.2f}m). Triggering classification...")
+                
+                # Call /detect_shopfront in a background thread to prevent blocking the map generator
+                threading.Thread(target=self._call_store_classification, args=(idx,)).start()
+                
+    def _call_store_classification(self, idx):
+        try:
+            rospy.wait_for_service('/detect_shopfront', timeout=2.0)
+            detect_shop_srv = rospy.ServiceProxy('/detect_shopfront', DetectShopfront)
+            req = DetectShopfrontRequest()
+            req.target_shop = "EXPLORE"
+            detect_shop_srv(req)
+        except Exception as e:
+            rospy.logwarn(f"Failed to trigger storefront classification for Store S{idx+1}: {e}")
 
     def load_bundles(self, yaml_path):
         # Try multiple potential paths
@@ -136,7 +329,7 @@ class RobotWebServer:
         return {}
 
     def draw_tags(self, img):
-        K = np.array(self.camera_info).reshape(3, 3)
+        K = np.array(self.camera_info.K).reshape((3, 3))
         dist_coeffs = np.zeros((4,1)) # Assume rectified image
         
         def draw_single_tag(img, tag_id, size, rvec, tvec):
@@ -253,6 +446,52 @@ class RobotWebServer:
             except Exception as e:
                 rospy.logwarn(f"Failed to load stores in Web UI: {e}")
 
+    def load_tag_true_poses(self):
+        active_yaml = "/home/linusv/project_5/catkin_ws/src/AprilTagLocalization/config/2025/re540_n1_room111.yaml"
+        self.tag_true_poses = {}
+        if os.path.exists(active_yaml):
+            try:
+                with open(active_yaml, 'r') as f:
+                    config = yaml.safe_load(f)
+                if config and 'TAG_TRUE_RT' in config and 'TAGS' in config['TAG_TRUE_RT']:
+                    for tag_def in config['TAG_TRUE_RT']['TAGS']:
+                        name = tag_def[0]
+                        x_true = float(tag_def[2])
+                        y_true = float(tag_def[3])
+                        self.tag_true_poses[name] = (x_true, y_true)
+                rospy.loginfo(f"Web UI loaded true poses for {len(self.tag_true_poses)} signboards.")
+            except Exception as e:
+                rospy.logwarn(f"Failed to load true poses: {e}")
+
+    def estimate_rigid_transform_2d(self, pts_true, pts_meas):
+        n = len(pts_true)
+        if n == 0:
+            return np.eye(2), np.array([0.0, -3.125])
+        elif n == 1:
+            tx = pts_meas[0][0] - pts_true[0][0]
+            ty = pts_meas[0][1] - pts_true[0][1]
+            return np.eye(2), np.array([tx, ty])
+            
+        pts_true = np.array(pts_true)
+        pts_meas = np.array(pts_meas)
+        
+        centroid_true = np.mean(pts_true, axis=0)
+        centroid_meas = np.mean(pts_meas, axis=0)
+        
+        pts_true_c = pts_true - centroid_true
+        pts_meas_c = pts_meas - centroid_meas
+        
+        H = np.dot(pts_true_c.T, pts_meas_c)
+        U, S, Vt = np.linalg.svd(H)
+        R = np.dot(Vt.T, U.T)
+        
+        if np.linalg.det(R) < 0:
+            Vt[1, :] *= -1
+            R = np.dot(Vt.T, U.T)
+            
+        T = centroid_meas - np.dot(R, centroid_true)
+        return R, T
+
     def generate_map_frames(self):
         rate = rospy.Rate(5) # 5 Hz is perfect
         while not rospy.is_shutdown():
@@ -283,6 +522,7 @@ class RobotWebServer:
                     
                     # Try to lookup robot's pose in map frame
                     try:
+                        self.tf_listener.waitForTransform('map', 'base_footprint', rospy.Time(0), rospy.Duration(0.1))
                         (trans, rot) = self.tf_listener.lookupTransform('map', 'base_footprint', rospy.Time(0))
                         rx, ry = trans[0], trans[1]
                         euler = tf.transformations.euler_from_quaternion(rot)
@@ -292,6 +532,9 @@ class RobotWebServer:
                         self.robot_x = rx
                         self.robot_y = ry
                         self.robot_yaw = yaw
+                        
+                        # Trigger automated storefront classification in manual RC/other modes
+                        self.check_and_classify_stores()
                         
                         # Translate to pixel coordinates
                         r_col = int((rx - origin.position.x) / resolution)
@@ -323,18 +566,93 @@ class RobotWebServer:
                     except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
                         pass
                         
-                    # Draw shops
+                    # Build matched point sets for 2D rigid transform estimation
+                    pts_true = []
+                    pts_meas = []
+                    
+                    # Try to lookup transform map -> odom
+                    try:
+                        self.tf_listener.waitForTransform('map', 'odom', rospy.Time(0), rospy.Duration(0.1))
+                        (trans_mo, rot_mo) = self.tf_listener.lookupTransform('map', 'odom', rospy.Time(0))
+                        T_map_odom = tf.transformations.quaternion_matrix(rot_mo)
+                        T_map_odom[:3, 3] = trans_mo
+                    except (tf.LookupException, tf.ConnectivityException, tf.ExtrapolationException):
+                        T_map_odom = np.eye(4)
+                        
+                    for tag_id, tag_pose_odom in self.detected_tags.items():
+                        signboard_name = None
+                        for ids, bundle in self.bundles.items():
+                            if tag_id in ids:
+                                signboard_name = bundle['name']
+                                break
+                        if signboard_name and signboard_name in self.tag_true_poses:
+                            # Transform tag_pose_odom from odom to map
+                            pt_odom = np.array([tag_pose_odom[0], tag_pose_odom[1], 0.0, 1.0])
+                            pt_map = np.dot(T_map_odom, pt_odom)
+                            
+                            pts_true.append(self.tag_true_poses[signboard_name])
+                            pts_meas.append((pt_map[0], pt_map[1]))
+                            
+                    # Estimate the transform from ground-truth/world coordinates to current SLAM map coordinates
+                    R, T = self.estimate_rigid_transform_2d(pts_true, pts_meas)
+                    with self.lock:
+                        self.R = R
+                        self.T = T
+                        
+                    if not hasattr(self, 'last_transform_log_time'):
+                        self.last_transform_log_time = 0.0
+                    now_sec = rospy.Time.now().to_sec()
+                    if now_sec - self.last_transform_log_time > 5.0:
+                        rospy.loginfo(f"[RIGID TRANSFORM] Match count: {len(pts_true)}, T: {T.tolist()}")
+                        self.last_transform_log_time = now_sec
+                    
+                    # Draw shops projected into current SLAM map coordinates
                     for idx, store in enumerate(self.stores):
-                        s_col = int((store[0] - origin.position.x) / resolution)
-                        s_row = int((store[1] - origin.position.y) / resolution)
+                        s_x, s_y = self.project_store_to_map(store)
+                        
+                        s_col = int((s_x - origin.position.x) / resolution)
+                        s_row = int((s_y - origin.position.y) / resolution)
                         s_row_flipped = height - 1 - s_row
                         
                         if 0 <= s_col < width and 0 <= s_row_flipped < height:
-                            # Cyan circle marker
-                            cv2.circle(color_map, (s_col, s_row_flipped), 6, (255, 255, 0), -1)
+                            # Choose color based on category:
+                            # Convenience store: Yellow (36, 191, 251)
+                            # Café: Brown (14, 77, 133)
+                            # Fast-food restaurant (Burger): Red (68, 68, 239)
+                            # Pharmacy: Purple (246, 92, 139)
+                            # Unmapped: Cyan (255, 255, 0)
+                            color = (255, 255, 0) # default Cyan
+                            if idx in self.shop_categories:
+                                cat = self.shop_categories[idx].get("category", "Unknown")
+                                if cat == "Convenience store":
+                                    color = (36, 191, 251) # Yellow
+                                elif cat == "Café":
+                                    color = (14, 77, 133) # Brown
+                                elif cat == "Fast-food restaurant":
+                                    color = (68, 68, 239) # Red
+                                elif cat == "Pharmacy":
+                                    color = (246, 92, 139) # Purple
+                                    
+                            cv2.circle(color_map, (s_col, s_row_flipped), 6, color, -1)
                             cv2.circle(color_map, (s_col, s_row_flipped), 6, (255, 255, 255), 1)
                             cv2.putText(color_map, f"S{idx+1}", (s_col + 8, s_row_flipped + 4), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
+                                        
+                    # Draw persistently detected AprilTags
+                    for tag_id, tag_pose_odom in self.detected_tags.items():
+                        pt_odom = np.array([tag_pose_odom[0], tag_pose_odom[1], 0.0, 1.0])
+                        pt_map = np.dot(T_map_odom, pt_odom)
+                        
+                        t_col = int((pt_map[0] - origin.position.x) / resolution)
+                        t_row = int((pt_map[1] - origin.position.y) / resolution)
+                        t_row_flipped = height - 1 - t_row
+                        
+                        if 0 <= t_col < width and 0 <= t_row_flipped < height:
+                            # Orange square marker
+                            cv2.rectangle(color_map, (t_col - 5, t_row_flipped - 5), (t_col + 5, t_row_flipped + 5), (0, 127, 255), -1)
+                            cv2.rectangle(color_map, (t_col - 5, t_row_flipped - 5), (t_col + 5, t_row_flipped + 5), (255, 255, 255), 1)
+                            cv2.putText(color_map, f"T{tag_id}", (t_col + 8, t_row_flipped + 4), 
+                                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
                                         
                     # Calculate explored area in square meters
                     explored_cells = np.sum((data == 0) | ((data > 0) & (data <= 100)))
@@ -387,14 +705,45 @@ def video_map():
 
 @app.route('/api/status')
 def api_status():
+    is_paused = rospy.get_param("/exploration_paused", False)
+    explore_state = rospy.get_param("/exploration_state", "IDLE")
+    
+    # Map raw state to simple status string for UI highlighting: 'play', 'pause', or 'stop'
+    status_str = "stop"
+    if explore_state in ["EXPLORE", "READ_SIGN", "TURN", "CHECK_SHOP"]:
+        status_str = "pause" if is_paused else "play"
+    elif explore_state == "ARRIVED":
+        status_str = "arrived"
+    elif explore_state == "IDLE":
+        status_str = "stop"
+
+    has_key = bool(rospy.get_param("/openai_api_key", "").strip()) or \
+              bool(os.getenv("OPENAI_API_KEY")) or \
+              os.path.exists("/home/linusv/project_5/HW4/ChatGPT_API_KEY.txt")
+
     status = {
         "x": round(server.robot_x, 2) if hasattr(server, 'robot_x') else None,
         "y": round(server.robot_y, 2) if hasattr(server, 'robot_y') else None,
         "yaw": round(server.robot_yaw, 2) if hasattr(server, 'robot_yaw') else None,
         "explored_area": round(server.map_coverage_m2, 1) if hasattr(server, 'map_coverage_m2') else 0.0,
-        "shops_detected": len(server.tag_detections) if hasattr(server, 'tag_detections') else 0
+        "shops_detected": len(server.shop_categories) if hasattr(server, 'shop_categories') else 0,
+        "tags_detected": len(server.detected_tags) if hasattr(server, 'detected_tags') else 0,
+        "exploration_status": status_str,
+        "exploration_state": explore_state,
+        "has_api_key": has_key
     }
     return jsonify(status)
+
+@app.route('/api/set_api_key', methods=['POST'])
+def set_api_key():
+    data = request.json or {}
+    key = data.get('api_key', '').strip()
+    if key:
+        rospy.set_param("/openai_api_key", key)
+        rospy.loginfo("OpenAI API key dynamically updated by the user interface.")
+        return jsonify({"status": "success", "message": "API key successfully set for this session!"})
+    else:
+        return jsonify({"status": "error", "message": "API key cannot be empty!"}), 400
 
 @app.route('/api/cmd_vel', methods=['POST'])
 def cmd_vel():
@@ -408,6 +757,154 @@ def cmd_vel():
     
     server.cmd_vel_pub.publish(twist)
     return jsonify({"status": "success"})
+
+@app.route('/api/set_ai_mode', methods=['POST'])
+def set_ai_mode():
+    data = request.json
+    mode = data.get('mode', 'local') # 'local' or 'remote'
+    use_local = (mode == 'local')
+    rospy.set_param("/use_local_ai", use_local)
+    rospy.loginfo(f"Set /use_local_ai to {use_local}")
+    return jsonify({"status": "success", "mode": mode})
+
+@app.route('/api/exploration/control', methods=['POST'])
+def exploration_control():
+    data = request.json
+    cmd = data.get('command', 'play').lower()
+    
+    if cmd == 'play':
+        rospy.set_param("/exploration_paused", False)
+        msg = String()
+        msg.data = "EXPLORE"
+        server.user_prompt_pub.publish(msg)
+    elif cmd == 'pause':
+        rospy.set_param("/exploration_paused", True)
+    elif cmd == 'stop':
+        rospy.set_param("/exploration_paused", False)
+        msg = String()
+        msg.data = "STOP"
+        server.user_prompt_pub.publish(msg)
+        
+    return jsonify({"status": "success", "command": cmd})
+
+@app.route('/api/delivery/send', methods=['POST'])
+def delivery_send():
+    data = request.json
+    message = data.get('message', '').strip()
+    if not message:
+        return jsonify({"reply": "I did not receive a message. Please say something!"})
+        
+    # Call the /llm_query service of the stateless client to parse the user's intent!
+    try:
+        rospy.wait_for_service("llm_query", timeout=2.0)
+        llm_query_srv = rospy.ServiceProxy("llm_query", LLMQuery)
+        
+        prompt = (
+            f"The user is talking to a delivery robot. They said: '{message}'.\n"
+            f"We want to match their request to one of our mapped storefront categories or store names: "
+            f"BLUE CAFE, BLUE STORE, GREEN STORE, ORANGE CAFE, RED BURGER, RED PHARMACY, WHITE CAFE, YELLOW BURGER.\n"
+            f"Business Category categories are Cafe, Convenience store, Fast-food restaurant, Pharmacy.\n"
+            f"Determine what they want, and return ONLY a raw JSON object with two keys:\n"
+            f"1. 'target' (string, the exact target category or store name, e.g. 'Café' or 'BLUE CAFE' or 'RED BURGER')\n"
+            f"2. 'reply' (string, a cute, polite conversational response to display to the user, explaining where you will go to get this)."
+        )
+        
+        llm_req = LLMQueryRequest()
+        llm_req.prompt = prompt
+        llm_res = llm_query_srv(llm_req)
+        
+        # Parse reply safely
+        cleaned_resp = llm_res.response.strip()
+        if cleaned_resp.startswith("```json"):
+            cleaned_resp = cleaned_resp[7:]
+        if cleaned_resp.endswith("```"):
+            cleaned_resp = cleaned_resp[:-3]
+        cleaned_resp = cleaned_resp.strip()
+        
+        parsed = json.loads(cleaned_resp)
+        target = parsed.get("target", "")
+        reply = parsed.get("reply", "Understood! Moving to target.")
+        
+        if target:
+            msg = String()
+            msg.data = target
+            server.user_prompt_pub.publish(msg)
+            
+        return jsonify({"reply": reply, "target": target})
+        
+    except Exception as e:
+        rospy.logwarn(f"LLM Query failed or timed out: {e}")
+        # Standard local backup parser for simple keywords
+        reply = "I'm in offline Local Mode. Let me parse that... "
+        target = ""
+        m = message.lower()
+        if "burger" in m or "food" in m or "burger" in m or "restaurant" in m:
+            target = "Fast-food restaurant"
+            reply += "Ah! You want a burger. I will navigate to the Fast-food restaurant!"
+        elif "coffee" in m or "cafe" in m or "drink" in m:
+            target = "Café"
+            reply += "Ah! You want coffee. I will navigate to the Café!"
+        elif "med" in m or "pharm" in m or "pill" in m or "sick" in m:
+            target = "Pharmacy"
+            reply += "Ah! You need a pharmacy. I will navigate to the Pharmacy!"
+        elif "store" in m or "shop" in m or "item" in m or "convenience" in m:
+            target = "Convenience store"
+            reply += "Ah! You need the Convenience store. I will navigate there!"
+        else:
+            reply = "I'm not sure which storefront matches that request. Try asking for coffee, a burger, medicine, or the convenience store!"
+            
+        if target:
+            msg = String()
+            msg.data = target
+            server.user_prompt_pub.publish(msg)
+            
+        return jsonify({"reply": reply, "target": target})
+
+@app.route('/api/semantic_map')
+def api_semantic_map():
+    # Return server.shop_categories for UI legends and mapping
+    return jsonify(server.shop_categories)
+
+@app.route('/api/reset', methods=['POST'])
+def api_reset():
+    # 1. Reset local lists/dictionaries in the web server
+    server.shop_categories = {}
+    server.detected_tags = {}
+    server.grid_map = None
+    if hasattr(server, 'trail'):
+        server.trail = []
+    if hasattr(server, 'last_classification_time'):
+        server.last_classification_time = {}
+        
+    rospy.loginfo("Web server local state reset triggered.")
+    
+    # 2. Reset Gazebo Simulation (models, controllers, and odometry)
+    try:
+        rospy.wait_for_service('/gazebo/reset_simulation', timeout=1.0)
+        reset_sim_srv = rospy.ServiceProxy('/gazebo/reset_simulation', EmptySrv)
+        reset_sim_srv()
+        rospy.loginfo("Gazebo simulation successfully reset.")
+    except Exception as e:
+        rospy.logwarn(f"Failed to reset Gazebo simulation: {e}")
+        
+    # 3. Reset RTAB-Map SLAM completely (reset database + trigger fresh map session)
+    try:
+        rospy.wait_for_service('/rtabmap/reset', timeout=1.0)
+        reset_rtab_srv = rospy.ServiceProxy('/rtabmap/reset', EmptySrv)
+        reset_rtab_srv()
+        rospy.loginfo("RTAB-Map database successfully reset.")
+    except Exception as e:
+        rospy.logwarn(f"Failed to reset RTAB-Map SLAM: {e}")
+        
+    try:
+        rospy.wait_for_service('/rtabmap/trigger_new_map', timeout=1.0)
+        trigger_new_srv = rospy.ServiceProxy('/rtabmap/trigger_new_map', EmptySrv)
+        trigger_new_srv()
+        rospy.loginfo("RTAB-Map fresh map session triggered.")
+    except Exception as e:
+        rospy.logwarn(f"Failed to trigger fresh RTAB-Map session: {e}")
+        
+    return jsonify({"status": "success", "message": "Robot state, classifications, SLAM map database, and Gazebo simulation successfully reset."})
 
 if __name__ == '__main__':
     global server

@@ -40,38 +40,51 @@ class AgentNode:
         self.turn_dyaw = 0.0
         
         self.rate = rospy.Rate(10)
+        
+        # Publish initial state to ROS parameters
+        self.set_state("IDLE")
         rospy.loginfo("Agent Node initialized. Waiting for user input on /user_prompt...")
         
+    def set_state(self, new_state):
+        self.state = new_state
+        rospy.set_param("/exploration_state", new_state)
+        rospy.loginfo(f"Agent state transitioned to: {new_state}")
+        
     def prompt_cb(self, msg):
-        if self.state == "IDLE":
-            self.target_shop = msg.data
+        cmd = msg.data.strip()
+        if cmd == "STOP":
+            rospy.loginfo("Received STOP command. Stopping exploration.")
+            self.set_state("IDLE")
+            self.stop_robot()
+        else:
+            self.target_shop = cmd
             rospy.loginfo(f"Received target: {self.target_shop}. Starting EXPLORE.")
             self.last_shop_check_time = rospy.Time.now()
-            self.state = "EXPLORE"
+            self.set_state("EXPLORE")
             
     def tag_cb(self, msg):
         if self.state == "EXPLORE":
             if len(msg.detections) > 0:
                 if (rospy.Time.now() - self.last_tag_time) > self.tag_cooldown:
                     rospy.loginfo("Detected AprilTag! Stopping to read sign.")
-                    self.state = "READ_SIGN"
+                    self.set_state("READ_SIGN")
                     
     def stop_robot(self):
         # Publish empty path to stop control_space_planner
         path = Path()
-        path.header.frame_id = "odom"
+        path.header.frame_id = "map"
         path.header.stamp = rospy.Time.now()
         self.path_pub.publish(path)
 
     def publish_local_path(self, dx, dy, dyaw):
         try:
-            trans = self.tf_buffer.lookup_transform("odom", "base_footprint", rospy.Time(0), rospy.Duration(1.0))
+            trans = self.tf_buffer.lookup_transform("map", "base_footprint", rospy.Time(0), rospy.Duration(1.0))
         except (tf2_ros.LookupException, tf2_ros.ConnectivityException, tf2_ros.ExtrapolationException) as e:
             rospy.logwarn(f"TF lookup failed: {e}")
             return
             
         path = Path()
-        path.header.frame_id = "odom"
+        path.header.frame_id = "map"
         path.header.stamp = rospy.Time.now()
         
         p0 = PoseStamped()
@@ -96,6 +109,12 @@ class AgentNode:
 
     def run(self):
         while not rospy.is_shutdown():
+            # Support real-time pause control
+            if rospy.get_param("/exploration_paused", False):
+                self.stop_robot()
+                self.rate.sleep()
+                continue
+                
             if self.state == "IDLE":
                 pass
                 
@@ -103,7 +122,7 @@ class AgentNode:
                 if (rospy.Time.now() - self.last_shop_check_time) > self.shop_check_interval:
                     self.stop_robot()
                     rospy.loginfo("Pausing exploration to check for shopfront...")
-                    self.state = "CHECK_SHOP"
+                    self.set_state("CHECK_SHOP")
                 else:
                     self.publish_local_path(1.5, 0.0, 0.0) # publish point 1.5m straight ahead
                     
@@ -134,11 +153,11 @@ class AgentNode:
                     self.turn_dyaw = 0.0
                     self.turn_end_time = rospy.Time.now() + rospy.Duration(3.0)
                     
-                self.state = "TURN"
+                self.set_state("TURN")
                 
             elif self.state == "TURN":
                 if rospy.Time.now() > self.turn_end_time:
-                    self.state = "EXPLORE"
+                    self.set_state("EXPLORE")
                     self.last_shop_check_time = rospy.Time.now()
                 else:
                     self.publish_local_path(self.turn_dx, self.turn_dy, self.turn_dyaw)
@@ -147,13 +166,19 @@ class AgentNode:
                 rospy.sleep(1.0)
                 rospy.loginfo("Calling /detect_shopfront API...")
                 res = self.shop_srv(self.target_shop)
-                if res.is_found:
+                
+                # If we are in mapping/exploration mode, always resume to keep exploring!
+                if self.target_shop.upper() in ["", "EXPLORE", "MAPPING"]:
+                    rospy.loginfo("Completed local shop scan. Resuming systematic exploration.")
+                    self.last_shop_check_time = rospy.Time.now()
+                    self.set_state("EXPLORE")
+                elif res.is_found:
                     rospy.loginfo("SUCCESS! Arrived at target shop.")
-                    self.state = "ARRIVED"
+                    self.set_state("ARRIVED")
                 else:
                     rospy.loginfo("Shop not found yet. Resuming exploration.")
                     self.last_shop_check_time = rospy.Time.now()
-                    self.state = "EXPLORE"
+                    self.set_state("EXPLORE")
                     
             elif self.state == "ARRIVED":
                 self.stop_robot()

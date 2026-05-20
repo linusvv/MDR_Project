@@ -12,9 +12,9 @@ class TagPoseInjector:
         self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
         
         self.pub = rospy.Publisher('/rtabmap/global_pose', PoseWithCovarianceStamped, queue_size=1)
-        self.sub = rospy.Subscriber('/apriltag_localization_pose', PoseStamped, self.pose_cb)
+        self.sub = rospy.Subscriber('/camera_link', PoseStamped, self.pose_cb)
         
-        rospy.loginfo("Tag Pose Injector started. Listening to /apriltag_localization_pose")
+        rospy.loginfo("Tag Pose Injector started. Listening to /camera_link")
 
     def pose_cb(self, msg):
         try:

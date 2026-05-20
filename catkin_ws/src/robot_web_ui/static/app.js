@@ -1,4 +1,19 @@
 document.addEventListener('DOMContentLoaded', () => {
+    // Console Logger Utility
+    const consoleEl = document.getElementById('console-output');
+    const logConsole = (msg) => {
+        if (consoleEl) {
+            const time = new Date().toLocaleTimeString();
+            const newMsg = document.createElement('div');
+            newMsg.textContent = `[${time}] ${msg}`;
+            consoleEl.appendChild(newMsg);
+            consoleEl.scrollTop = consoleEl.scrollHeight;
+        }
+    };
+
+    // Initial Welcome
+    logConsole("Robot Control Dashboard loaded.");
+
     // Layout Slider Logic
     const layoutSlider = document.getElementById('layout-slider');
     const layoutVal = document.getElementById('layout-val');
@@ -8,7 +23,6 @@ document.addEventListener('DOMContentLoaded', () => {
     };
     
     if (layoutSlider && layoutVal) {
-        // Load initial layout preference if saved in localStorage
         const savedWidth = localStorage.getItem('sidebarWidth');
         if (savedWidth) {
             layoutSlider.value = savedWidth;
@@ -24,23 +38,186 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
-    // Mode Toggle Logic (Placeholder for now)
-    const modeToggle = document.getElementById('mode-toggle');
-    const labelRemote = document.getElementById('label-remote');
-    const labelExplore = document.getElementById('label-explore');
-
-    // Currently exploration is disabled, so we force the toggle back if clicked
-    modeToggle.addEventListener('change', (e) => {
-        if (e.target.checked) {
-            e.preventDefault();
-            setTimeout(() => {
-                modeToggle.checked = false;
-                alert("Exploration mode is currently under development.");
-            }, 200);
+    // Three-Position Tabs Slider Handler
+    const tabBtns = document.querySelectorAll('.tab-btn');
+    const tabPanels = document.querySelectorAll('.tab-panel');
+    
+    async function sendExplorationCmd(command) {
+        try {
+            const res = await fetch('/api/exploration/control', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ command })
+            });
+            await res.json();
+            logConsole(`Exploration Command: ${command.toUpperCase()}`);
+        } catch (error) {
+            console.error("Failed to send exploration command", error);
+            logConsole(`Error: Failed to execute ${command} control`);
         }
+    }
+
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            tabBtns.forEach(b => b.classList.remove('active'));
+            btn.classList.add('active');
+            
+            const targetTab = btn.dataset.tab;
+            
+            // Automatically stop exploration if switching to RC mode or Delivery mode
+            if (targetTab === 'rc' || targetTab === 'delivery') {
+                sendExplorationCmd('stop');
+            }
+            
+            tabPanels.forEach(panel => {
+                if (panel.id === `panel-${targetTab}`) {
+                    panel.style.display = 'block';
+                    panel.classList.add('active');
+                } else {
+                    panel.style.display = 'none';
+                    panel.classList.remove('active');
+                }
+            });
+            
+            logConsole(`Activated mode: ${btn.textContent}`);
+        });
     });
 
-    // Remote Control Logic
+    // Local / Remote AI Switch Handler
+    const aiToggle = document.getElementById('ai-toggle');
+    const labelLocal = document.getElementById('label-local');
+    const labelRemote = document.getElementById('label-remote');
+    
+    if (aiToggle) {
+        aiToggle.addEventListener('change', async (e) => {
+            const mode = e.target.checked ? 'remote' : 'local';
+            if (mode === 'remote') {
+                labelRemote.classList.add('active');
+                labelLocal.classList.remove('active');
+            } else {
+                labelLocal.classList.add('active');
+                labelRemote.classList.remove('active');
+            }
+            
+            try {
+                const res = await fetch('/api/set_ai_mode', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ mode })
+                });
+                await res.json();
+                logConsole(`AI Mode changed to: ${mode.toUpperCase()} (${mode === 'local' ? 'Offline Local OpenCV' : 'VLM ChatGPT Service'})`);
+            } catch (error) {
+                console.error("Failed to set AI mode", error);
+                logConsole("Error: Failed to change AI core mode");
+            }
+        });
+    }
+
+    // Exploration Mode controls (Play, Pause, Stop)
+    const expPlay = document.getElementById('exp-play');
+    const expPause = document.getElementById('exp-pause');
+    const expStop = document.getElementById('exp-stop');
+    
+    if (expPlay) expPlay.addEventListener('click', () => sendExplorationCmd('play'));
+    if (expPause) expPause.addEventListener('click', () => sendExplorationCmd('pause'));
+    if (expStop) expStop.addEventListener('click', () => sendExplorationCmd('stop'));
+
+    // OpenAI API Key Submission Form Logic
+    const apiKeyInput = document.getElementById('openai-api-key');
+    const apiKeySubmit = document.getElementById('btn-submit-api-key');
+    const apiKeyStatus = document.getElementById('api-key-status');
+
+    if (apiKeySubmit && apiKeyInput) {
+        apiKeySubmit.addEventListener('click', async () => {
+            const apiKey = apiKeyInput.value.trim();
+            if (!apiKey) {
+                alert("Please enter a valid OpenAI API Key!");
+                return;
+            }
+            try {
+                apiKeyStatus.textContent = "Setting session key...";
+                apiKeyStatus.className = "api-key-status updating";
+                
+                const response = await fetch('/api/set_api_key', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ api_key: apiKey })
+                });
+                const resData = await response.json();
+                
+                if (response.ok) {
+                    apiKeyStatus.textContent = "Active session key loaded! (Remote AI enabled)";
+                    apiKeyStatus.className = "api-key-status active-key";
+                    apiKeyInput.value = ""; // Clear for safety
+                    logConsole("System: OpenAI API Key dynamically updated for this session.");
+                } else {
+                    apiKeyStatus.textContent = `Error: ${resData.message}`;
+                    apiKeyStatus.className = "api-key-status missing-key";
+                }
+            } catch (error) {
+                console.error("Failed to submit API key", error);
+                apiKeyStatus.textContent = "Error: Failed to connect to server.";
+                apiKeyStatus.className = "api-key-status missing-key";
+            }
+        });
+        
+        // Submit on enter press
+        apiKeyInput.addEventListener('keypress', (e) => {
+            if (e.key === 'Enter') {
+                apiKeySubmit.click();
+            }
+        });
+    }
+
+    // Delivery Agent Chatbot Logic
+    const chatInput = document.getElementById('chat-input');
+    const chatSend = document.getElementById('btn-send-chat');
+    const chatMessages = document.getElementById('chat-messages');
+    
+    const addChatMessage = (msg, sender) => {
+        if (chatMessages) {
+            const div = document.createElement('div');
+            div.className = `msg ${sender}`;
+            div.textContent = msg;
+            chatMessages.appendChild(div);
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+        }
+    };
+    
+    const sendChatMessage = async () => {
+        const text = chatInput.value.trim();
+        if (!text) return;
+        
+        chatInput.value = '';
+        addChatMessage(text, 'user');
+        logConsole(`User prompt: "${text}"`);
+        
+        try {
+            const res = await fetch('/api/delivery/send', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ message: text })
+            });
+            const data = await res.json();
+            addChatMessage(data.reply, 'bot');
+            logConsole(`Delivery Agent: "${data.reply}"`);
+        } catch (error) {
+            console.error("Failed to send chat message", error);
+            addChatMessage("Sorry, I am having trouble connecting to the delivery brain. Make sure the ROS nodes are running!", 'bot');
+        }
+    };
+    
+    if (chatSend) chatSend.addEventListener('click', sendChatMessage);
+    if (chatInput) {
+        chatInput.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                sendChatMessage();
+            }
+        });
+    }
+
+    // Remote Control manual button publishers
     const buttons = {
         'btn-up': document.getElementById('btn-up'),
         'btn-down': document.getElementById('btn-down'),
@@ -62,8 +239,7 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({ linear, angular })
             });
         } catch (error) {
-            console.error("Failed to send command", error);
-            // Visual feedback for error could be added here
+            console.error("Failed to send manual command", error);
         }
     };
 
@@ -71,7 +247,6 @@ document.addEventListener('DOMContentLoaded', () => {
         if (activeInterval) clearInterval(activeInterval);
         currentCmd = { linear, angular };
         sendCommand(linear, angular);
-        // Continuously send command while holding (10Hz)
         activeInterval = setInterval(() => sendCommand(linear, angular), 100);
     };
 
@@ -81,14 +256,12 @@ document.addEventListener('DOMContentLoaded', () => {
         sendCommand(0, 0);
     };
 
-    // Attach event listeners to buttons
     Object.values(buttons).forEach(btn => {
         if (!btn) return;
 
         const linear = parseFloat(btn.dataset.linear);
         const angular = parseFloat(btn.dataset.angular);
 
-        // Mouse events
         btn.addEventListener('mousedown', () => {
             if (btn.id === 'btn-stop') {
                 stopCommand();
@@ -109,9 +282,8 @@ document.addEventListener('DOMContentLoaded', () => {
             }
         });
 
-        // Touch events for mobile support
         btn.addEventListener('touchstart', (e) => {
-            e.preventDefault(); // Prevent scrolling
+            e.preventDefault();
             if (btn.id === 'btn-stop') {
                 stopCommand();
             } else {
@@ -129,36 +301,36 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Keyboard support for WASD / Arrows
     document.addEventListener('keydown', (e) => {
-        if (e.repeat) return; // Prevent key repeat triggering multiple starts
+        if (e.repeat) return;
         
         switch(e.key) {
             case 'ArrowUp':
             case 'w':
             case 'W':
                 startCommand(0.5, 0);
-                buttons['btn-up'].style.transform = 'translateY(2px)';
+                if (buttons['btn-up']) buttons['btn-up'].style.transform = 'translateY(2px)';
                 break;
             case 'ArrowDown':
             case 's':
             case 'S':
                 startCommand(-0.5, 0);
-                buttons['btn-down'].style.transform = 'translateY(2px)';
+                if (buttons['btn-down']) buttons['btn-down'].style.transform = 'translateY(2px)';
                 break;
             case 'ArrowLeft':
             case 'a':
             case 'A':
                 startCommand(0, 1.0);
-                buttons['btn-left'].style.transform = 'translateY(2px)';
+                if (buttons['btn-left']) buttons['btn-left'].style.transform = 'translateY(2px)';
                 break;
             case 'ArrowRight':
             case 'd':
             case 'D':
                 startCommand(0, -1.0);
-                buttons['btn-right'].style.transform = 'translateY(2px)';
+                if (buttons['btn-right']) buttons['btn-right'].style.transform = 'translateY(2px)';
                 break;
-            case ' ': // Spacebar for stop
+            case ' ':
                 stopCommand();
-                buttons['btn-stop'].style.transform = 'translateY(2px)';
+                if (buttons['btn-stop']) buttons['btn-stop'].style.transform = 'translateY(2px)';
                 break;
         }
     });
@@ -169,36 +341,38 @@ document.addEventListener('DOMContentLoaded', () => {
             case 'w':
             case 'W':
                 stopCommand();
-                buttons['btn-up'].style.transform = '';
+                if (buttons['btn-up']) buttons['btn-up'].style.transform = '';
                 break;
             case 'ArrowDown':
             case 's':
             case 'S':
                 stopCommand();
-                buttons['btn-down'].style.transform = '';
+                if (buttons['btn-down']) buttons['btn-down'].style.transform = '';
                 break;
             case 'ArrowLeft':
             case 'a':
             case 'A':
                 stopCommand();
-                buttons['btn-left'].style.transform = '';
+                if (buttons['btn-left']) buttons['btn-left'].style.transform = '';
                 break;
             case 'ArrowRight':
             case 'd':
             case 'D':
                 stopCommand();
-                buttons['btn-right'].style.transform = '';
+                if (buttons['btn-right']) buttons['btn-right'].style.transform = '';
                 break;
             case ' ':
-                buttons['btn-stop'].style.transform = '';
+                if (buttons['btn-stop']) buttons['btn-stop'].style.transform = '';
                 break;
         }
     });
 
-    // Telemetry Polling
+    // Telemetry and Map Legend Polling
     const robotPoseEl = document.getElementById('robot-pose');
     const shopsCountEl = document.getElementById('shops-count');
     const mapCoverageEl = document.getElementById('map-coverage');
+    const tagsCountEl = document.getElementById('tags-count');
+    const legendGrid = document.getElementById('legend-grid');
 
     const updateTelemetry = async () => {
         try {
@@ -209,16 +383,124 @@ document.addEventListener('DOMContentLoaded', () => {
                 robotPoseEl.textContent = `[X: ${data.x}, Y: ${data.y}, θ: ${data.yaw}]`;
             }
             if (shopsCountEl) {
-                shopsCountEl.textContent = data.shops_detected;
+                shopsCountEl.textContent = `${data.shops_detected} / 8`;
             }
             if (mapCoverageEl) {
                 mapCoverageEl.textContent = `${data.explored_area} m²`;
+            }
+            if (tagsCountEl) {
+                tagsCountEl.textContent = `${data.tags_detected} tags`;
+            }
+            
+            // Highlight active exploration buttons
+            if (data.exploration_status) {
+                const expPlay = document.getElementById('exp-play');
+                const expPause = document.getElementById('exp-pause');
+                const expStop = document.getElementById('exp-stop');
+                
+                if (expPlay && expPause && expStop) {
+                    expPlay.classList.remove('active');
+                    expPause.classList.remove('active');
+                    expStop.classList.remove('active');
+                    
+                    if (data.exploration_status === 'play') {
+                        expPlay.classList.add('active');
+                    } else if (data.exploration_status === 'pause') {
+                        expPause.classList.add('active');
+                    } else if (data.exploration_status === 'stop') {
+                        expStop.classList.add('active');
+                    }
+                }
+            }
+
+            // Dynamic API Key Status Update
+            if (apiKeyStatus && document.activeElement !== apiKeyInput) {
+                if (data.has_api_key) {
+                    apiKeyStatus.textContent = "Active session key loaded! (Remote AI enabled)";
+                    apiKeyStatus.className = "api-key-status active-key";
+                } else {
+                    apiKeyStatus.textContent = "No session key loaded. (Remote AI disabled)";
+                    apiKeyStatus.className = "api-key-status missing-key";
+                }
             }
         } catch (error) {
             console.error("Failed to fetch telemetry status", error);
         }
     };
 
-    // Poll every 500ms
+    const updateLegend = async () => {
+        try {
+            const res = await fetch('/api/semantic_map');
+            const mapData = await res.json();
+            
+            for (let i = 0; i < 8; i++) {
+                const item = legendGrid.querySelector(`.legend-item[data-idx="${i}"]`);
+                if (!item) continue;
+                
+                if (mapData[i]) {
+                    const store = mapData[i];
+                    const sf = store.storefront;
+                    const cat = store.category;
+                    
+                    let dotClass = 'unmapped';
+                    if (cat === 'Café') dotClass = 'cafe';
+                    else if (cat === 'Convenience store') dotClass = 'store';
+                    else if (cat === 'Fast-food restaurant') dotClass = 'burger';
+                    else if (cat === 'Pharmacy') dotClass = 'pharmacy';
+                    
+                    item.innerHTML = `<span class="legend-dot ${dotClass}"></span> S${i+1}: ${sf} (${cat})`;
+                } else {
+                    item.innerHTML = `<span class="legend-dot unmapped"></span> S${i+1}: Unmapped`;
+                }
+            }
+        } catch (error) {
+            console.error("Failed to fetch semantic map for legend", error);
+        }
+    };
+
+    // Reset Robot & Map button click handler
+    const btnReset = document.getElementById('btn-reset');
+    if (btnReset) {
+        btnReset.addEventListener('click', async () => {
+            if (!confirm("Are you sure you want to reset the robot's pose, SLAM map database, and storefront classifications?")) {
+                return;
+            }
+            
+            btnReset.disabled = true;
+            logConsole("Triggering global simulation, pose, and SLAM map reset...");
+            
+            try {
+                const res = await fetch('/api/reset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const data = await res.json();
+                
+                logConsole("Reset successful: " + data.message);
+                
+                // Clear chatbot chat thread to initial greeting
+                if (chatMessages) {
+                    chatMessages.innerHTML = '<div class="msg bot">Hello! I am your AI delivery robot. Tell me what product or storefront you want me to find, and I will search the map or interpret signboards to bring it to you!</div>';
+                }
+                
+                // Force instant telemetry refresh
+                updateTelemetry();
+                updateLegend();
+            } catch (error) {
+                console.error("Failed to reset robot and map", error);
+                logConsole("Error: Reset command failed. Check server status.");
+            } finally {
+                btnReset.disabled = false;
+            }
+        });
+    }
+
+    // Trigger initial poll
+    updateTelemetry();
+    updateLegend();
+
+    // Poll status every 500ms
     setInterval(updateTelemetry, 500);
+    // Poll semantic map legend every 1000ms
+    setInterval(updateLegend, 1000);
 });

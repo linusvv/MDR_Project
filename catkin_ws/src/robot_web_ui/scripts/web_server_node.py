@@ -588,6 +588,54 @@ class RobotWebServer:
         self.navigating_to_pose_active = False
         self.stop_search(keep_delivery=True) # Clears path but keeps workflow target
 
+    def check_for_shop(self, target_category):
+        """Single-frame check for the target shop. Returns detections if found."""
+        with self.lock:
+            img = self.color_image.copy() if self.color_image is not None else None
+            depth_raw = getattr(self, 'depth_raw', None)
+            
+        if img is not None:
+            results = self.yolo_model.predict(img, conf=0.65, verbose=False)
+            for res in results:
+                for box in res.boxes:
+                    label = res.names[int(box.cls[0])].upper()
+                    clean_label = label.replace("STORE_", "").replace("_", " ")
+                    
+                    is_cafe = "CAF" in target_category.upper() and ("CAF" in label or "CAF" in clean_label)
+                    is_hamb = ("HAMB" in target_category.upper() or "BURG" in target_category.upper()) and ("HAMB" in label or "BURG" in label)
+                    is_pharm = "PHARM" in target_category.upper() and ("PHARM" in label or "PHARM" in clean_label)
+                    is_store = "STORE" in target_category.upper() and "STORE" in label and not ("CAF" in label or "PHARM" in label or "BURG" in label or "HAMB" in label)
+                    
+                    match = (target_category.upper() == label or target_category.upper() == clean_label) or \
+                            is_cafe or is_hamb or is_pharm or is_store
+
+                    if match:
+                        shop_img_x = (box.xyxy[0][0] + box.xyxy[0][2]) / 2.0
+                        y1, x1, y2, x2 = int(box.xyxy[0][1]), int(box.xyxy[0][0]), int(box.xyxy[0][3]), int(box.xyxy[0][2])
+                        
+                        depth_val = 0.0
+                        if depth_raw is not None:
+                            h, w = depth_raw.shape
+                            roi = depth_raw[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                            valid_depths = roi[roi > 0.1]
+                            if valid_depths.size > 0:
+                                # Use 15th percentile to ensure we are looking at the 'front-most' edge
+                                dist_to_shop = np.percentile(valid_depths, 15)
+                                if dist_to_shop > 50.0: dist_to_shop /= 1000.0
+                                depth_val = dist_to_shop
+                        
+                        if depth_val == 0.0: depth_val = 1.8 
+                        if depth_val > 6.0: continue
+
+                        return {
+                            'label': label,
+                            'depth': depth_val,
+                            'img_x': shop_img_x,
+                            'img_w': float(img.shape[1]),
+                            'pose': self.get_current_robot_pose()
+                        }
+        return None
+
     def approach_shop_via_waypoint(self, target_category, corridor_yaw=None):
         """Find shop via discrete steps -> Compute Waypoint -> Go there."""
         if not self.yolo_model:
@@ -605,11 +653,24 @@ class RobotWebServer:
         # Use the provided corridor_yaw if available, otherwise assume start_yaw was corridor-aligned
         ref_yaw = corridor_yaw if corridor_yaw is not None else start_yaw
         
-        # Step-wise targets from +80 down to -80 in 20 degree increments
-        step_targets_rel = [math.radians(a) for a in range(80, -100, -20)]
+        # PRE-SWEEP CHECK: See if we can already find it without rotating
+        rospy.loginfo(f"[Waypoint Appr] Pre-sweep check for {target_category}...")
+        detection = self.check_for_shop(target_category)
+        if detection:
+            rospy.loginfo(f"[Waypoint Appr] Found {detection['label']} in pre-sweep! Skipping sweep.")
+            shop_depth = detection['depth']
+            shop_label = detection['label']
+            shop_img_x = detection['img_x']
+            img_w_found = detection['img_w']
+            found_robot_pose = detection['pose']
+            found = True
+
+        # Step-wise targets from +60 down to -60 in 20 degree increments
+        step_targets_rel = [math.radians(a) for a in range(60, -80, -20)]
         
         # Attempt loop: Sweep -> Move 0.5m -> Sweep
         for attempt in range(3):
+            if found: break
             rospy.loginfo(f"[Waypoint Appr] Attempt {attempt+1}: Scanning for {target_category} (Step-wise 20 deg)...")
             target_idx = 0
             start_time = rospy.Time.now()
@@ -623,62 +684,34 @@ class RobotWebServer:
                 curr_target_rel = step_targets_rel[target_idx]
                 target_yaw = (start_yaw + curr_target_rel + math.pi) % (2*math.pi) - math.pi
                 
-                # Turn faster to the initial search angle (+80 deg), then slower for incremental steps
+                # Turn faster to the initial search angle (+60 deg), then slower for incremental steps
+                # use very tight threshold (0.02) to ensure it stops perfectly for analysis
                 if target_idx == 0:
-                    self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=1.5)
+                    self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=1.5, threshold=0.02)
                 else:
-                    self.rotate_to_yaw(target_yaw, p_gain=1.8, speed_limit=0.8)
+                    self.rotate_to_yaw(target_yaw, p_gain=1.8, speed_limit=0.8, threshold=0.02)
+                
+                # Double-check stop to ensure no "rolling out"
+                self.cmd_vel_pub.publish(Twist())
                 
                 # --- ACTION B: STOP AND ANALYZE ---
-                rospy.loginfo(f"[Waypoint Appr] Step {math.degrees(curr_target_rel):.0f} deg. Analyzing...")
-                rospy.sleep(0.8) # Wait for stabilization
+                rospy.loginfo(f"[Waypoint Appr] Step {math.degrees(curr_target_rel):.0f} deg. Perfectly still analysis...")
+                rospy.sleep(1.0) # Longer wait for complete stabilization
                 
-                with self.lock:
-                    img = self.color_image.copy() if self.color_image is not None else None
-                    depth_raw = getattr(self, 'depth_raw', None)
-                    
-                if img is not None:
-                    # Confidence increased to 0.65 as requested
-                    results = self.yolo_model.predict(img, conf=0.65, verbose=False)
-                    for res in results:
-                        for box in res.boxes:
-                            label = res.names[int(box.cls[0])].upper()
-                            clean_label = label.replace("STORE_", "").replace("_", " ")
-                            
-                            # Strict categorization
-                            is_cafe = "CAF" in target_category.upper() and ("CAF" in label or "CAF" in clean_label)
-                            is_hamb = ("HAMB" in target_category.upper() or "BURG" in target_category.upper()) and ("HAMB" in label or "BURG" in label)
-                            is_pharm = "PHARM" in target_category.upper() and ("PHARM" in label or "PHARM" in clean_label)
-                            is_store = "STORE" in target_category.upper() and "STORE" in label and not ("CAF" in label or "PHARM" in label or "BURG" in label or "HAMB" in label)
-                            
-                            match = (target_category.upper() == label or target_category.upper() == clean_label) or \
-                                    is_cafe or is_hamb or is_pharm or is_store
+                detection = self.check_for_shop(target_category)
+                if detection:
+                    rospy.loginfo(f"[Waypoint Appr] Found {detection['label']} at {detection['depth']:.2f}m. MATCHED.")
+                    shop_depth = detection['depth']
+                    shop_label = detection['label']
+                    shop_img_x = detection['img_x']
+                    img_w_found = detection['img_w']
+                    found_robot_pose = detection['pose']
+                    found = True
+                    break
 
-                            if match:
-                                shop_img_x = (box.xyxy[0][0] + box.xyxy[0][2]) / 2.0
-                                y1, x1, y2, x2 = int(box.xyxy[0][1]), int(box.xyxy[0][0]), int(box.xyxy[0][3]), int(box.xyxy[0][2])
-                                
-                                depth_val = 0.0
-                                if depth_raw is not None:
-                                    h, w = depth_raw.shape
-                                    roi = depth_raw[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                                    valids = roi[roi > 0.1]
-                                    if valids.size > 0:
-                                        depth_val = np.median(valids)
-                                
-                                # mm to meters scale check
-                                if depth_val > 50.0: depth_val /= 1000.0
-                                if depth_val == 0.0: depth_val = 1.8 
-                                if depth_val > 6.0: continue
-
-                                rospy.loginfo(f"[Waypoint Appr] Found {label} at {depth_val:.2f}m (conf:{float(box.conf[0]):.2f}). MATCHED.")
-                                shop_depth = depth_val
-                                shop_label = label
-                                img_w_found = float(img.shape[1])
-                                found_robot_pose = self.get_current_robot_pose()
-                                found = True
-                                break
-                    if found: break
+                target_idx += 1
+                if target_idx >= len(step_targets_rel):
+                    break
 
                 target_idx += 1
                 if target_idx >= len(step_targets_rel):
@@ -1042,13 +1075,13 @@ class RobotWebServer:
         self.cmd_vel_pub.publish(Twist()) # Final stop
         return arrived
 
-    def rotate_to_yaw(self, target_yaw, p_gain=1.5, speed_limit=0.8):
+    def rotate_to_yaw(self, target_yaw, p_gain=1.5, speed_limit=0.8, threshold=0.03):
         """Simple proportional controller for rotation in-place."""
         rate = rospy.Rate(10)
         while not rospy.is_shutdown() and self.active_delivery_task:
             _, _, ryaw = self.get_current_robot_pose()
             diff = (target_yaw - ryaw + math.pi) % (2 * math.pi) - math.pi
-            if abs(diff) < 0.05: break
+            if abs(diff) < threshold: break
             
             cmd = Twist()
             cmd.angular.z = p_gain * diff 

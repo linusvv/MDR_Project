@@ -200,6 +200,9 @@ class MotionPlanner:
             _, _, yaw = tf_trans.euler_from_quaternion(q)
             self.goal_yaw = yaw
             self.bGetGoal = True
+        else:
+            self.bGetGoal = False
+            self.global_path = []
 
     def global_to_local_node(self, globalNode):
         delX = globalNode.x - self.ego_x
@@ -413,6 +416,18 @@ class MotionPlanner:
         self.pubCommand.publish(cmd)
 
     def plan(self):
+        # Check if we should be active
+        is_paused = rospy.get_param("/exploration_paused", False)
+        explore_state = rospy.get_param("/exploration_state", "IDLE")
+        
+        if is_paused or explore_state == "IDLE":
+            # If we were moving, stop.
+            if self.prev_v != 0.0 or self.prev_w != 0.0:
+                self.pubCommand.publish(Twist())
+                self.prev_v = 0.0
+                self.prev_w = 0.0
+            return
+
         self.update_ego_pose()
         if not (self.bGetMap and self.bGetGoal and self.bGetEgoOdom):
             return

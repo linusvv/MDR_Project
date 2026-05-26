@@ -1,5 +1,29 @@
 document.addEventListener('DOMContentLoaded', () => {
-    // Console Logger Utility
+    const rosConsoleEl = document.getElementById('ros-console-output');
+    const logRosConsole = (msg) => {
+        if (rosConsoleEl) {
+            const newMsg = document.createElement('div');
+            newMsg.textContent = msg;
+            // Style based on severity level prefix in message
+            if (msg.includes('[WARN]')) {
+                newMsg.style.color = '#fbbf24';
+            } else if (msg.includes('[ERROR]') || msg.includes('[FATAL]')) {
+                newMsg.style.color = '#ef4444';
+            } else if (msg.includes('[DEBUG]')) {
+                newMsg.style.color = '#94a3b8';
+            } else {
+                newMsg.style.color = '#38bdf8';
+            }
+            rosConsoleEl.appendChild(newMsg);
+            
+            // Limit lines to prevent DOM bloat
+            while (rosConsoleEl.childNodes.length > 200) {
+                rosConsoleEl.removeChild(rosConsoleEl.firstChild);
+            }
+            
+            rosConsoleEl.scrollTop = rosConsoleEl.scrollHeight;
+        }
+    };
     const consoleEl = document.getElementById('console-output');
     const logConsole = (msg) => {
         if (consoleEl) {
@@ -128,9 +152,13 @@ document.addEventListener('DOMContentLoaded', () => {
             if (mode === 'remote') {
                 labelRemote.classList.add('active');
                 labelLocal.classList.remove('active');
+                const apiKeySection = document.getElementById('api-key-section');
+                if (apiKeySection) apiKeySection.style.display = 'block';
             } else {
                 labelLocal.classList.add('active');
                 labelRemote.classList.remove('active');
+                const apiKeySection = document.getElementById('api-key-section');
+                if (apiKeySection) apiKeySection.style.display = 'none';
             }
             
             try {
@@ -250,6 +278,77 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // Go to mapped shop handler
+    const selectMappedShop = document.getElementById('select-mapped-shop');
+    const btnGoToShop = document.getElementById('btn-go-to-shop');
+    if (btnGoToShop && selectMappedShop) {
+        btnGoToShop.addEventListener('click', async () => {
+            const shopName = selectMappedShop.value;
+            if (!shopName) {
+                alert("Please select a mapped shop first!");
+                return;
+            }
+            
+            const overshootVal = document.getElementById('overshoot-val');
+            const overshoot_cm = overshootVal ? parseFloat(overshootVal.value) || 0 : 0;
+
+            logConsole(`Commanding robot to navigate to mapped shop: ${shopName} (Overshoot: ${overshoot_cm}cm)...`);
+            btnGoToShop.disabled = true;
+            
+            try {
+                const res = await fetch('/api/goto_shop', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: shopName, overshoot_cm })
+                });
+                const data = await res.json();
+                if (res.ok && data.status === 'success') {
+                    logConsole(`System: Navigation to ${shopName} started.`);
+                } else {
+                    logConsole(`Error: ${data.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to navigate to shop", error);
+                logConsole("Error: Failed to connect to navigation backend.");
+            } finally {
+                btnGoToShop.disabled = false;
+            }
+        });
+    }
+
+    const btnDeleteShop = document.getElementById('btn-delete-shop');
+    if (btnDeleteShop && selectMappedShop) {
+        btnDeleteShop.addEventListener('click', async () => {
+            const shopName = selectMappedShop.value;
+            if (!shopName) {
+                alert("Please select a mapped shop to delete!");
+                return;
+            }
+            
+            logConsole(`Deleting mapped shop: ${shopName}...`);
+            btnDeleteShop.disabled = true;
+            
+            try {
+                const res = await fetch('/api/delete_shop', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ name: shopName })
+                });
+                const data = await res.json();
+                if (res.ok) {
+                    logConsole(`System: Deleted ${shopName}`);
+                } else {
+                    logConsole(`Error: ${data.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to delete shop", error);
+                logConsole("Error: Failed to connect to backend.");
+            } finally {
+                btnDeleteShop.disabled = false;
+            }
+        });
+    }
+
     // OpenAI API Key Submission Form Logic
     const apiKeyInput = document.getElementById('openai-api-key');
     const apiKeySubmit = document.getElementById('btn-submit-api-key');
@@ -297,6 +396,34 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // Overshoot Value Apply Handler
+    const overshootVal = document.getElementById('overshoot-val');
+    const btnApplyOvershoot = document.getElementById('btn-apply-overshoot');
+    if (btnApplyOvershoot && overshootVal) {
+        btnApplyOvershoot.addEventListener('click', async () => {
+            const overshootValNum = parseFloat(overshootVal.value) || 0;
+            try {
+                btnApplyOvershoot.disabled = true;
+                const response = await fetch('/api/set_overshoot', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ overshoot_cm: overshootValNum })
+                });
+                const resData = await response.json();
+                if (response.ok) {
+                    logConsole(`System: Approach overshoot set to ${overshootValNum} cm.`);
+                } else {
+                    logConsole(`Error: ${resData.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to apply overshoot", error);
+                logConsole("Error: Failed to connect to server.");
+            } finally {
+                btnApplyOvershoot.disabled = false;
+            }
+        });
+    }
+
     // Delivery Agent Chatbot Logic
     const chatInput = document.getElementById('chat-input');
     const chatSend = document.getElementById('btn-send-chat');
@@ -320,11 +447,14 @@ document.addEventListener('DOMContentLoaded', () => {
         addChatMessage(text, 'user');
         logConsole(`User prompt: "${text}"`);
         
+        const overshootVal = document.getElementById('overshoot-val');
+        const overshoot_cm = overshootVal ? parseFloat(overshootVal.value) || 0 : 0;
+        
         try {
             const res = await fetch('/api/delivery/send', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ message: text })
+                body: JSON.stringify({ message: text, overshoot_cm })
             });
             const data = await res.json();
             addChatMessage(data.reply, 'bot');
@@ -498,7 +628,7 @@ document.addEventListener('DOMContentLoaded', () => {
     const robotPoseEl = document.getElementById('robot-pose');
     const shopsCountEl = document.getElementById('shops-count');
     const mapCoverageEl = document.getElementById('map-coverage');
-    const tagsCountEl = document.getElementById('tags-count');
+    const tasksCountEl = document.getElementById('tasks-fulfilled');
     const legendGrid = document.getElementById('legend-grid');
 
     const updateTelemetry = async () => {
@@ -510,13 +640,13 @@ document.addEventListener('DOMContentLoaded', () => {
                 robotPoseEl.textContent = `[X: ${data.x}, Y: ${data.y}, θ: ${data.yaw}]`;
             }
             if (shopsCountEl) {
-                shopsCountEl.textContent = `${data.shops_detected} / 8`;
+                shopsCountEl.textContent = `${data.shops_detected}`;
             }
             if (mapCoverageEl) {
                 mapCoverageEl.textContent = `${data.explored_area} m²`;
             }
-            if (tagsCountEl) {
-                tagsCountEl.textContent = `${data.tags_detected} tags`;
+            if (tasksCountEl) {
+                tasksCountEl.textContent = `${data.tasks_fulfilled} tasks`;
             }
             
             // Dynamic Find Tag Button UI updates
@@ -564,10 +694,48 @@ document.addEventListener('DOMContentLoaded', () => {
                 }
             }
 
+            // Chat interface visibility logic
+            const chatInterface = document.getElementById('chat-interface-section');
+            const aiToggleBtn = document.getElementById('ai-toggle');
+            if (chatInterface && aiToggleBtn) {
+                if (aiToggleBtn.checked) { // Remote AI
+                    if (data.has_api_key) {
+                        chatInterface.style.display = 'flex';
+                    } else {
+                        chatInterface.style.display = 'none';
+                    }
+                } else { // Local AI
+                    chatInterface.style.display = 'flex';
+                }
+            }
+
+            // Update select-mapped-shop
+            const selectMappedShop = document.getElementById('select-mapped-shop');
+            if (selectMappedShop && data.mapped_shops) {
+                // only update if currently not focused
+                if (document.activeElement !== selectMappedShop) {
+                    const currentVal = selectMappedShop.value;
+                    let optionsHtml = '<option value="" disabled selected>Select a Mapped Shop...</option>';
+                    data.mapped_shops.forEach(s => {
+                        optionsHtml += `<option value="${s.name}">${s.name} (${s.type})</option>`;
+                    });
+                    selectMappedShop.innerHTML = optionsHtml;
+                    if (currentVal && data.mapped_shops.find(s => s.name === currentVal)) {
+                        selectMappedShop.value = currentVal;
+                    }
+                }
+            }
+
             // Dynamic Planner Select UI updates
             const plannerSelect = document.getElementById('planner-select');
             if (plannerSelect && data.local_planner && document.activeElement !== plannerSelect) {
                 plannerSelect.value = data.local_planner;
+            }
+
+            // Dynamic Overshoot UI updates
+            const overshootValEl = document.getElementById('overshoot-val');
+            if (overshootValEl && data.overshoot_cm !== undefined && document.activeElement !== overshootValEl) {
+                overshootValEl.value = data.overshoot_cm;
             }
         } catch (error) {
             console.error("Failed to fetch telemetry status", error);
@@ -580,7 +748,7 @@ document.addEventListener('DOMContentLoaded', () => {
             const data = await response.json();
             if (data.logs && data.logs.length > 0) {
                 data.logs.forEach(log => {
-                    logConsole(log);
+                    logRosConsole(log);
                 });
             }
         } catch (error) {

@@ -729,7 +729,9 @@ class RobotWebServer:
         return False
 
     def approach_shop_via_waypoint(self, target_category, corridor_yaw=None):
-        """RADICALLY NEW STRATEGY: Discover -> Visual Center -> Raycast -> TEB -> Align"""
+        """RADICALLY NEW STRATEGY: Discover -> Visual Center -> Raycast -> TEB -> Align.
+        Supports retry with forward nudge on focus failure (centering timeout) or local costmap blockage.
+        """
         if not self.yolo_model:
             return False
 
@@ -737,174 +739,176 @@ class RobotWebServer:
         _, _, start_yaw = self.get_current_robot_pose()
         ref_yaw = corridor_yaw if corridor_yaw is not None else start_yaw
         
-        # PHASE 1: DISCOVER THE STORE
-        found = False
-        det = self.check_for_shop(target_category)
-        if det:
-            rospy.loginfo("[Radical Overhaul] Found shop in pre-sweep!")
-            found = True
-        else:
-            for attempt in range(2):
-                if found: break
+        max_attempts = 4
+        for attempt in range(max_attempts):
+            if not self.active_delivery_task:
+                break
                 
-                rospy.loginfo("[Radical Overhaul] Snapping to left boundary to begin continuous sweep...")
-                left_yaw = (start_yaw + math.radians(60) + math.pi) % (2*math.pi) - math.pi
+            rospy.loginfo(f"[Approach Workflow] Sweep-and-Nudge Attempt {attempt + 1}/{max_attempts}")
+            
+            # PHASE 1: DISCOVER THE STORE
+            found = False
+            # Check pre-sweep
+            det = self.check_for_shop(target_category)
+            if det:
+                rospy.loginfo("[Approach Workflow] Found shop in pre-sweep!")
+                found = True
+            else:
+                # Do continuous sweep left-to-right
+                rospy.loginfo("[Approach Workflow] Snapping to left boundary to begin continuous sweep...")
+                left_yaw = (ref_yaw + math.radians(60) + math.pi) % (2*math.pi) - math.pi
                 self.rotate_to_yaw(left_yaw, p_gain=2.5, speed_limit=1.5, threshold=0.03)
                 self.cmd_vel_pub.publish(Twist())
                 rospy.sleep(0.2)
                 
                 if self.check_for_shop(target_category):
-                    rospy.loginfo("[Radical Overhaul] Discovered shop at left boundary.")
+                    rospy.loginfo("[Approach Workflow] Discovered shop at left boundary.")
                     found = True
-                    break
+                else:
+                    rospy.loginfo("[Approach Workflow] Commencing smooth continuous visual sweep...")
+                    rate = rospy.Rate(15)
+                    cmd = Twist()
+                    cmd.angular.z = -0.5 # Smooth rotation rightwards
                     
-                rospy.loginfo("[Radical Overhaul] Commencing smooth continuous visual sweep...")
-                rate = rospy.Rate(15) # ~15 detections per second for instant reaction
-                cmd = Twist()
-                cmd.angular.z = -0.5 # Smooth rotation rightwards
+                    sweep_start = rospy.Time.now()
+                    while not rospy.is_shutdown() and self.active_delivery_task:
+                        self.cmd_vel_pub.publish(cmd)
+                        if self.check_for_shop(target_category):
+                            rospy.loginfo("[Approach Workflow] Discovered shop dynamically on-the-fly!")
+                            self.cmd_vel_pub.publish(Twist()) # Halt instantly
+                            found = True
+                            break
+                        if (rospy.Time.now() - sweep_start).to_sec() > 4.5:
+                            break
+                        rate.sleep()
+                    self.cmd_vel_pub.publish(Twist())
+            
+            # If we didn't find the shop during the sweep at all
+            if not found:
+                rospy.logwarn("[Approach Workflow] No shop found in sweep. Resetting and translating forward...")
+                self.nudge_forward_and_recover(ref_yaw)
+                continue
                 
-                start_time = rospy.Time.now()
-                while not rospy.is_shutdown():
-                    self.cmd_vel_pub.publish(cmd)
-                    
-                    if self.check_for_shop(target_category):
-                        rospy.loginfo("[Radical Overhaul] Discovered shop dynamically on-the-fly!")
-                        self.cmd_vel_pub.publish(Twist()) # Halt instantly
-                        found = True
-                        break
-                        
-                    # Stop if we rotated roughly 130 degrees (-0.5 rad/s * 4.5s = ~128 degrees)
-                    if (rospy.Time.now() - start_time).to_sec() > 4.5:
-                        break
-                        
-                    rate.sleep()
+            # PHASE 2: VISUAL CENTERING (Face the store strictly based on bounding box)
+            rospy.loginfo("[Approach Workflow] Attempting to center on shop...")
+            centered = self.center_on_shop(target_category, timeout=8.0)
+            if not centered:
+                rospy.logwarn("[Approach Workflow] Centering failed (lost focus). Assuming not detected, nudging forward to retry sweep...")
+                self.nudge_forward_and_recover(ref_yaw)
+                continue
                 
-                self.cmd_vel_pub.publish(Twist())
-                    
-                if not found:
-                    rospy.logwarn("[Radical Overhaul] No shop found. Resetting and translating forward...")
-                    self.rotate_to_yaw(start_yaw)
-                    rx, ry, _ = self.get_current_robot_pose()
-                    fwd_x, fwd_y = rx + 0.5 * math.cos(start_yaw), ry + 0.5 * math.sin(start_yaw)
-                    if self.is_pose_reachable(fwd_x, fwd_y):
-                        self.navigate_to_pose(fwd_x, fwd_y, start_yaw)
-                    else:
-                        break # Blocked
-
-        if not found:
-            rospy.logerr("[Radical Overhaul] Failed to discover shop.")
-            return False
-
-        # PHASE 2: VISUAL CENTERING (Face the store strictly based on bounding box)
-        if not self.center_on_shop(target_category):
-            rospy.logwarn("[Radical Overhaul] Centering failed or timed out. Using current heading.")
-
-        # PHASE 3: CALCULATE EXACT STORE LOCATION
-        rx, ry, ryaw = self.get_current_robot_pose()
-        wall_dist = self.get_distance_to_wall_ahead(max_dist=6.0)
-        
-        if wall_dist is not None:
-            rospy.loginfo(f"[Radical Overhaul] LiDAR/Costmap hit physical wall at {wall_dist:.2f}m straight ahead.")
-        else:
-            # Fallback to YOLO depth percentile if we are somehow in an empty void
-            det = self.check_for_shop(target_category)
-            wall_dist = det['depth'] + 0.15 if det else 2.0 # Add camera offset if relying on raw sensor
-            rospy.logwarn(f"[Radical Overhaul] Raycast missed. Using Camera Depth: {wall_dist:.2f}m")
-
-        # The actual physical center of the storefront on the map
-        shop_x = rx + wall_dist * math.cos(ryaw)
-        shop_y = ry + wall_dist * math.sin(ryaw)
-
-        # PHASE 4: CALCULATE 90-DEGREE WAYPOINT FROM CORRIDOR
-        # The wall is parallel to the corridor (ref_yaw).
-        n1 = (ref_yaw + math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
-        n2 = (ref_yaw - math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
-        
-        # We need the normal that points OUTWARD from the shop into the corridor.
-        # Compare with the vector from the shop to the robot.
-        vec_to_robot = np.array([rx - shop_x, ry - shop_y])
-        vec_n1 = np.array([math.cos(n1), math.sin(n1)])
-        vec_n2 = np.array([math.cos(n2), math.sin(n2)])
-        
-        outward_normal = n1 if np.dot(vec_to_robot, vec_n1) > np.dot(vec_to_robot, vec_n2) else n2
-        
-        # We want to be exactly 60cm away from the shop center along this outward perpendicular line.
-        target_dist = 0.60
-        target_x = shop_x + target_dist * math.cos(outward_normal)
-        target_y = shop_y + target_dist * math.sin(outward_normal)
-        
-        # Apply overshoot along the corridor direction (ref_yaw)
-        # This determines how far we go along the corridor before rotating to face the wall
-        overshoot_m = getattr(self, 'overshoot_m', 0.0)
-        target_x += overshoot_m * math.cos(ref_yaw)
-        target_y += overshoot_m * math.sin(ref_yaw)
-
-        # The robot should ultimately face the shop (exactly opposite the outward normal)
-        target_yaw = (outward_normal + math.pi)
-        target_yaw = (target_yaw + math.pi) % (2*math.pi) - math.pi
-        
-        rospy.loginfo(f"[Radical Overhaul] Shop Center Map Pos: ({shop_x:.2f}, {shop_y:.2f})")
-        rospy.loginfo(f"[Radical Overhaul] Outward Normal: {math.degrees(outward_normal):.1f} deg")
-        rospy.loginfo(f"[Radical Overhaul] Corridor Waypoint Target (overshoot: {overshoot_m:.2f}m): ({target_x:.2f}, {target_y:.2f}) facing {math.degrees(target_yaw):.1f} deg")
-
-        # PHASE 5: SAFETY PUSH (GUARANTEE NO CRASH)
-        for push in range(10):
-            # Check a 20cm physical radius around the goal point to ensure robot fits (using relaxed threshold 98)
-            if self.is_pose_reachable(target_x, target_y, radius=0.20, threshold=98):
-                break
-            rospy.logwarn(f"[Radical Overhaul] Perpendicular goal blocked. Pushing outward by 10cm...")
-            target_dist += 0.10
+            # PHASE 3: CALCULATE EXACT STORE LOCATION
+            rx, ry, ryaw = self.get_current_robot_pose()
+            wall_dist = self.get_distance_to_wall_ahead(max_dist=6.0)
+            
+            if wall_dist is not None:
+                rospy.loginfo(f"[Approach Workflow] LiDAR/Costmap hit physical wall at {wall_dist:.2f}m straight ahead.")
+            else:
+                det = self.check_for_shop(target_category)
+                wall_dist = det['depth'] + 0.15 if det else 2.0
+                rospy.logwarn(f"[Approach Workflow] Raycast missed. Using Camera Depth: {wall_dist:.2f}m")
+                
+            # The physical center of the storefront on the map
+            shop_x = rx + wall_dist * math.cos(ryaw)
+            shop_y = ry + wall_dist * math.sin(ryaw)
+            
+            # PHASE 4: CALCULATE 90-DEGREE WAYPOINT
+            n1 = (ref_yaw + math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
+            n2 = (ref_yaw - math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
+            
+            vec_to_robot = np.array([rx - shop_x, ry - shop_y])
+            vec_n1 = np.array([math.cos(n1), math.sin(n1)])
+            vec_n2 = np.array([math.cos(n2), math.sin(n2)])
+            
+            outward_normal = n1 if np.dot(vec_to_robot, vec_n1) > np.dot(vec_to_robot, vec_n2) else n2
+            
+            target_dist = 0.60
             target_x = shop_x + target_dist * math.cos(outward_normal)
             target_y = shop_y + target_dist * math.sin(outward_normal)
+            
+            # Apply overshoot along the corridor direction
+            overshoot_m = getattr(self, 'overshoot_m', 0.0)
+            target_x += overshoot_m * math.cos(ref_yaw)
+            target_y += overshoot_m * math.sin(ref_yaw)
+            
+            target_yaw = (outward_normal + math.pi)
+            target_yaw = (target_yaw + math.pi) % (2*math.pi) - math.pi
+            
+            rospy.loginfo(f"[Approach Workflow] Target Pose: ({target_x:.2f}, {target_y:.2f}) facing {math.degrees(target_yaw):.1f} deg")
+            
+            # PHASE 5: SAFETY PUSH (GUARANTEE NO CRASH)
+            for push in range(10):
+                if self.is_pose_reachable(target_x, target_y, radius=0.20, threshold=98):
+                    break
+                rospy.logwarn(f"[Approach Workflow] Perpendicular goal blocked. Pushing outward by 10cm...")
+                target_dist += 0.10
+                target_x = shop_x + target_dist * math.cos(outward_normal)
+                target_y = shop_y + target_dist * math.sin(outward_normal)
+            else:
+                rospy.logerr("[Approach Workflow] Completely blocked up to 1.5m. Cannot find safe position. Nudging forward to retry sweep...")
+                self.nudge_forward_and_recover(ref_yaw)
+                continue
+                
+            # PHASE 6: EXECUTE (Slow TEB)
+            v_max = rospy.get_param("/navigation/max_vel_x", 0.3)
+            rospy.set_param("/navigation/max_vel_x", 0.08)
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x", 0.08)
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", 0.08)
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.3)
+            
+            rospy.loginfo("[Approach Workflow] Engaging TEB planner to exact spatial dot...")
+            nav_success = self.navigate_to_pose(target_x, target_y, target_yaw, ignore_yaw=True, dist_tol=0.10, cost_thresh=98)
+            
+            # Restore speeds
+            rospy.set_param("/navigation/max_vel_x", v_max)
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x", v_max)
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", 0.15)
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.8)
+            
+            if not nav_success:
+                rospy.logerr("[Approach Workflow] Navigation to shopfront failed or was blocked. Nudging forward to retry sweep...")
+                self.nudge_forward_and_recover(ref_yaw)
+                continue
+                
+            # FINAL SQUARING UP
+            rospy.loginfo("[Approach Workflow] Executing final exact rotation snap to 90 degrees...")
+            self.rotate_to_yaw(target_yaw, threshold=0.015)
+            return True
+            
+        rospy.logerr(f"[Approach Workflow] Failed to approach shop {target_category} after {max_attempts} attempts.")
+        return False
+
+    def nudge_forward_and_recover(self, corridor_yaw):
+        """Helper to recover from lost/failed sweep: rotates back to corridor, rotates to clear costmap, then translates forward."""
+        rospy.loginfo("[Nudge Recovery] Rotating back to corridor direction...")
+        self.rotate_to_yaw(corridor_yaw, threshold=0.05)
+        self.stop_search(keep_delivery=True)
+        
+        # In-place rotation recovery to clear costmaps
+        self.recover_robot()
+        
+        # Nudge forward
+        rx, ry, ryaw = self.get_current_robot_pose()
+        # Try a 0.5m nudge first, check reachability
+        nudge_dist = 0.50
+        
+        # Try steps: 0.5m, 0.35m, 0.20m
+        for step in [0.50, 0.35, 0.20]:
+            fx = rx + step * math.cos(corridor_yaw)
+            fy = ry + step * math.sin(corridor_yaw)
+            if self.is_pose_reachable(fx, fy, threshold=98):
+                rospy.loginfo(f"[Nudge Recovery] Nudging forward by {step:.2f}m...")
+                self.navigate_to_pose(fx, fy, corridor_yaw, cost_thresh=98)
+                break
         else:
-            rospy.logerr("[Radical Overhaul] Completely blocked up to 1.5m. Cannot find safe position. Aborting.")
-            return False
+            # If all are blocked in costmap pre-check, execute a small blind nudge to clear the costmap inflation
+            rospy.logwarn("[Nudge Recovery] Nudge path blocked in costmap. Executing safe blind nudge...")
+            cmd = Twist()
+            cmd.linear.x = 0.1
+            self.cmd_vel_pub.publish(cmd)
+            rospy.sleep(2.0)
+            self.cmd_vel_pub.publish(Twist())
 
-        # PHASE 6: EXECUTE (Slow TEB)
-        v_max = rospy.get_param("/navigation/max_vel_x", 0.3)
-        rospy.set_param("/navigation/max_vel_x", 0.08)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x", 0.08)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", 0.08)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.3)
-        
-        rospy.loginfo("[Radical Overhaul] Engaging TEB planner to exact spatial dot...")
-        self.navigate_to_pose(target_x, target_y, target_yaw, ignore_yaw=True, dist_tol=0.10, cost_thresh=98)
-        
-        # Restore speeds
-        rospy.set_param("/navigation/max_vel_x", v_max)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x", v_max)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", 0.15)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.8)
-
-        # FINAL SQUARING UP
-        rospy.loginfo("[Radical Overhaul] Executing final exact rotation snap to 90 degrees...")
-        self.rotate_to_yaw(target_yaw, threshold=0.015)
-        
-        return True
-        # PHASE 3: NAVIGATE TO PERPENDICULAR WAYPOINT
-        # Set TEB and default navigation to a crawl for maximum precision and no overshoot
-        current_max_v = rospy.get_param("/navigation/max_vel_x", 0.3)
-        slow_speed = 0.08
-        
-        # Set multiple parameters to ensure TEB and other planners respect the limit
-        rospy.set_param("/navigation/max_vel_x", slow_speed)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x", slow_speed)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", slow_speed / 2.0)
-        # Reduce angular speed too for smoother final alignment
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.4) 
-        
-        self.navigate_to_pose(target_x, target_y, target_yaw)
-        
-        # Reset to previous default
-        rospy.set_param("/navigation/max_vel_x", current_max_v)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x", current_max_v)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", 0.15)
-        rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.8)
-        
-        # PHASE 4: FINAL ROTATION REFINEMENT
-        # Use a very tight threshold for the final alignment to the wall
-        self.rotate_to_yaw(target_yaw, threshold=0.015)
-        return True
 
 
     def start_delivery_search(self, category):
@@ -2519,6 +2523,12 @@ def api_navigate_to_tag():
         return jsonify({"status": "ok", "message": f"Navigating to landmark {tag_name}..."})
     else:
         return jsonify({"status": "error", "message": "Failed to start navigation."}), 500
+
+@app.route('/api/delivery/clear', methods=['POST'])
+def delivery_clear():
+    server.active_todo_list = None
+    server.stop_robot()
+    return jsonify({"status": "success", "message": "Delivery plan cleared."})
 
 @app.route('/api/delivery/send', methods=['POST'])
 def delivery_send():

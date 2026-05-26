@@ -424,6 +424,31 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // Clear Active Todo List Handler
+    const btnClearTodo = document.getElementById('btn-clear-todo');
+    if (btnClearTodo) {
+        btnClearTodo.addEventListener('click', async () => {
+            try {
+                btnClearTodo.disabled = true;
+                const response = await fetch('/api/delivery/clear', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                if (response.ok) {
+                    logConsole("System: Active delivery plan cleared.");
+                    const todoSection = document.getElementById('todo-section');
+                    if (todoSection) {
+                        todoSection.style.display = 'none';
+                    }
+                }
+            } catch (error) {
+                console.error("Failed to clear delivery plan", error);
+            } finally {
+                btnClearTodo.disabled = false;
+            }
+        });
+    }
+
     // Delivery Agent Chatbot Logic
     const chatInput = document.getElementById('chat-input');
     const chatSend = document.getElementById('btn-send-chat');

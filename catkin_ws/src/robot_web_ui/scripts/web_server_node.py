@@ -124,18 +124,6 @@ class RobotWebServer:
             "stores": []
         }
         
-    def append_bot_chat_message(self, text):
-        with self.lock:
-            self.delivery_chat_history.append({"sender": "bot", "text": text})
-            if len(self.delivery_chat_history) > 100:
-                self.delivery_chat_history.pop(0)
-
-    def append_user_chat_message(self, text):
-        with self.lock:
-            self.delivery_chat_history.append({"sender": "user", "text": text})
-            if len(self.delivery_chat_history) > 100:
-                self.delivery_chat_history.pop(0)
-        
         # Visualization Toggles
         self.viz_apriltag = True
         self.viz_yolo = True
@@ -161,6 +149,18 @@ class RobotWebServer:
             rospy.Subscriber('/tag_detections', AprilTagDetectionArray, self.tags_cb)
 
         rospy.loginfo("Web Server Node initialized.")
+
+    def append_bot_chat_message(self, text):
+        with self.lock:
+            self.delivery_chat_history.append({"sender": "bot", "text": text})
+            if len(self.delivery_chat_history) > 100:
+                self.delivery_chat_history.pop(0)
+
+    def append_user_chat_message(self, text):
+        with self.lock:
+            self.delivery_chat_history.append({"sender": "user", "text": text})
+            if len(self.delivery_chat_history) > 100:
+                self.delivery_chat_history.pop(0)
 
     def stop_robot(self):
         """Immediately stops all autonomous navigation and the robot movement."""

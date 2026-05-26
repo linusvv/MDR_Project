@@ -272,6 +272,17 @@
                             <div class="api-key-status" id="api-key-status">Checking key status...</div>
                         </div>
                     </div>
+                    
+                    <!-- Delivery ToDo List Section (Hidden when no active task) -->
+                    <div class="todo-section" id="todo-section" style="display: none; margin-bottom: 1rem; background: rgba(255, 255, 255, 0.03); padding: 0.8rem; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.05);">
+                        <h3 style="font-size: 0.9rem; margin-bottom: 0.6rem; color: #38bdf8; display: flex; align-items: center; justify-content: space-between; font-weight: 600;">
+                            <span>Active Delivery Plan</span>
+                            <span id="todo-task-status" style="font-size: 0.75rem; padding: 0.1rem 0.4rem; border-radius: 4px; background: rgba(56, 189, 248, 0.2); color: #38bdf8;">In Progress</span>
+                        </h3>
+                        <div id="todo-list-container" style="display: flex; flex-direction: column; gap: 0.6rem; font-size: 0.85rem;">
+                            <!-- Dynamically populated ToDo items -->
+                        </div>
+                    </div>
 
                     <div class="chat-container" id="chat-interface-section" style="display: none;">
                         <div class="chat-messages" id="chat-messages">

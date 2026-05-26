@@ -113,6 +113,29 @@ class RobotWebServer:
         self.task_thread = None
         self.navigating_to_pose_active = False
         
+        self.delivery_chat_history = [
+            {
+                "sender": "bot",
+                "text": "Hello! I am your AI delivery robot. Tell me what product or storefront you want me to find, and I will search the map or interpret signboards to bring it to you!"
+            }
+        ]
+        self.active_todo_list = {
+            "status": "idle",
+            "stores": []
+        }
+        
+    def append_bot_chat_message(self, text):
+        with self.lock:
+            self.delivery_chat_history.append({"sender": "bot", "text": text})
+            if len(self.delivery_chat_history) > 100:
+                self.delivery_chat_history.pop(0)
+
+    def append_user_chat_message(self, text):
+        with self.lock:
+            self.delivery_chat_history.append({"sender": "user", "text": text})
+            if len(self.delivery_chat_history) > 100:
+                self.delivery_chat_history.pop(0)
+        
         # Visualization Toggles
         self.viz_apriltag = True
         self.viz_yolo = True
@@ -1000,6 +1023,8 @@ class RobotWebServer:
 
     def shopping_list_worker(self, tasks):
         rospy.loginfo(f"[Shopping List] Commencing execution of {len(tasks)} tasks sequentially.")
+        overshoot_m = getattr(self, 'overshoot_m', 0.0)
+        
         for task in tasks:
             if not self.active_delivery_task:
                 rospy.logwarn("[Shopping List] Task execution halted (cancelled).")
@@ -1008,84 +1033,220 @@ class RobotWebServer:
             target = task.get("target", "")
             items = task.get("items", [])
             target_upper = target.upper().strip()
-            
-            rospy.loginfo(f"[Shopping List] Moving to next target: {target_upper} to pick up: {items}")
-            
             target_norm = self.normalize_category(target)
             
-            # 1. Check if store is already dynamically mapped
-            resolved_shop = None
-            if hasattr(self, 'mapped_shops'):
-                for s in self.mapped_shops:
-                    s_norm = self.normalize_category(s['type'])
-                    if s_norm == target_norm:
-                        resolved_shop = s
-                        break
-                        
+            rospy.loginfo(f"[Shopping List] Moving to next target: {target_upper} to pick up: {items}")
+            self.append_bot_chat_message(f"Headed to the {target}...")
+            
+            # Update store status in active_todo_list to "navigating"
+            with self.lock:
+                if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                    for s in self.active_todo_list["stores"]:
+                        if self.normalize_category(s["category"]) == target_norm:
+                            s["status"] = "navigating"
+            
+            max_attempts = 3
             success = False
-            if resolved_shop:
-                # Direct navigation to the mapped storefront
-                rospy.loginfo(f"[Shopping List] Target {target_norm} is already mapped. Navigating directly.")
-                # Calculate corridor axis perpendicular to resolved_shop['yaw']
-                syaw = resolved_shop['yaw']
-                axis_x = -math.sin(syaw)
-                axis_y = math.cos(syaw)
-                
-                # Project robot's current position to determine approach direction
-                rx, ry, _ = self.get_current_robot_pose()
-                dx = resolved_shop['x'] - rx
-                dy = resolved_shop['y'] - ry
-                projection = dx * axis_x + dy * axis_y
-                sign = 1.0 if projection >= 0 else -1.0
-                
-                tx = resolved_shop['x'] + overshoot_m * sign * axis_x
-                ty = resolved_shop['y'] + overshoot_m * sign * axis_y
-                
-                success = self.navigate_to_pose(tx, ty, resolved_shop['yaw'], cost_thresh=98)
-            else:
-                # 2. Check if we should do the complex sign-to-store workflow
-                if any(target_norm == self.normalize_category(entry['category']) for entry in self.sign_database):
-                    rospy.loginfo(f"[Shopping List] Target {target_norm} is in sign database. Starting search.")
-                    success = self.delivery_search_workflow(target_norm, is_part_of_task=True)
-                else:
-                    # 3. Fallback to direct navigation to landmark tag
-                    resolved_tag = None
-                    target_key = target_norm.replace(" ", "_")
-                    if target_key in self.tag_true_poses:
-                        resolved_tag = target_key
-                    else:
-                        for k in self.tag_true_poses.keys():
-                            if k in target_key or target_key in k:
-                                resolved_tag = k
-                                break
-                                
-                    if resolved_tag:
-                        rospy.loginfo(f"[Shopping List] Navigating directly to tag/landmark: {resolved_tag}")
-                        self.navigating_to_tag = True
-                        self.nav_to_tag_thread(resolved_tag)
-                        
-                        # Wait for arrival
-                        pose_info = self.tag_true_poses[resolved_tag]
-                        if "STORE_" in resolved_tag:
-                            gx, gy = pose_info[0], pose_info[1]
-                        else:
-                            with self.lock:
-                                R = self.R.copy()
-                                T = self.T.copy()
-                            tag_map = np.dot(R, np.array([pose_info[0], pose_info[1]])) + T
-                            gx, gy = tag_map[0], tag_map[1]
+            for attempt in range(max_attempts):
+                if not self.active_delivery_task:
+                    break
+                if attempt > 0:
+                    rospy.logwarn(f"[Shopping List] Navigation to {target_upper} failed or timed out. Retrying (Attempt {attempt+1}/{max_attempts})...")
+                    self.append_bot_chat_message(f"Goal blocked or navigation timed out. Recovering and retrying ({attempt+1}/{max_attempts})...")
+                    self.stop_search(keep_delivery=True)
+                    self.recover_robot()
+                    
+                # 1. Check if store is already dynamically mapped
+                resolved_shop = None
+                if hasattr(self, 'mapped_shops'):
+                    for s in self.mapped_shops:
+                        s_norm = self.normalize_category(s['type'])
+                        if s_norm == target_norm:
+                            resolved_shop = s
+                            break
                             
-                        rx, ry, _ = self.get_current_robot_pose()
-                        success = (math.hypot(rx - gx, ry - gy) < 0.35) and (self.active_delivery_task is not None)
+                if resolved_shop:
+                    # Direct navigation to the mapped storefront
+                    rospy.loginfo(f"[Shopping List] Target {target_norm} is already mapped. Navigating directly.")
+                    # Calculate corridor axis perpendicular to resolved_shop['yaw']
+                    syaw = resolved_shop['yaw']
+                    axis_x = -math.sin(syaw)
+                    axis_y = math.cos(syaw)
+                    
+                    # Project robot's current position to determine approach direction
+                    rx, ry, _ = self.get_current_robot_pose()
+                    dx = resolved_shop['x'] - rx
+                    dy = resolved_shop['y'] - ry
+                    projection = dx * axis_x + dy * axis_y
+                    sign = 1.0 if projection >= 0 else -1.0
+                    
+                    tx = resolved_shop['x'] + overshoot_m * sign * axis_x
+                    ty = resolved_shop['y'] + overshoot_m * sign * axis_y
+                    
+                    success = self.navigate_to_pose(tx, ty, resolved_shop['yaw'], cost_thresh=98)
+                else:
+                    # 2. Check if we should do the complex sign-to-store workflow
+                    if any(target_norm == self.normalize_category(entry['category']) for entry in self.sign_database):
+                        rospy.loginfo(f"[Shopping List] Target {target_norm} is in sign database. Starting search.")
+                        success = self.delivery_search_workflow(target_norm, is_part_of_task=True)
                     else:
-                        rospy.logerr(f"[Shopping List] Could not resolve target for: {target_upper}")
+                        # 3. Fallback to direct navigation to landmark tag
+                        resolved_tag = None
+                        target_key = target_norm.replace(" ", "_")
+                        if target_key in self.tag_true_poses:
+                            resolved_tag = target_key
+                        else:
+                            for k in self.tag_true_poses.keys():
+                                if k in target_key or target_key in k:
+                                    resolved_tag = k
+                                    break
+                                    
+                        if resolved_tag:
+                            rospy.loginfo(f"[Shopping List] Navigating directly to tag/landmark: {resolved_tag}")
+                            self.navigating_to_tag = True
+                            self.nav_to_tag_thread(resolved_tag)
+                            
+                            # Wait for arrival
+                            pose_info = self.tag_true_poses[resolved_tag]
+                            if "STORE_" in resolved_tag:
+                                gx, gy = pose_info[0], pose_info[1]
+                            else:
+                                with self.lock:
+                                    R = self.R.copy()
+                                    T = self.T.copy()
+                                tag_map = np.dot(R, np.array([pose_info[0], pose_info[1]])) + T
+                                gx, gy = tag_map[0], tag_map[1]
+                                
+                            rx, ry, _ = self.get_current_robot_pose()
+                            success = (math.hypot(rx - gx, ry - gy) < 0.35) and (self.active_delivery_task is not None)
+                        else:
+                            rospy.logerr(f"[Shopping List] Could not resolve target for: {target_upper}")
+                            break # Break retry loop if category is completely unresolvable
+                            
+                if success:
+                    break
                         
             if success and self.active_delivery_task:
-                rospy.loginfo(f"[Shopping List] Successfully arrived at {target_upper}. Simulating pickup.")
-                rospy.sleep(3.0)
-                self.tasks_fulfilled += len(items)
+                rospy.loginfo(f"[Shopping List] Successfully arrived at {target_upper}. Simulating pick up.")
+                self.append_bot_chat_message(f"Arrived at the {target}. Commencing item pick up.")
+                
+                with self.lock:
+                    if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                        for s in self.active_todo_list["stores"]:
+                            if self.normalize_category(s["category"]) == target_norm:
+                                s["status"] = "arrived"
+                                
+                for item in items:
+                    if not self.active_delivery_task:
+                        break
+                    # Set item to picking_up
+                    with self.lock:
+                        if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                            for s in self.active_todo_list["stores"]:
+                                if self.normalize_category(s["category"]) == target_norm:
+                                    for it in s["items"]:
+                                        if it["name"] == item:
+                                            it["status"] = "picking_up"
+                    self.append_bot_chat_message(f"Picking up {item}...")
+                    rospy.sleep(2.0)
+                    # Set item to completed
+                    with self.lock:
+                        if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                            for s in self.active_todo_list["stores"]:
+                                if self.normalize_category(s["category"]) == target_norm:
+                                    for it in s["items"]:
+                                        if it["name"] == item:
+                                            it["status"] = "completed"
+                    self.append_bot_chat_message(f"Loaded {item}!")
+                    self.tasks_fulfilled += 1
+                    
+                # Set store status to completed
+                with self.lock:
+                    if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                        for s in self.active_todo_list["stores"]:
+                            if self.normalize_category(s["category"]) == target_norm:
+                                s["status"] = "completed"
+                self.append_bot_chat_message(f"Finished loading items from the {target}.")
             else:
                 rospy.logwarn(f"[Shopping List] Failed to arrive at target category {target_upper}.")
+                self.append_bot_chat_message(f"Failed to navigate to the {target}. Skipping items: {', '.join(items)}.")
+                with self.lock:
+                    if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                        for s in self.active_todo_list["stores"]:
+                            if self.normalize_category(s["category"]) == target_norm:
+                                s["status"] = "failed"
+                                
+        # FINAL STEP: Navigate to Pickup Point
+        if self.active_delivery_task:
+            rospy.loginfo("[Shopping List] All shopping list stores visited. Guiding robot to the Pickup Point.")
+            self.append_bot_chat_message("All shopping items loaded! Guiding the robot to the Pickup Point for delivery.")
+            
+            target_norm = "PICKUP POINT"
+            
+            max_attempts = 3
+            success = False
+            for attempt in range(max_attempts):
+                if not self.active_delivery_task:
+                    break
+                if attempt > 0:
+                    rospy.logwarn(f"[Shopping List] Navigation to Pickup Point failed or timed out. Retrying (Attempt {attempt+1}/{max_attempts})...")
+                    self.append_bot_chat_message(f"Pickup Point blocked or navigation timed out. Recovering and retrying ({attempt+1}/{max_attempts})...")
+                    self.stop_search(keep_delivery=True)
+                    self.recover_robot()
+                    
+                # Find in mapped shops
+                resolved_shop = None
+                if hasattr(self, 'mapped_shops'):
+                    for s in self.mapped_shops:
+                        s_norm = self.normalize_category(s['type'])
+                        if s_norm == target_norm:
+                            resolved_shop = s
+                            break
+                            
+                if resolved_shop:
+                    rospy.loginfo("[Shopping List] Navigating directly to mapped Pickup Point.")
+                    syaw = resolved_shop['yaw']
+                    axis_x = -math.sin(syaw)
+                    axis_y = math.cos(syaw)
+                    
+                    rx, ry, _ = self.get_current_robot_pose()
+                    dx = resolved_shop['x'] - rx
+                    dy = resolved_shop['y'] - ry
+                    projection = dx * axis_x + dy * axis_y
+                    sign = 1.0 if projection >= 0 else -1.0
+                    
+                    tx = resolved_shop['x'] + overshoot_m * sign * axis_x
+                    ty = resolved_shop['y'] + overshoot_m * sign * axis_y
+                    
+                    success = self.navigate_to_pose(tx, ty, resolved_shop['yaw'], cost_thresh=98)
+                else:
+                    if any(target_norm == self.normalize_category(entry['category']) for entry in self.sign_database):
+                        success = self.delivery_search_workflow(target_norm, is_part_of_task=True)
+                    else:
+                        # Fallback to tag navigation
+                        resolved_tag = None
+                        for k in self.tag_true_poses.keys():
+                            if "STORE_2" in k or "STORE_8" in k or "STORE_22" in k or "STORE_26" in k:
+                                resolved_tag = k
+                                break
+                        if resolved_tag:
+                            self.navigating_to_tag = True
+                            self.nav_to_tag_thread(resolved_tag)
+                            # Wait for arrival...
+                            pose_info = self.tag_true_poses[resolved_tag]
+                            gx, gy = pose_info[0], pose_info[1]
+                            rx, ry, _ = self.get_current_robot_pose()
+                            success = (math.hypot(rx - gx, ry - gy) < 0.35) and (self.active_delivery_task is not None)
+                if success:
+                    break
+            
+            if success and self.active_delivery_task:
+                self.append_bot_chat_message("I have successfully arrived at the Pickup Point! Here are all your items. Enjoy!")
+                with self.lock:
+                    if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                        self.active_todo_list["status"] = "completed"
+            else:
+                self.append_bot_chat_message("I was unable to reach the Pickup Point. Please guide me manually or clear the path.")
                 
         rospy.loginfo("[Shopping List] Sequential shopping list workflow completed.")
         self.active_delivery_task = None
@@ -1462,6 +1623,17 @@ class RobotWebServer:
         path.header.stamp = rospy.Time.now()
         self.path_pub.publish(path)
         self.cmd_vel_pub.publish(Twist())
+
+    def recover_robot(self):
+        """Costmap clearing recovery by rotating in place."""
+        rospy.loginfo("[Recovery] Attempting costmap clearing recovery by rotating in place.")
+        cmd = Twist()
+        cmd.angular.z = 0.5
+        self.cmd_vel_pub.publish(cmd)
+        rospy.sleep(1.5)
+        cmd.angular.z = 0.0
+        self.cmd_vel_pub.publish(cmd)
+        rospy.sleep(1.0)
 
 
     def project_store_to_map(self, store):
@@ -2123,9 +2295,22 @@ def api_status():
     elif explore_state == "IDLE":
         status_str = "stop"
 
-    has_key = bool(rospy.get_param("/openai_api_key", "").strip()) or \
-              bool(os.getenv("OPENAI_API_KEY")) or \
-              os.path.exists("/home/linusv/project_5/HW4/ChatGPT_API_KEY.txt")
+    has_key = False
+    param_key = rospy.get_param("/openai_api_key", "").strip()
+    if param_key.startswith("sk-"):
+        has_key = True
+    elif os.getenv("OPENAI_API_KEY", "").strip().startswith("sk-"):
+        has_key = True
+    elif os.path.exists("/home/linusv/project_5/HW4/ChatGPT_API_KEY.txt"):
+        try:
+            with open("/home/linusv/project_5/HW4/ChatGPT_API_KEY.txt", "r") as f:
+                content = f.read().strip()
+            import re
+            match = re.search(r'\b(sk-[a-zA-Z0-9_-]+)\b', content)
+            if match:
+                has_key = True
+        except Exception:
+            pass
 
     local_planner = rospy.get_param("/local_planner_type", "teb")
 
@@ -2144,7 +2329,9 @@ def api_status():
         "navigating_to_tag": server.navigating_to_tag if hasattr(server, 'navigating_to_tag') else False,
         "local_planner": local_planner,
         "mapped_shops": server.mapped_shops if hasattr(server, "mapped_shops") else [],
-        "overshoot_cm": (server.overshoot_m * 100.0) if hasattr(server, 'overshoot_m') else 0.0
+        "overshoot_cm": (server.overshoot_m * 100.0) if hasattr(server, 'overshoot_m') else 0.0,
+        "chat_messages": server.delivery_chat_history if hasattr(server, 'delivery_chat_history') else [],
+        "todo_list": server.active_todo_list if hasattr(server, 'active_todo_list') else None
     }
     return jsonify(status)
 
@@ -2342,6 +2529,8 @@ def delivery_send():
     if not message:
         return jsonify({"reply": "I did not receive a message. Please say something!"})
         
+    server.append_user_chat_message(message)
+    
     tasks = []
     reply = ""
     
@@ -2354,25 +2543,27 @@ def delivery_send():
             llm_query_srv = rospy.ServiceProxy("llm_query", LLMQuery)
             
             prompt = (
-                f"The user is talking to a delivery robot. They said: '{message}'.\n"
-                f"We want to extract all the items they want to buy/get and match each item to one of our business categories:\n"
-                f"- 'Cafe' (for coffee, tea, drinks, etc.)\n"
-                f"- 'Convenience store' (for general items, snacks, convenience items, store, shop, etc.)\n"
-                f"- 'Fast-food restaurant' (for burger, food, restaurant, hungry, etc.)\n"
-                f"- 'Pharmacy' (for medicine, pill, sick, drug, pharmacy, etc.)\n\n"
-                f"If there are multiple items, group them by category.\n"
+                f"The user wants to get some items. They said: '{message}'.\n"
+                f"Please match the items they requested to one of our 5 store categories:\n"
+                f"- 'Cafe' (for coffee, ice coffee, tea, latte, cappuccino, espresso, drinks, etc.)\n"
+                f"- 'Convenience store' (for onigiri, banana, snacks, chips, tissue, water, general shop items, etc.)\n"
+                f"- 'Fast-food restaurant' (for burger, fries, hamburger, food, pizza, chicken nuggets, etc.)\n"
+                f"- 'Pharmacy' (for medicine, aspirin, cough drop, band-aid, pills, etc.)\n"
+                f"- 'Pickup Point' (for packages, parcels, etc.)\n\n"
+                f"If there are items, group them by category.\n"
                 f"Return ONLY a raw JSON object with two keys:\n"
                 f"1. 'tasks': A list of objects, where each object has:\n"
-                f"   - 'target': The exact category string ('Cafe', 'Convenience store', 'Fast-food restaurant', or 'Pharmacy')\n"
+                f"   - 'target': The exact category string ('Cafe', 'Convenience store', 'Fast-food restaurant', 'Pharmacy', or 'Pickup Point')\n"
                 f"   - 'items': A list of strings containing the items matched to this category.\n"
-                f"2. 'reply': A cute, polite conversational response to display to the user, listing the items and where you will pick them up (e.g., 'I will go to the Cafe to get your coffee, and then to the Pharmacy to get your medicine!').\n\n"
+                f"2. 'reply': A polite conversational response to display to the user, listing the items and where you will pick them up (e.g., 'sounds good, here is where I will go to get your items: Cafe for coffee and ice coffee, Convenience store for onigiri and banana, Fast-food restaurant for burger and fries.').\n\n"
                 f"Example JSON output:\n"
                 f"{{\n"
                 f"  \"tasks\": [\n"
-                f"    {{\"target\": \"Fast-food restaurant\", \"items\": [\"burger\"]}},\n"
-                f"    {{\"target\": \"Cafe\", \"items\": [\"coffee\"]}}\n"
+                f"    {{\"target\": \"Cafe\", \"items\": [\"coffee\", \"ice coffee\"]}},\n"
+                f"    {{\"target\": \"Convenience store\", \"items\": [\"onigiri\", \"banana\"]}},\n"
+                f"    {{\"target\": \"Fast-food restaurant\", \"items\": [\"burger\", \"fries\"]}}\n"
                 f"  ],\n"
-                f"  \"reply\": \"Sure! I will head to the Fast-food restaurant for your burger, and then the Cafe for your coffee!\"\n"
+                f"  \"reply\": \"sounds good, here is where I will go to get your items: Cafe for coffee and ice coffee, Convenience store for onigiri and banana, Fast-food restaurant for burger and fries.\"\n"
                 f"}}"
             )
             
@@ -2398,32 +2589,79 @@ def delivery_send():
             
     if use_local:
         # Standard local backup parser for simple keywords
-        reply = "I'm in offline Local Mode. Let me parse that... "
         m = message.lower()
-        target = ""
-        if "burger" in m or "food" in m or "restaurant" in m or "hungry" in m:
-            target = "Fast-food restaurant"
-            reply += "Ah! You want a burger. I will navigate to the Fast-food restaurant!"
-        elif "coffee" in m or "cafe" in m or "drink" in m or "ice" in m or "tea" in m:
-            target = "Cafe"
-            reply += "Ah! You want coffee. I will navigate to the Cafe!"
-        elif "med" in m or "pharm" in m or "pill" in m or "sick" in m or "drug" in m:
-            target = "Pharmacy"
-            reply += "Ah! You need a pharmacy. I will navigate to the Pharmacy!"
-        elif "store" in m or "shop" in m or "item" in m or "convenience" in m:
-            target = "Convenience store"
-            reply += "Ah! You need the Convenience store. I will navigate there!"
-        elif "pickup" in m or "parcel" in m or "package" in m:
-            target = "Pickup Point"
-            reply += "Ah! You have a package. I will navigate to the Pickup Point!"
+        tasks = []
+        cafe_items = []
+        conv_items = []
+        burger_items = []
+        pharm_items = []
+        
+        # Simple local keywords mapping
+        if "coffee" in m or "cafe" in m or "drink" in m or "tea" in m:
+            items = []
+            if "ice coffee" in m or "ice-coffee" in m:
+                items.append("ice coffee")
+            if "coffee" in m and "ice coffee" not in m:
+                items.append("coffee")
+            if not items:
+                items.append("coffee")
+            cafe_items.extend(items)
+            
+        if "onigiri" in m or "banana" in m or "convenience" in m or "store" in m or "shop" in m:
+            items = []
+            if "onigiri" in m: items.append("onigiri")
+            if "banana" in m: items.append("banana")
+            if not items: items.append("general item")
+            conv_items.extend(items)
+            
+        if "burger" in m or "fries" in m or "food" in m or "restaurant" in m or "hamburger" in m:
+            items = []
+            if "burger" in m or "hamburger" in m: items.append("burger")
+            if "fries" in m: items.append("fries")
+            if not items: items.append("burger")
+            burger_items.extend(items)
+            
+        if "med" in m or "pharm" in m or "pill" in m or "sick" in m or "drug" in m:
+            pharm_items.append("medicine")
+            
+        if cafe_items:
+            tasks.append({"target": "Cafe", "items": cafe_items})
+        if conv_items:
+            tasks.append({"target": "Convenience store", "items": conv_items})
+        if burger_items:
+            tasks.append({"target": "Fast-food restaurant", "items": burger_items})
+        if pharm_items:
+            tasks.append({"target": "Pharmacy", "items": pharm_items})
+            
+        if tasks:
+            reply = "sounds good, here is where I will go to get your items: "
+            parts = []
+            for t in tasks:
+                parts.append(f"{t['target']} for {', '.join(t['items'])}")
+            reply += ", ".join(parts) + "."
         else:
-            reply = "I'm not sure which storefront matches that request. Try asking for coffee, a burger, medicine, or the convenience store!"
+            reply = "I'm not sure which storefront matches that request. Try asking for coffee, a burger, medicine, or convenience store items!"
             
-        if target:
-            tasks = [{"target": target, "items": [target]}]
-            
+    server.append_bot_chat_message(reply)
+    
     if tasks:
+        # Build active_todo_list
+        server.active_todo_list = {
+            "status": "in_progress",
+            "stores": [
+                {
+                    "category": t["target"],
+                    "items": [{"name": item, "status": "pending"} for item in t["items"]],
+                    "status": "pending"
+                } for t in tasks
+            ]
+        }
         server.start_shopping_list_workflow(tasks)
+    else:
+        server.active_todo_list = {
+            "status": "idle",
+            "stores": []
+        }
         
     return jsonify({"reply": reply, "tasks": tasks})
 

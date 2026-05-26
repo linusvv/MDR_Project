@@ -444,7 +444,15 @@ document.addEventListener('DOMContentLoaded', () => {
         if (!text) return;
         
         chatInput.value = '';
-        addChatMessage(text, 'user');
+        const dummyHistory = [
+            ...Array.from(chatMessages.children).map(child => ({
+                sender: child.classList.contains('user') ? 'user' : 'bot',
+                text: child.textContent
+            })),
+            { sender: 'user', text }
+        ];
+        lastChatCount = 0; // force re-render
+        syncChat(dummyHistory);
         logConsole(`User prompt: "${text}"`);
         
         const overshootVal = document.getElementById('overshoot-val');
@@ -457,11 +465,16 @@ document.addEventListener('DOMContentLoaded', () => {
                 body: JSON.stringify({ message: text, overshoot_cm })
             });
             const data = await res.json();
-            addChatMessage(data.reply, 'bot');
-            logConsole(`Delivery Agent: "${data.reply}"`);
+            // Force quick update
+            updateTelemetry();
         } catch (error) {
             console.error("Failed to send chat message", error);
-            addChatMessage("Sorry, I am having trouble connecting to the delivery brain. Make sure the ROS nodes are running!", 'bot');
+            const errorHistory = [
+                ...dummyHistory,
+                { sender: 'bot', text: "Sorry, I am having trouble connecting to the delivery brain. Make sure the ROS nodes are running!" }
+            ];
+            lastChatCount = 0; // force re-render
+            syncChat(errorHistory);
         }
     };
     
@@ -631,6 +644,187 @@ document.addEventListener('DOMContentLoaded', () => {
     const tasksCountEl = document.getElementById('tasks-fulfilled');
     const legendGrid = document.getElementById('legend-grid');
 
+    let lastChatCount = 0;
+    const syncChat = (messages) => {
+        if (!chatMessages || !messages) return;
+        if (messages.length !== lastChatCount) {
+            chatMessages.innerHTML = '';
+            messages.forEach(msg => {
+                const div = document.createElement('div');
+                div.className = `msg ${msg.sender}`;
+                div.textContent = msg.text;
+                chatMessages.appendChild(div);
+            });
+            chatMessages.scrollTop = chatMessages.scrollHeight;
+            lastChatCount = messages.length;
+        }
+    };
+
+    const todoSection = document.getElementById('todo-section');
+    const todoStatus = document.getElementById('todo-task-status');
+    const todoContainer = document.getElementById('todo-list-container');
+
+    const updateTodoList = (todoList) => {
+        if (!todoSection || !todoStatus || !todoContainer) return;
+        
+        if (!todoList || todoList.status === 'idle') {
+            todoSection.style.display = 'none';
+            return;
+        }
+        
+        todoSection.style.display = 'block';
+        
+        // Update general status
+        if (todoList.status === 'completed') {
+            todoStatus.textContent = 'Completed';
+            todoStatus.style.background = 'rgba(16, 185, 129, 0.2)';
+            todoStatus.style.color = '#10b981';
+        } else {
+            todoStatus.textContent = 'In Progress';
+            todoStatus.style.background = 'rgba(59, 130, 246, 0.2)';
+            todoStatus.style.color = '#60a5fa';
+        }
+        
+        todoContainer.innerHTML = '';
+        todoList.stores.forEach(store => {
+            const storeDiv = document.createElement('div');
+            
+            // Determine styles based on status
+            let borderStyle = '2px solid #334155';
+            let statusColor = '#94a3b8';
+            let statusText = store.status;
+            
+            if (store.status === 'completed') {
+                borderStyle = '2px solid #10b981';
+                statusColor = '#10b981';
+                statusText = 'Completed ✓';
+            } else if (store.status === 'navigating') {
+                borderStyle = '2px solid #3b82f6';
+                statusColor = '#60a5fa';
+                statusText = 'Navigating... 🚀';
+            } else if (store.status === 'arrived') {
+                borderStyle = '2px solid #fbbf24';
+                statusColor = '#fbbf24';
+                statusText = 'Arrived 📍';
+            } else if (store.status === 'failed') {
+                borderStyle = '2px solid #ef4444';
+                statusColor = '#f87171';
+                statusText = 'Failed ✗';
+            } else {
+                statusText = 'Pending';
+            }
+            
+            storeDiv.style.borderLeft = borderStyle;
+            storeDiv.style.paddingLeft = '0.6rem';
+            storeDiv.style.marginBottom = '0.4rem';
+            
+            // Header row
+            const header = document.createElement('div');
+            header.style.display = 'flex';
+            header.style.justifyContent = 'space-between';
+            header.style.alignItems = 'center';
+            header.style.fontWeight = '600';
+            
+            const storeName = document.createElement('span');
+            storeName.textContent = store.category;
+            
+            const storeStatusText = document.createElement('span');
+            storeStatusText.textContent = statusText;
+            storeStatusText.style.color = statusColor;
+            storeStatusText.style.fontSize = '0.8rem';
+            
+            header.appendChild(storeName);
+            header.appendChild(storeStatusText);
+            storeDiv.appendChild(header);
+            
+            // Items sub-list
+            const itemsList = document.createElement('div');
+            itemsList.style.marginLeft = '0.4rem';
+            itemsList.style.marginTop = '0.2rem';
+            itemsList.style.display = 'flex';
+            itemsList.style.flexDirection = 'column';
+            itemsList.style.gap = '0.15rem';
+            itemsList.style.color = '#94a3b8';
+            itemsList.style.fontSize = '0.8rem';
+            
+            store.items.forEach(item => {
+                const itemDiv = document.createElement('div');
+                itemDiv.style.display = 'flex';
+                itemDiv.style.alignItems = 'center';
+                itemDiv.style.gap = '0.4rem';
+                
+                const dot = document.createElement('span');
+                dot.style.width = '6px';
+                dot.style.height = '6px';
+                dot.style.borderRadius = '50%';
+                
+                const itemName = document.createElement('span');
+                
+                if (item.status === 'completed') {
+                    dot.style.background = '#10b981';
+                    itemName.textContent = `${item.name} (Picked up)`;
+                    itemName.style.textDecoration = 'line-through';
+                    itemName.style.color = '#475569';
+                } else if (item.status === 'picking_up') {
+                    dot.style.background = '#fbbf24';
+                    itemName.textContent = `${item.name} (Picking up...)`;
+                    itemName.style.color = '#fbbf24';
+                } else {
+                    dot.style.background = '#64748b';
+                    itemName.textContent = `${item.name} (Pending)`;
+                }
+                
+                itemDiv.appendChild(dot);
+                itemDiv.appendChild(itemName);
+                itemsList.appendChild(itemDiv);
+            });
+            
+            storeDiv.appendChild(itemsList);
+            todoContainer.appendChild(storeDiv);
+        });
+        
+        // Add final pickup destination at the end of the list if tasks exist
+        if (todoList.stores.length > 0) {
+            const finalDiv = document.createElement('div');
+            let borderStyle = '2px solid #334155';
+            let statusColor = '#94a3b8';
+            let statusText = 'Pending';
+            
+            if (todoList.status === 'completed') {
+                borderStyle = '2px solid #10b981';
+                statusColor = '#10b981';
+                statusText = 'Completed ✓';
+            } else if (todoList.stores.every(s => s.status === 'completed' || s.status === 'failed')) {
+                borderStyle = '2px solid #3b82f6';
+                statusColor = '#60a5fa';
+                statusText = 'Navigating... 🚀';
+            }
+            
+            finalDiv.style.borderLeft = borderStyle;
+            finalDiv.style.paddingLeft = '0.6rem';
+            finalDiv.style.marginTop = '0.4rem';
+            
+            const header = document.createElement('div');
+            header.style.display = 'flex';
+            header.style.justifyContent = 'space-between';
+            header.style.alignItems = 'center';
+            header.style.fontWeight = '600';
+            
+            const name = document.createElement('span');
+            name.textContent = 'Pickup Point';
+            
+            const status = document.createElement('span');
+            status.textContent = statusText;
+            status.style.color = statusColor;
+            status.style.fontSize = '0.8rem';
+            
+            header.appendChild(name);
+            header.appendChild(status);
+            finalDiv.appendChild(header);
+            todoContainer.appendChild(finalDiv);
+        }
+    };
+
     const updateTelemetry = async () => {
         try {
             const response = await fetch('/api/status');
@@ -736,6 +930,18 @@ document.addEventListener('DOMContentLoaded', () => {
             const overshootValEl = document.getElementById('overshoot-val');
             if (overshootValEl && data.overshoot_cm !== undefined && document.activeElement !== overshootValEl) {
                 overshootValEl.value = data.overshoot_cm;
+            }
+
+            // Sync Chat history
+            if (data.chat_messages) {
+                syncChat(data.chat_messages);
+            }
+
+            // Update active todo list
+            if (data.todo_list) {
+                updateTodoList(data.todo_list);
+            } else {
+                updateTodoList(null);
             }
         } catch (error) {
             console.error("Failed to fetch telemetry status", error);

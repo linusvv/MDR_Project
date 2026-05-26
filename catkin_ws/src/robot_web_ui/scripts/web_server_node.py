@@ -109,6 +109,10 @@ class RobotWebServer:
         self.active_delivery_task = None
         self.task_thread = None
         self.navigating_to_pose_active = False
+        
+        # Visualization Toggles
+        self.viz_apriltag = True
+        self.viz_yolo = True
 
         # ROS Publishers
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
@@ -339,6 +343,50 @@ class RobotWebServer:
                 
         return cv_image
 
+    def is_pose_reachable(self, x, y):
+        """Checks the local costmap to see if the target (x, y) is blocked or too close to obstacles."""
+        with self.lock:
+            grid = self.local_costmap
+            
+        if grid is None:
+            return True # Assume reachable if no costmap available yet
+            
+        try:
+            # 1. Transform Map Point (x, y) to Costmap Frame
+            ps = PointStamped()
+            ps.header.frame_id = "map"
+            ps.header.stamp = rospy.Time(0)
+            ps.point.x = x
+            ps.point.y = y
+            
+            ps_local = self.tf_listener.transformPoint(grid.header.frame_id, ps)
+            lx, ly = ps_local.point.x, ps_local.point.y
+            
+            # 2. Convert to Grid Coordinates
+            info = grid.info
+            origin = info.origin.position
+            res = info.resolution
+            
+            gx = int((lx - origin.x) / res)
+            gy = int((ly - origin.y) / res)
+            
+            # 3. Bounds check
+            if 0 <= gx < info.width and 0 <= gy < info.height:
+                cost = grid.data[gy * info.width + gx]
+                # ROS costmap: 0-100. 100 is lethal, 0 is free. -1 is unknown.
+                if cost > 80: # Lethal or near-lethal obstacle
+                    rospy.logwarn(f"[Safety Check] Target ({x:.2f}, {y:.2f}) is BLOCKED (cost:{cost})")
+                    return False
+                if cost == -1:
+                    rospy.logwarn(f"[Safety Check] Target ({x:.2f}, {y:.2f}) is in UNKNOWN space.")
+                    # Return True or False? Let's be optimistic but warn.
+                    return True 
+            
+            return True
+        except Exception as e:
+            rospy.logerr(f"Costmap Check Error: {e}")
+            return True
+
     def get_current_robot_pose(self):
         if self.tf_listener.canTransform('map', 'base_footprint', rospy.Time(0)):
             try:
@@ -482,6 +530,12 @@ class RobotWebServer:
 
     def navigate_to_pose(self, x, y, yaw):
         """Standard method to navigate to a specific map pose using the global planner."""
+        # 0. Safety Pre-check
+        if not self.is_pose_reachable(x, y):
+            rospy.logerr(f"[Navigation] Goal ({x:.2f}, {y:.2f}) is blocked in local costmap. Aborting.")
+            self.navigating_to_pose_active = False
+            return False
+
         self.navigating_to_pose_active = True
         
         # Enable C++ planner
@@ -495,7 +549,7 @@ class RobotWebServer:
             rx, ry, ryaw = self.get_current_robot_pose()
             dist = math.hypot(rx - x, ry - y)
             
-            if dist < 0.4: # Distance threshold
+            if dist < 0.2: # Tightened threshold for precision
                 # Check orientation near end
                 angle_diff = (yaw - ryaw + math.pi) % (2 * math.pi) - math.pi
                 if abs(angle_diff) < 0.15:
@@ -534,120 +588,203 @@ class RobotWebServer:
         self.navigating_to_pose_active = False
         self.stop_search(keep_delivery=True) # Clears path but keeps workflow target
 
-    def approach_shop_via_waypoint(self, target_category):
-        """Find shop via sweep -> Compute Waypoint -> Go there -> Face shop."""
+    def approach_shop_via_waypoint(self, target_category, corridor_yaw=None):
+        """Find shop via discrete steps -> Compute Waypoint -> Go there."""
         if not self.yolo_model:
             return False
 
-        # PHASE 1: SEARCH (Sweep 90 deg left and right)
+        # PHASE 1: SEARCH (Step-wise ±80 degrees)
         rate = rospy.Rate(10)
         found = False
         shop_img_x = 0
         shop_depth = 0
         shop_label = ""
+        found_robot_pose = (0, 0, 0)
         
         _, _, start_yaw = self.get_current_robot_pose()
-        rospy.loginfo(f"[Waypoint Appr] Phase 1: Scanning for {target_category} (90 deg sweep)...")
+        # Use the provided corridor_yaw if available, otherwise assume start_yaw was corridor-aligned
+        ref_yaw = corridor_yaw if corridor_yaw is not None else start_yaw
         
-        # Target sequence: +90 (Left), back to 0 (Center), then -90 (Right)
-        sweep_rel_targets = [math.radians(90), 0, math.radians(-90)]
-        target_idx = 0
+        # Step-wise targets from +80 down to -80 in 20 degree increments
+        step_targets_rel = [math.radians(a) for a in range(80, -100, -20)]
         
-        start_time = rospy.Time.now()
-        while not rospy.is_shutdown() and self.active_delivery_task and not found:
-            if (rospy.Time.now() - start_time).to_sec() > 50.0: break
+        # Attempt loop: Sweep -> Move 0.5m -> Sweep
+        for attempt in range(3):
+            rospy.loginfo(f"[Waypoint Appr] Attempt {attempt+1}: Scanning for {target_category} (Step-wise 20 deg)...")
+            target_idx = 0
+            start_time = rospy.Time.now()
             
-            with self.lock:
-                img = self.color_image.copy() if self.color_image is not None else None
-                depth_raw = getattr(self, 'depth_raw', None)
-                
-            if img is not None:
-                results = self.yolo_model.predict(img, conf=0.35, verbose=False)
-                for res in results:
-                    for box in res.boxes:
-                        label = res.names[int(box.cls[0])].upper()
-                        if target_category in label or label in target_category or \
-                           ("CAFE" in target_category and "CAFE" in label) or \
-                           ("HAMBURGER" in target_category and "HAMBURGER" in label) or \
-                           ("PHARMACY" in target_category and "PHARMACY" in label) or \
-                           ("PICKUP" in target_category and "PICK" in label):
-                            
-                            shop_img_x = (box.xyxy[0][0] + box.xyxy[0][2]) / 2.0
-                            y1, x1, y2, x2 = int(box.xyxy[0][1]), int(box.xyxy[0][0]), int(box.xyxy[0][3]), int(box.xyxy[0][2])
-                            if depth_raw is not None:
-                                h, w = depth_raw.shape
-                                roi = depth_raw[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                                valids = roi[roi > 0.1]
-                                if valids.size > 0:
-                                    shop_depth = np.median(valids)
-                                    shop_label = label
-                                    found = True
-                                    break
-                if found: break
-            
-            # Rotation logic: reach target 1 (+90), then target 2 (-90)
-            _, _, curr_yaw = self.get_current_robot_pose()
-            target_yaw = (start_yaw + sweep_rel_targets[target_idx] + math.pi) % (2 * math.pi) - math.pi
-            diff = (target_yaw - curr_yaw + math.pi) % (2 * math.pi) - math.pi
-            
-            if abs(diff) < 0.2: # Match threshold
-                target_idx += 1
-                if target_idx >= len(sweep_rel_targets):
+            while not rospy.is_shutdown() and self.active_delivery_task and not found:
+                if (rospy.Time.now() - start_time).to_sec() > 80.0:
+                    rospy.logwarn("[Waypoint Appr] Search timeout for this attempt.")
                     break
+                
+                # --- ACTION A: ROTATE TO NEXT STEP ---
+                curr_target_rel = step_targets_rel[target_idx]
+                target_yaw = (start_yaw + curr_target_rel + math.pi) % (2*math.pi) - math.pi
+                
+                # Turn faster to the initial search angle (+80 deg), then slower for incremental steps
+                if target_idx == 0:
+                    self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=1.5)
+                else:
+                    self.rotate_to_yaw(target_yaw, p_gain=1.8, speed_limit=0.8)
+                
+                # --- ACTION B: STOP AND ANALYZE ---
+                rospy.loginfo(f"[Waypoint Appr] Step {math.degrees(curr_target_rel):.0f} deg. Analyzing...")
+                rospy.sleep(0.8) # Wait for stabilization
+                
+                with self.lock:
+                    img = self.color_image.copy() if self.color_image is not None else None
+                    depth_raw = getattr(self, 'depth_raw', None)
                     
-            cmd = Twist()
-            # If we are heading from +90 to -90, the diff will be -180. 
-            # Force it to take the "Right" turn (shortest path)
-            cmd.angular.z = 0.5 * np.sign(diff)
-            self.cmd_vel_pub.publish(cmd)
-            rate.sleep()
+                if img is not None:
+                    # Confidence increased to 0.65 as requested
+                    results = self.yolo_model.predict(img, conf=0.65, verbose=False)
+                    for res in results:
+                        for box in res.boxes:
+                            label = res.names[int(box.cls[0])].upper()
+                            clean_label = label.replace("STORE_", "").replace("_", " ")
+                            
+                            # Strict categorization
+                            is_cafe = "CAF" in target_category.upper() and ("CAF" in label or "CAF" in clean_label)
+                            is_hamb = ("HAMB" in target_category.upper() or "BURG" in target_category.upper()) and ("HAMB" in label or "BURG" in label)
+                            is_pharm = "PHARM" in target_category.upper() and ("PHARM" in label or "PHARM" in clean_label)
+                            is_store = "STORE" in target_category.upper() and "STORE" in label and not ("CAF" in label or "PHARM" in label or "BURG" in label or "HAMB" in label)
+                            
+                            match = (target_category.upper() == label or target_category.upper() == clean_label) or \
+                                    is_cafe or is_hamb or is_pharm or is_store
+
+                            if match:
+                                shop_img_x = (box.xyxy[0][0] + box.xyxy[0][2]) / 2.0
+                                y1, x1, y2, x2 = int(box.xyxy[0][1]), int(box.xyxy[0][0]), int(box.xyxy[0][3]), int(box.xyxy[0][2])
+                                
+                                depth_val = 0.0
+                                if depth_raw is not None:
+                                    h, w = depth_raw.shape
+                                    roi = depth_raw[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                                    valids = roi[roi > 0.1]
+                                    if valids.size > 0:
+                                        depth_val = np.median(valids)
+                                
+                                # mm to meters scale check
+                                if depth_val > 50.0: depth_val /= 1000.0
+                                if depth_val == 0.0: depth_val = 1.8 
+                                if depth_val > 6.0: continue
+
+                                rospy.loginfo(f"[Waypoint Appr] Found {label} at {depth_val:.2f}m (conf:{float(box.conf[0]):.2f}). MATCHED.")
+                                shop_depth = depth_val
+                                shop_label = label
+                                img_w_found = float(img.shape[1])
+                                found_robot_pose = self.get_current_robot_pose()
+                                found = True
+                                break
+                    if found: break
+
+                target_idx += 1
+                if target_idx >= len(step_targets_rel):
+                    break
+            
+            if found:
+                break
+            
+            # PHASE 1.5: RESET AND MOVE FORWARD
+            rospy.logwarn(f"[Waypoint Appr] No shop detected in attempt {attempt+1}. Resetting and moving forward 0.5m.")
+            # Fast turn back to starting orientation (higher speed and P-gain)
+            self.rotate_to_yaw(start_yaw, p_gain=2.0, speed_limit=1.5)
+            
+            rx_now, ry_now, _ = self.get_current_robot_pose()
+            fwd_x = rx_now + 0.5 * math.cos(start_yaw)
+            fwd_y = ry_now + 0.5 * math.sin(start_yaw)
+            
+            # --- SAFETY CHECK FOR FALLBACK ---
+            if not self.is_pose_reachable(fwd_x, fwd_y):
+                rospy.logerr("[Waypoint Appr] Fallback move is BLOCKED by obstacles. Aborting search.")
+                break
+
+            # Short navigation to new search spot
+            self.navigate_to_pose(fwd_x, fwd_y, start_yaw)
+            rospy.sleep(1.0)
             
         if not found: 
             self.cmd_vel_pub.publish(Twist())
             return False
-        
-        self.cmd_vel_pub.publish(Twist())
-        rospy.loginfo(f"[Waypoint Appr] Found {shop_label} at {shop_depth:.2f}m.")
-        rospy.sleep(0.5)
-            cmd.angular.z = 0.5 * rot_dir
-            self.cmd_vel_pub.publish(cmd)
-            rate.sleep()
             
-        if not found: 
-            self.cmd_vel_pub.publish(Twist())
-            return False
-        
-        # Stop briefly to finalize position
         self.cmd_vel_pub.publish(Twist())
         rospy.sleep(0.5)
 
-        # PHASE 2: COMPUTE GLOBAL COORDINATES OF SHOP
-        rospy.loginfo(f"[Waypoint Appr] Phase 2: Computing pose for {shop_label}...")
-        rx, ry, ryaw = self.get_current_robot_pose()
+        # PHASE 2: COMPUTE PERPENDICULAR WAYPOINT
+        rospy.loginfo(f"[Waypoint Appr] Phase 2: Computing perpendicular waypoint for {shop_label}...")
+        rx, ry, ryaw = found_robot_pose
         
-        # Approximate offset from center to angle (FOV is ~85 deg)
-        img_w = 640.0 # Standard
-        pix_offset = shop_img_x - (img_w/2.0)
-        angle_to_shop_rel = -(pix_offset / (img_w/2.0)) * (math.radians(42.0)) # Rough mapping
+        # 1. Map shop location using precise image geometry
+        img_w = locals().get('img_w_found', 640.0)
+        pix_offset = shop_img_x - (img_w / 2.0)
+        # Using 80 degree Horizontal FOV for calculation
+        angle_to_shop_rel = -(pix_offset / (img_w / 2.0)) * (math.radians(40.0)) 
+        
+        # Compensate for depth measurement parallax at close range
+        # At < 2m, the depth camera offset from base_link becomes significant.
+        # We also slightly reduce the perceived depth to account for shop frontage thickness.
+        effective_depth = shop_depth - 0.15 # Offset of camera from base center + buffer
+        if effective_depth < 0.3: effective_depth = 0.3 # Safety floor
+        
         angle_to_shop_global = ryaw + angle_to_shop_rel
         
-        # Shop map location
-        shop_map_x = rx + shop_depth * math.cos(angle_to_shop_global)
-        shop_map_y = ry + shop_depth * math.sin(angle_to_shop_global)
+        shop_map_x = rx + effective_depth * math.cos(angle_to_shop_global)
+        shop_map_y = ry + effective_depth * math.sin(angle_to_shop_global)
+
+        rospy.loginfo(f"[Waypoint Appr] Robot Pose: ({rx:.2f}, {ry:.2f}, {math.degrees(ryaw):.1f} deg)")
+        rospy.loginfo(f"[Waypoint Appr] Shop Rel Angle: {math.degrees(angle_to_shop_rel):.1f} deg, Depth: {shop_depth:.2f}m")
+        rospy.loginfo(f"[Waypoint Appr] Calculated Shop Map Pos: ({shop_map_x:.2f}, {shop_map_y:.2f})")
+
+        # 2. Determine Wall Normal based on Corridor Yaw
+        # The wall is parallel to the corridor. Normal is +/- 90deg from corridor.
+        # We pick the normal that points FROM the shop TOWARDS the corridor/robot.
+        normal_angle_1 = (ref_yaw + math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
+        normal_angle_2 = (ref_yaw - math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
         
-        # Waypoint: 0.5m in front of shop along the approach vector
-        # Approach vector is from robot to shop (angle_to_shop_global)
-        # We want to be at a position that is (shop_depth - 0.5) away from robot
-        target_x = rx + (shop_depth - 0.5) * math.cos(angle_to_shop_global)
-        target_y = ry + (shop_depth - 0.5) * math.sin(angle_to_shop_global)
-        target_yaw = angle_to_shop_global # Face the shop
+        # Check which normal points from shop position towards the current robot position
+        vec_shop_to_robot = np.array([rx - shop_map_x, ry - shop_map_y])
+        vec_n1 = np.array([math.cos(normal_angle_1), math.sin(normal_angle_1)])
+        vec_n2 = np.array([math.cos(normal_angle_2), math.sin(normal_angle_2)])
         
-        rospy.loginfo(f"[Waypoint Appr] Shop at ({shop_map_x:.2f}, {shop_map_y:.2f}). Waypoint at ({target_x:.2f}, {target_y:.2f})")
+        if np.dot(vec_shop_to_robot, vec_n1) > np.dot(vec_shop_to_robot, vec_n2):
+            wall_normal_out = normal_angle_1
+        else:
+            wall_normal_out = normal_angle_2
+            
+        # 3. Target Position: Start with 60cm as default safely away from wall
+        target_dist = 0.60
+        target_x = shop_map_x + target_dist * math.cos(wall_normal_out)
+        target_y = shop_map_y + target_dist * math.sin(wall_normal_out)
         
-        # PHASE 3: ACTUALLY NAVIGATE THERE
+        # 4. Target Orientation: Face the shop (exactly opposite of the outward normal)
+        target_yaw = (wall_normal_out + 2*math.pi) % (2*math.pi) - math.pi
+        
+        rospy.loginfo(f"[Waypoint Appr] Shop Side Normal: {math.degrees(wall_normal_out):.1f} deg")
+        rospy.loginfo(f"[Waypoint Appr] Shop Map Pos: ({shop_map_x:.2f}, {shop_map_y:.2f}) -> Waypoint: ({target_x:.2f}, {target_y:.2f})")
+        rospy.loginfo(f"[Waypoint Appr] Final Waypoint: ({target_x:.2f}, {target_y:.2f}) Facing {math.degrees(target_yaw):.1f} deg")
+        
+        # --- PHASE 3 PRE-CHECK: LOCAL COSTMAP SAFETY ---
+        if not self.is_pose_reachable(target_x, target_y):
+            rospy.logerr(f"[Waypoint Appr] Primary waypoint (60cm) is UNREACHABLE! Trying to nudge to 35cm...")
+            # Try nudge to 35cm as requested
+            target_x_nudge = shop_map_x + 0.35 * math.cos(wall_normal_out)
+            target_y_nudge = shop_map_y + 0.35 * math.sin(wall_normal_out)
+            if self.is_pose_reachable(target_x_nudge, target_y_nudge):
+                rospy.loginfo("[Waypoint Appr] Nudge (35cm) is safe. Proceeding with nudge.")
+                target_x, target_y = target_x_nudge, target_y_nudge
+            else:
+                rospy.logerr("[Waypoint Appr] Even nudged goal is blocked. Aborting navigation.")
+                return False
+
+        # PHASE 3: NAVIGATE TO PERPENDICULAR WAYPOINT
+        # Use a slower approach for the final alignment to prevent overshoot
+        rospy.set_param("/navigation/max_vel_x", 0.15) 
         self.navigate_to_pose(target_x, target_y, target_yaw)
+        rospy.set_param("/navigation/max_vel_x", 0.3) # Reset to default
         
-        # PHASE 4: FINAL ROTATION TO FACE SHOP EXACTLY
+        # PHASE 4: FINAL ROTATION REFINEMENT
         self.rotate_to_yaw(target_yaw)
         return True
 
@@ -726,12 +863,13 @@ class RobotWebServer:
             target_yaw = math.radians(tag_true_yaw_deg) + rot_angle + math.radians(target_dir)
             
             rospy.loginfo(f"[Delivery Task] Rotating to target yaw: {math.degrees(target_yaw):.1f} deg")
-            self.rotate_to_yaw(target_yaw)
+            # Fast alignment with corridor before sweep
+            self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=1.5)
             
             # 4. DISCOVER SHOP & APPROACH USING WAYPOINT
             rospy.loginfo(f"[Delivery Task] Step 3: Discovering and approaching {target_category}...")
-            # Use the new waypoint-based approach for reliability
-            success = self.approach_shop_via_waypoint(target_category)
+            # Use the new waypoint-based approach for reliability, passing the corridor alignment
+            success = self.approach_shop_via_waypoint(target_category, corridor_yaw=target_yaw)
             
             if success:
                 rospy.loginfo(f"[Delivery Task] SUCCESS: Arrived at {target_category}!")
@@ -852,7 +990,12 @@ class RobotWebServer:
                 if roi.size > 0:
                     valid_depths = roi[roi > 0.1]
                     if valid_depths.size > 0:
-                        dist_to_shop = np.percentile(valid_depths, 30) # Use 30th percentile to get the front face
+                        # Use 15th percentile to ensure we are looking at the 'front-most' edge
+                        # This prevents overshooting into the shop interior
+                        dist_to_shop = np.percentile(valid_depths, 15) 
+                        
+                        # Sanity check for Millimeters vs Meters
+                        if dist_to_shop > 50.0: dist_to_shop /= 1000.0
                         
                         # Check perpendicularity: depth left vs right
                         half_w = roi.shape[1] // 2
@@ -870,15 +1013,15 @@ class RobotWebServer:
             # 3. Control Logic
             cmd = Twist()
             
-            # Distance stop (40cm)
-            if dist_to_shop < 0.40:
+            # Distance stop (60cm)
+            if dist_to_shop < 0.60:
                 rospy.loginfo(f"[Visual Servoing] Target reached at {dist_to_shop:.2f}m")
                 arrived = True
                 break
                 
             # Forward velocity (Proportional to distance)
-            # P-controller for distance: goal is 0.4m
-            dist_error = dist_to_shop - 0.40
+            # P-controller for distance: goal is 0.6m
+            dist_error = dist_to_shop - 0.60
             cmd.linear.x = 0.3 * dist_error
             
             # Side strafe (To get perpendicular)
@@ -899,7 +1042,7 @@ class RobotWebServer:
         self.cmd_vel_pub.publish(Twist()) # Final stop
         return arrived
 
-    def rotate_to_yaw(self, target_yaw):
+    def rotate_to_yaw(self, target_yaw, p_gain=1.5, speed_limit=0.8):
         """Simple proportional controller for rotation in-place."""
         rate = rospy.Rate(10)
         while not rospy.is_shutdown() and self.active_delivery_task:
@@ -908,10 +1051,9 @@ class RobotWebServer:
             if abs(diff) < 0.05: break
             
             cmd = Twist()
-            cmd.angular.z = 1.0 * diff # P controller
+            cmd.angular.z = p_gain * diff 
             # Clamp
-            if cmd.angular.z > 0.6: cmd.angular.z = 0.6
-            if cmd.angular.z < -0.6: cmd.angular.z = -0.6
+            cmd.angular.z = np.clip(cmd.angular.z, -speed_limit, speed_limit)
             self.cmd_vel_pub.publish(cmd)
             rate.sleep()
         self.cmd_vel_pub.publish(Twist()) # Stop
@@ -966,7 +1108,7 @@ class RobotWebServer:
             dist = math.hypot(rx - gx, ry - gy)
             
             # Check if arrived at position (under signboard)
-            if dist < 0.5:
+            if dist < 0.25:
                 rospy.loginfo("[Tag Nav] Arrived at target signboard position successfully.")
                 break
                 
@@ -1205,9 +1347,10 @@ class RobotWebServer:
         # --- Optimized YOLO Detections for Visualization ---
         # Only run at ~5Hz to prevent web UI lag
         now = time.time()
-        if self.yolo_model is not None:
+        if self.yolo_model is not None and self.viz_yolo:
             if now - self.last_yolo_viz_time > 0.2: # 5 FPS
-                self.last_yolo_viz_results = self.yolo_model.predict(img, conf=0.4, verbose=False)
+                # Lower confidence for visualization helps see distant/partial shops
+                self.last_yolo_viz_results = self.yolo_model.predict(img, conf=0.25, verbose=False)
                 self.last_yolo_viz_time = now
                 
             for res in self.last_yolo_viz_results:
@@ -1221,6 +1364,8 @@ class RobotWebServer:
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         
         def draw_single_tag(img, tag_id, size, rvec, tvec):
+            if not self.viz_apriltag:
+                return
             # Define object points: corners and normal vector tip
             # Tag frame: Z out (normal), X right, Y down. Center is 0,0,0
             half = size / 2.0
@@ -1887,6 +2032,19 @@ def api_find_tag():
 def api_stop():
     server.stop_robot()
     return jsonify({"status": "success", "message": "Emergency Stop Triggered!"})
+
+@app.route('/api/viz_toggle', methods=['POST'])
+def api_viz_toggle():
+    data = request.json or {}
+    layer = data.get('layer', '')
+    enabled = data.get('enabled', True)
+    
+    if layer == 'apriltag':
+        server.viz_apriltag = enabled
+    elif layer == 'yolo':
+        server.viz_yolo = enabled
+        
+    return jsonify({"status": "success", "layer": layer, "enabled": enabled})
 
 @app.route('/api/navigate_to_tag', methods=['POST'])
 def api_navigate_to_tag():

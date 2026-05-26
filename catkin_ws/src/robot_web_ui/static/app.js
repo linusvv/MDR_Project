@@ -97,6 +97,30 @@ document.addEventListener('DOMContentLoaded', () => {
     const aiToggle = document.getElementById('ai-toggle');
     const labelLocal = document.getElementById('label-local');
     const labelRemote = document.getElementById('label-remote');
+
+    // Viz Toggles (AprilTag / YOLO)
+    const toggleApril = document.getElementById('toggle-apriltag');
+    const toggleYolo = document.getElementById('toggle-yolo');
+
+    const sendVizToggle = async (layer, enabled) => {
+        try {
+            await fetch('/api/viz_toggle', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ layer, enabled })
+            });
+            logConsole(`Visualization: ${layer.toUpperCase()} marks ${enabled ? 'ON' : 'OFF'}`);
+        } catch (e) {
+            console.error(`Failed to toggle ${layer}`, e);
+        }
+    };
+
+    if (toggleApril) {
+        toggleApril.addEventListener('change', (e) => sendVizToggle('apriltag', e.target.checked));
+    }
+    if (toggleYolo) {
+        toggleYolo.addEventListener('change', (e) => sendVizToggle('yolo', e.target.checked));
+    }
     
     if (aiToggle) {
         aiToggle.addEventListener('change', async (e) => {

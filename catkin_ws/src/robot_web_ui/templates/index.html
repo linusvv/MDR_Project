@@ -61,10 +61,30 @@
 
         <!-- Main Content -->
         <main class="main-grid">
-            <!-- Left Column: Primary & Depth Camera -->
+            <!-- Column 1: Primary Camera with Toggles -->
             <section class="video-section">
                 <div class="card video-card small-video">
-                    <div class="card-header"><h2>Primary Camera (AprilTag Detection)</h2></div>
+                    <div class="card-header" style="display: flex; justify-content: space-between; align-items: center;">
+                        <h2>Primary Camera</h2>
+                        <div style="display: flex; gap: 1rem;">
+                            <!-- AprilTag Toggle -->
+                            <div style="display: flex; align-items: center; gap: 0.4rem;">
+                                <span style="font-size: 0.7rem; color: #94a3b8; font-weight: 600;">TAGS</span>
+                                <label class="switch mini-switch">
+                                    <input type="checkbox" id="toggle-apriltag" checked>
+                                    <span class="slider round"></span>
+                                </label>
+                            </div>
+                            <!-- YOLO Toggle -->
+                            <div style="display: flex; align-items: center; gap: 0.4rem;">
+                                <span style="font-size: 0.7rem; color: #94a3b8; font-weight: 600;">YOLO</span>
+                                <label class="switch mini-switch">
+                                    <input type="checkbox" id="toggle-yolo" checked>
+                                    <span class="slider round"></span>
+                                </label>
+                            </div>
+                        </div>
+                    </div>
                     <div class="video-container"><img src="{{ url_for('video_color') }}" alt="Color Camera Stream" class="video-stream"></div>
                 </div>
                 <div class="card video-card small-video">

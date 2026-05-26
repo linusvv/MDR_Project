@@ -156,6 +156,11 @@ html, body {
 input:checked + .slider{background:#10b981;}
 input:checked + .slider:before{transform:translateX(24px);}
 
+/* Mini Switch */
+.mini-switch {width:32px; height:16px;}
+.mini-switch .slider:before {height:12px; width:12px; left:2px; bottom:2px;}
+.mini-switch input:checked + .slider:before {transform:translateX(16px);}
+
 /* New 3‑column layout */
 :root {
     --col-left: 25%;

@@ -1,0 +1,4 @@
+string prompt
+string base64_image
+---
+string response

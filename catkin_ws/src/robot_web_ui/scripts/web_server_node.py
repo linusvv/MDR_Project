@@ -131,7 +131,8 @@ class RobotWebServer:
 
         # ROS Subscribers
         rospy.Subscriber('/camera/color/image_raw', Image, self.color_cb)
-        rospy.Subscriber('/camera/depth/image_raw', Image, self.depth_cb)
+        depth_topic = rospy.get_param('~depth_topic', '/camera/aligned_depth_to_color/image_raw')
+        rospy.Subscriber(depth_topic, Image, self.depth_cb)
         rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.cam_info_cb)
         rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.map_cb)
         rospy.Subscriber('/map/local_map/obstacle', OccupancyGrid, self.local_map_cb)

@@ -140,13 +140,23 @@
                             Remote Control
                         </h2>
                     </div>
+                    <!-- Speed Limit Slider Section -->
+                    <div class="speed-selector-container" style="padding: 0.6rem 1.2rem; border-bottom: 1px solid rgba(255,255,255,0.06); display: flex; flex-direction: column; gap: 0.3rem; background: rgba(255,255,255,0.01);">
+                        <div style="display: flex; justify-content: space-between; align-items: center;">
+                            <span style="font-size: 0.8rem; color: #94a3b8; font-weight: 500;">Max Speed Limit:</span>
+                            <span id="speed-limit-val" style="font-size: 0.8rem; color: #38bdf8; font-weight: 600;">0.06 m/s</span>
+                        </div>
+                        <input type="range" id="speed-limit-slider" min="0.02" max="0.30" step="0.01" value="0.06" style="width: 100%; height: 6px; border-radius: 3px; accent-color: #38bdf8; cursor: pointer; outline: none;">
+                    </div>
                     <div class="joystick-container">
                         <div class="d-pad">
-                            <button class="d-btn up" id="btn-up" data-linear="0.5" data-angular="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
-                            <button class="d-btn left" id="btn-left" data-linear="0" data-angular="1.0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
-                            <button class="d-btn stop" id="btn-stop" data-linear="0" data-angular="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg></button>
-                            <button class="d-btn right" id="btn-right" data-linear="0" data-angular="-1.0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></button>
-                            <button class="d-btn down" id="btn-down" data-linear="-0.5" data-angular="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M19 12l-7 7-7-7"/></svg></button>
+                            <button class="d-btn strafe-left" id="btn-strafe-left" data-linear="0" data-angular="0" data-strafe="0.06" title="Strafe Left"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M11 17l-5-5 5-5"/><path d="M18 17l-5-5 5-5"/></svg></button>
+                            <button class="d-btn up" id="btn-up" data-linear="0.06" data-angular="0" data-strafe="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 19V5M5 12l7-7 7 7"/></svg></button>
+                            <button class="d-btn strafe-right" id="btn-strafe-right" data-linear="0" data-angular="0" data-strafe="-0.06" title="Strafe Right"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M13 17l5-5-5-5"/><path d="M6 17l5-5-5-5"/></svg></button>
+                            <button class="d-btn left" id="btn-left" data-linear="0" data-angular="0.3" data-strafe="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M19 12H5M12 19l-7-7 7-7"/></svg></button>
+                            <button class="d-btn stop" id="btn-stop" data-linear="0" data-angular="0" data-strafe="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="6" y="6" width="12" height="12"/></svg></button>
+                            <button class="d-btn right" id="btn-right" data-linear="0" data-angular="-0.3" data-strafe="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M5 12h14M12 5l7 7-7 7"/></svg></button>
+                            <button class="d-btn down" id="btn-down" data-linear="-0.06" data-angular="0" data-strafe="0"><svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 5v14M19 12l-7 7-7-7"/></svg></button>
                         </div>
                     </div>
                     <div class="rc-actions" style="margin-top: 0.5rem; border-top: 1px solid rgba(255,255,255,0.08); padding: 0.8rem; display: flex; justify-content: center;">

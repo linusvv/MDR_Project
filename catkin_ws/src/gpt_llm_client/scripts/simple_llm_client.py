@@ -9,7 +9,14 @@ class StatelessLLMClient:
     def __init__(self):
         api_key = os.getenv("OPENAI_API_KEY")
         if not api_key:
-            key_file = "/home/linusv/project_5/HW4/ChatGPT_API_KEY.txt"
+            import rospkg
+            try:
+                pkg_path = rospkg.RosPack().get_path('gpt_llm_client')
+                mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
+                key_file = os.path.join(mdr_path, 'HW4', 'ChatGPT_API_KEY.txt')
+            except Exception:
+                key_file = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/ChatGPT_API_KEY.txt"
+
             if os.path.exists(key_file):
                 try:
                     with open(key_file, "r") as f:
@@ -18,15 +25,15 @@ class StatelessLLMClient:
                     match = re.search(r'\b(sk-[a-zA-Z0-9_-]+)\b', content)
                     if match:
                         api_key = match.group(1)
-                        rospy.loginfo("Successfully extracted and loaded OPENAI_API_KEY from HW4/ChatGPT_API_KEY.txt")
+                        rospy.loginfo(f"Successfully extracted and loaded OPENAI_API_KEY from {key_file}")
                     else:
                         api_key = ""
-                        rospy.logwarn("ChatGPT_API_KEY.txt found but could not extract a valid sk-... key.")
+                        rospy.logwarn(f"{key_file} found but could not extract a valid sk-... key.")
                 except Exception as e:
                     api_key = ""
                     rospy.logerr(f"Error reading key file: {e}")
             else:
-                rospy.logwarn("OPENAI_API_KEY not set and ChatGPT_API_KEY.txt not found. Waiting for user setup via HRI.")
+                rospy.logwarn(f"OPENAI_API_KEY not set and key file not found at {key_file}. Waiting for user setup via HRI.")
                 api_key = ""
 
         openai.api_key = api_key

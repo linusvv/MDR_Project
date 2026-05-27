@@ -1,0 +1,41 @@
+from ultralytics import YOLO
+import cv2
+import time
+
+model = YOLO("best.engine", task="detect")
+
+cap = cv2.VideoCapture(2)  # Kamera 1
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+
+if not cap.isOpened():
+    print("Kamera nicht gefunden!")
+    exit()
+
+print("Kamera bereit! Drücke Ctrl+C zum Beenden")
+
+while True:
+    t_start = time.time()
+    ret, frame = cap.read()
+    if not ret:
+        print("Kein Bild!")
+        break
+
+    results = model(frame, conf=0.5, device=0, verbose=False)
+    annotated = results[0].plot()
+
+    fps = 1.0 / (time.time() - t_start)
+    cv2.putText(annotated, f"FPS: {fps:.1f}", (10, 30),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2)
+
+    for box in results[0].boxes:
+        cls_name = model.names[int(box.cls)]
+        conf = float(box.conf)
+        print(f"Erkannt: {cls_name} ({conf:.2f})")
+
+    cv2.imshow("YOLOv11 Detection", annotated)
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+cap.release()
+cv2.destroyAllWindows()

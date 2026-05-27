@@ -209,9 +209,13 @@ input:checked + .slider:before{transform:translateX(24px);}
 /* Remote control alignment */
 .control-section .control-card {margin-bottom:1rem;}
 .joystick-container {display:flex; justify-content:center; align-items:center; height:220px;}
-.d-pad {display:grid; grid-template-areas:". up ." "left stop right" ". down ."; gap:0.4rem;}
+.d-pad {display:grid; grid-template-areas:"strafe-left up strafe-right" "left stop right" ". down ."; gap:0.4rem;}
 .d-btn {background:rgba(255,255,255,0.08); border:none; border-radius:8px; color:#e2e8f0; width:55px; height:55px; cursor:pointer; transition:transform 0.1s, background 0.2s;}
-.d-btn:hover{background:rgba(255,255,255,0.15);} .d-btn:active{transform:scale(0.95);} .up{grid-area:up;} .down{grid-area:down;} .left{grid-area:left;} .right{grid-area:right;} .stop{grid-area:stop; background:#ef4444;}
+.d-btn:hover{background:rgba(255,255,255,0.15);} .d-btn:active{transform:scale(0.95);} 
+.up{grid-area:up;} .down{grid-area:down;} .left{grid-area:left;} .right{grid-area:right;} .stop{grid-area:stop; background:#ef4444;}
+.strafe-left{grid-area:strafe-left; background:rgba(59, 130, 246, 0.12) !important;}
+.strafe-right{grid-area:strafe-right; background:rgba(59, 130, 246, 0.12) !important;}
+.strafe-left:hover, .strafe-right:hover{background:rgba(59, 130, 246, 0.25) !important;}
 
 /* LLM card – unchanged visual style */
 .llm-card .llm-input-area{display:flex; flex-direction:column; gap:0.5rem;}

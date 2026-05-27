@@ -513,68 +513,68 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
     // Remote Control manual button publishers
+    let currentMaxSpeed = 0.06;  // m/s  (= 60 mm/s, safe for Pi power)
+    let currentMaxAngular = 0.3;   // rad/s
+
     const buttons = {
-        'btn-up': document.getElementById('btn-up'),
-        'btn-down': document.getElementById('btn-down'),
-        'btn-left': document.getElementById('btn-left'),
-        'btn-right': document.getElementById('btn-right'),
-        'btn-stop': document.getElementById('btn-stop')
+        'btn-up':           document.getElementById('btn-up'),
+        'btn-down':         document.getElementById('btn-down'),
+        'btn-left':         document.getElementById('btn-left'),
+        'btn-right':        document.getElementById('btn-right'),
+        'btn-stop':         document.getElementById('btn-stop'),
+        'btn-strafe-left':  document.getElementById('btn-strafe-left'),
+        'btn-strafe-right': document.getElementById('btn-strafe-right')
     };
 
     let activeInterval = null;
-    let currentCmd = { linear: 0, angular: 0 };
+    let currentCmd = { linear: 0, strafe: 0, angular: 0 };
 
-    const sendCommand = async (linear, angular) => {
+    // strafe maps to linear.y in Twist (mecanum sideways)
+    const sendCommand = async (linear, angular, strafe = 0) => {
         try {
             await fetch('/api/cmd_vel', {
                 method: 'POST',
-                headers: {
-                    'Content-Type': 'application/json',
-                },
-                body: JSON.stringify({ linear, angular })
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ linear, angular, strafe })
             });
         } catch (error) {
             console.error("Failed to send manual command", error);
         }
     };
 
-    const startCommand = (linear, angular) => {
+    const startCommand = (linear, angular, strafe = 0) => {
         if (activeInterval) clearInterval(activeInterval);
-        currentCmd = { linear, angular };
-        sendCommand(linear, angular);
-        activeInterval = setInterval(() => sendCommand(linear, angular), 100);
+        currentCmd = { linear, angular, strafe };
+        sendCommand(linear, angular, strafe);
+        activeInterval = setInterval(() => sendCommand(linear, angular, strafe), 100);
     };
 
     const stopCommand = () => {
         if (activeInterval) clearInterval(activeInterval);
-        currentCmd = { linear: 0, angular: 0 };
-        sendCommand(0, 0);
+        currentCmd = { linear: 0, angular: 0, strafe: 0 };
+        sendCommand(0, 0, 0);
     };
 
     Object.values(buttons).forEach(btn => {
         if (!btn) return;
 
-        const linear = parseFloat(btn.dataset.linear);
-        const angular = parseFloat(btn.dataset.angular);
-
         btn.addEventListener('mousedown', () => {
             if (btn.id === 'btn-stop') {
                 stopCommand();
             } else {
-                startCommand(linear, angular);
+                const linear = parseFloat(btn.dataset.linear  || 0);
+                const angular = parseFloat(btn.dataset.angular || 0);
+                const strafe  = parseFloat(btn.dataset.strafe  || 0);
+                startCommand(linear, angular, strafe);
             }
         });
 
         btn.addEventListener('mouseup', () => {
-            if (btn.id !== 'btn-stop') {
-                stopCommand();
-            }
+            if (btn.id !== 'btn-stop') stopCommand();
         });
 
         btn.addEventListener('mouseleave', () => {
-            if (btn.id !== 'btn-stop' && currentCmd.linear === linear && currentCmd.angular === angular) {
-                stopCommand();
-            }
+            if (btn.id !== 'btn-stop') stopCommand();
         });
 
         btn.addEventListener('touchstart', (e) => {
@@ -582,46 +582,98 @@ document.addEventListener('DOMContentLoaded', () => {
             if (btn.id === 'btn-stop') {
                 stopCommand();
             } else {
-                startCommand(linear, angular);
+                const linear = parseFloat(btn.dataset.linear  || 0);
+                const angular = parseFloat(btn.dataset.angular || 0);
+                const strafe  = parseFloat(btn.dataset.strafe  || 0);
+                startCommand(linear, angular, strafe);
             }
         }, {passive: false});
 
         btn.addEventListener('touchend', (e) => {
             e.preventDefault();
-            if (btn.id !== 'btn-stop') {
-                stopCommand();
-            }
+            if (btn.id !== 'btn-stop') stopCommand();
         }, {passive: false});
     });
 
-    // Keyboard support for WASD / Arrows
+    // Speed Slider Dynamic Event Handling
+    const speedSlider = document.getElementById('speed-limit-slider');
+    const speedLimitVal = document.getElementById('speed-limit-val');
+
+    if (speedSlider) {
+        speedSlider.addEventListener('input', (e) => {
+            const val = parseFloat(e.target.value);
+            speedLimitVal.textContent = `${val.toFixed(2)} m/s`;
+            
+            currentMaxSpeed = val;
+            currentMaxAngular = val * 5.0; // Maintain same speed ratio (0.06 -> 0.3)
+            
+            // Dynamically update D-pad buttons dataset values
+            if (buttons['btn-up']) {
+                buttons['btn-up'].dataset.linear = currentMaxSpeed;
+            }
+            if (buttons['btn-down']) {
+                buttons['btn-down'].dataset.linear = -currentMaxSpeed;
+            }
+            if (buttons['btn-left']) {
+                buttons['btn-left'].dataset.angular = currentMaxAngular;
+            }
+            if (buttons['btn-right']) {
+                buttons['btn-right'].dataset.angular = -currentMaxAngular;
+            }
+            if (buttons['btn-strafe-left']) {
+                buttons['btn-strafe-left'].dataset.strafe = currentMaxSpeed;
+            }
+            if (buttons['btn-strafe-right']) {
+                buttons['btn-strafe-right'].dataset.strafe = -currentMaxSpeed;
+            }
+        });
+
+        speedSlider.addEventListener('change', async (e) => {
+            const val = parseFloat(e.target.value);
+            const valTheta = val * 5.0;
+            try {
+                await fetch('/api/set_max_vel', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ max_vel: val, max_vel_theta: valTheta })
+                });
+            } catch (error) {
+                console.error("Failed to sync speed limit to backend", error);
+            }
+        });
+    }
+
+    // Keyboard support for WASD / Arrows / QE strafe
     document.addEventListener('keydown', (e) => {
         if (e.repeat) return;
-        
         switch(e.key) {
             case 'ArrowUp':
-            case 'w':
-            case 'W':
-                startCommand(0.5, 0);
+            case 'w': case 'W':
+                startCommand(currentMaxSpeed, 0, 0);
                 if (buttons['btn-up']) buttons['btn-up'].style.transform = 'translateY(2px)';
                 break;
             case 'ArrowDown':
-            case 's':
-            case 'S':
-                startCommand(-0.5, 0);
+            case 's': case 'S':
+                startCommand(-currentMaxSpeed, 0, 0);
                 if (buttons['btn-down']) buttons['btn-down'].style.transform = 'translateY(2px)';
                 break;
             case 'ArrowLeft':
-            case 'a':
-            case 'A':
-                startCommand(0, 1.0);
+            case 'a': case 'A':
+                startCommand(0, currentMaxAngular, 0);  // rotate left
                 if (buttons['btn-left']) buttons['btn-left'].style.transform = 'translateY(2px)';
                 break;
             case 'ArrowRight':
-            case 'd':
-            case 'D':
-                startCommand(0, -1.0);
+            case 'd': case 'D':
+                startCommand(0, -currentMaxAngular, 0); // rotate right
                 if (buttons['btn-right']) buttons['btn-right'].style.transform = 'translateY(2px)';
+                break;
+            case 'q': case 'Q':
+                startCommand(0, 0, currentMaxSpeed);   // strafe left
+                if (buttons['btn-strafe-left']) buttons['btn-strafe-left'].style.transform = 'translateY(2px)';
+                break;
+            case 'e': case 'E':
+                startCommand(0, 0, -currentMaxSpeed);  // strafe right
+                if (buttons['btn-strafe-right']) buttons['btn-strafe-right'].style.transform = 'translateY(2px)';
                 break;
             case ' ':
                 stopCommand();
@@ -632,33 +684,13 @@ document.addEventListener('DOMContentLoaded', () => {
 
     document.addEventListener('keyup', (e) => {
         switch(e.key) {
-            case 'ArrowUp':
-            case 'w':
-            case 'W':
-                stopCommand();
-                if (buttons['btn-up']) buttons['btn-up'].style.transform = '';
-                break;
-            case 'ArrowDown':
-            case 's':
-            case 'S':
-                stopCommand();
-                if (buttons['btn-down']) buttons['btn-down'].style.transform = '';
-                break;
-            case 'ArrowLeft':
-            case 'a':
-            case 'A':
-                stopCommand();
-                if (buttons['btn-left']) buttons['btn-left'].style.transform = '';
-                break;
-            case 'ArrowRight':
-            case 'd':
-            case 'D':
-                stopCommand();
-                if (buttons['btn-right']) buttons['btn-right'].style.transform = '';
-                break;
-            case ' ':
-                if (buttons['btn-stop']) buttons['btn-stop'].style.transform = '';
-                break;
+            case 'ArrowUp':    case 'w': case 'W': stopCommand(); if (buttons['btn-up'])           buttons['btn-up'].style.transform = ''; break;
+            case 'ArrowDown':  case 's': case 'S': stopCommand(); if (buttons['btn-down'])         buttons['btn-down'].style.transform = ''; break;
+            case 'ArrowLeft':  case 'a': case 'A': stopCommand(); if (buttons['btn-left'])         buttons['btn-left'].style.transform = ''; break;
+            case 'ArrowRight': case 'd': case 'D': stopCommand(); if (buttons['btn-right'])        buttons['btn-right'].style.transform = ''; break;
+            case 'q': case 'Q': stopCommand(); if (buttons['btn-strafe-left'])  buttons['btn-strafe-left'].style.transform = ''; break;
+            case 'e': case 'E': stopCommand(); if (buttons['btn-strafe-right']) buttons['btn-strafe-right'].style.transform = ''; break;
+            case ' ': if (buttons['btn-stop']) buttons['btn-stop'].style.transform = ''; break;
         }
     });
 

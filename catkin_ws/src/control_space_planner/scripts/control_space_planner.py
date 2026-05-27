@@ -308,9 +308,11 @@ class MotionPlanner:
 
     def generate_motion_primitives(self):
         primitives = []
-        # Significantly reduced sampling for performance
-        velocities = np.linspace(0.0, 0.8, 6) 
-        omegas = np.linspace(-1.5, 1.5, 11)
+        # Fetch dynamic limits from ROS parameter server
+        max_vel = rospy.get_param("/robot/max_vel", 0.06)
+        max_omega = rospy.get_param("/robot/max_vel_theta", 0.3)
+        velocities = np.linspace(0.0, max_vel, 6) 
+        omegas = np.linspace(-max_omega, max_omega, 11)
         
         self.total_primitives = 0
         for v in velocities:

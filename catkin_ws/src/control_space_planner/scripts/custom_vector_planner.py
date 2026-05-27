@@ -223,7 +223,13 @@ class CustomVectorPlanner:
             cmd.linear.y = 0.0
             cmd.angular.z = 2.0 * desired_local_yaw
         
-        # Clamp controls
+        # Clamp controls using dynamic limits
+        max_vel = rospy.get_param("/robot/max_vel", 0.06)
+        max_omega = rospy.get_param("/robot/max_vel_theta", 0.3)
+        self.MAX_VEL_X = max_vel
+        self.MAX_VEL_Y = max_vel
+        self.MAX_VEL_W = max_omega
+
         cmd.linear.x = max(0.0, min(self.MAX_VEL_X, cmd.linear.x))
         cmd.linear.y = max(-self.MAX_VEL_Y, min(self.MAX_VEL_Y, cmd.linear.y))
         cmd.angular.z = max(-self.MAX_VEL_W, min(self.MAX_VEL_W, cmd.angular.z))

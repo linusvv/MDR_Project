@@ -14,7 +14,14 @@ class StoreCoordinatorNode:
         self.publish_markers()
 
     def load_stores(self):
-        file_path = "/home/linusv/project_5/HW4/Store coordinates.txt"
+        import rospkg
+        try:
+            pkg_path = rospkg.RosPack().get_path('hw4_exploration')
+            mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
+            file_path = os.path.join(mdr_path, 'HW4', 'Store coordinates.txt')
+        except Exception:
+            file_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/Store coordinates.txt"
+
         if not os.path.exists(file_path):
             rospy.logerr(f"Store coordinates file not found at {file_path}")
             return

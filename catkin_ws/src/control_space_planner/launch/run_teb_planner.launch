@@ -7,6 +7,7 @@
             local_costmap:
                 global_frame: odom
                 robot_base_frame: base_footprint
+                transform_tolerance: 2.0
                 update_frequency: 30.0
                 publish_frequency: 30.0
                 rolling_window: true
@@ -22,6 +23,7 @@
             TebLocalPlannerROS:
                 odom_topic: /odom
                 map_frame: odom
+                transform_tolerance: 2.0
                 
                 # Trajectory Configuration
                 teb_autosize: True

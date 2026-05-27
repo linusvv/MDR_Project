@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import rospy
+import rospkg
 import cv2
 import numpy as np
 import threading
@@ -87,7 +88,14 @@ class RobotWebServer:
         self.tf_listener = tf.TransformListener()
 
         # Load AprilTag bundles configuration & Store coordinates
-        self.yaml_path = "/home/linusv/project_5/HW4/tags.yaml"
+        rospack = rospkg.RosPack()
+        try:
+            pkg_path = rospack.get_path('robot_web_ui')
+            mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
+            self.yaml_path = os.path.join(mdr_path, 'HW4', 'tags.yaml')
+        except Exception:
+            self.yaml_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/tags.yaml"
+
         self.bundles = self.load_bundles(self.yaml_path)
         self.load_tag_true_poses()
         self.sign_database = self.load_sign_database()
@@ -97,7 +105,12 @@ class RobotWebServer:
         self.last_yolo_viz_time = 0
 
         # YOLO initialization
-        model_path = "/home/linusv/project_5/catkin_ws/src/robot_web_ui/yolo_models/navigation.pt"
+        try:
+            pkg_path = rospack.get_path('robot_web_ui')
+            model_path = os.path.join(pkg_path, 'yolo_models', 'navigation.pt')
+        except Exception:
+            model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'yolo_models', 'navigation.pt')
+
         self.yolo_model = None
         if YOLO and os.path.exists(model_path):
             self.yolo_model = YOLO(model_path)
@@ -186,9 +199,9 @@ class RobotWebServer:
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             
-            # Draw AprilTags if we have camera info
+            # Draw AprilTags and YOLO overlays if we have camera info
             with self.lock:
-                if self.camera_info is not None and len(self.tag_detections) > 0:
+                if self.camera_info is not None:
                     cv_image = self.draw_tags(cv_image)
                     
                 is_paused = rospy.get_param("/exploration_paused", False)
@@ -225,8 +238,7 @@ class RobotWebServer:
 
     def cam_info_cb(self, msg):
         with self.lock:
-            if self.camera_info is None:
-                self.camera_info = msg
+            self.camera_info = msg
 
     def tags_cb(self, msg):
         with self.lock:
@@ -1404,12 +1416,24 @@ class RobotWebServer:
 
 
     def load_bundles(self, yaml_path):
+        # Resolve path using rospkg
+        try:
+            pkg_path = rospkg.RosPack().get_path('robot_web_ui')
+            mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
+            hw4_path = os.path.join(mdr_path, 'HW4', 'tags.yaml')
+        except Exception:
+            hw4_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/tags.yaml"
+
+        try:
+            apriltag_path = os.path.join(rospkg.RosPack().get_path('apriltag_localization'), 'tags.yaml')
+        except Exception:
+            apriltag_path = os.path.join(os.path.dirname(__file__), '../../AprilTagLocalization/tags.yaml')
+
         # Try multiple potential paths
         paths = [
             yaml_path,
-            "/home/linusv/project_5/HW4/tags.yaml",
-            "/home/linusv/project_5/catkin_ws/src/AprilTagLocalization/tags.yaml",
-            os.path.join(os.path.dirname(__file__), '../../AprilTagLocalization/tags.yaml')
+            hw4_path,
+            apriltag_path
         ]
         
         for path in paths:
@@ -1565,7 +1589,11 @@ class RobotWebServer:
             self.local_costmap = msg
 
     def load_tag_true_poses(self):
-        active_yaml = "/home/linusv/project_5/catkin_ws/src/AprilTagLocalization/config/2025/re540_simulation.yaml"
+        try:
+            apriltag_path = rospkg.RosPack().get_path('apriltag_localization')
+            active_yaml = os.path.join(apriltag_path, 'config', '2025', 're540_simulation.yaml')
+        except Exception:
+            active_yaml = os.path.join(os.path.dirname(__file__), '../../AprilTagLocalization/config/2025/re540_simulation.yaml')
         self.tag_true_poses = {}
         if os.path.exists(active_yaml):
             try:
@@ -1602,7 +1630,12 @@ class RobotWebServer:
 
     def load_sign_database(self):
         db = []
-        path = "/home/linusv/project_5/HW4/signboards.yaml"
+        try:
+            pkg_path = rospkg.RosPack().get_path('robot_web_ui')
+            mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
+            path = os.path.join(mdr_path, 'HW4', 'signboards.yaml')
+        except Exception:
+            path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/signboards.yaml"
         if os.path.exists(path):
             try:
                 with open(path, 'r') as f:
@@ -1946,16 +1979,24 @@ def api_status():
         has_key = True
     elif os.getenv("OPENAI_API_KEY", "").strip().startswith("sk-"):
         has_key = True
-    elif os.path.exists("/home/linusv/project_5/HW4/ChatGPT_API_KEY.txt"):
+    else:
         try:
-            with open("/home/linusv/project_5/HW4/ChatGPT_API_KEY.txt", "r") as f:
-                content = f.read().strip()
-            import re
-            match = re.search(r'\b(sk-[a-zA-Z0-9_-]+)\b', content)
-            if match:
-                has_key = True
+            pkg_path = rospkg.RosPack().get_path('robot_web_ui')
+            mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
+            key_file = os.path.join(mdr_path, 'HW4', 'ChatGPT_API_KEY.txt')
         except Exception:
-            pass
+            key_file = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/ChatGPT_API_KEY.txt"
+
+        if os.path.exists(key_file):
+            try:
+                with open(key_file, "r") as f:
+                    content = f.read().strip()
+                import re
+                match = re.search(r'\b(sk-[a-zA-Z0-9_-]+)\b', content)
+                if match:
+                    has_key = True
+            except Exception:
+                pass
 
     local_planner = rospy.get_param("/local_planner_type", "teb")
 
@@ -2010,13 +2051,41 @@ def cmd_vel():
     data = request.json
     linear = float(data.get('linear', 0.0))
     angular = float(data.get('angular', 0.0))
-    
+    strafe  = float(data.get('strafe',  0.0))  # mecanum sideways (linear.y)
+
     twist = Twist()
-    twist.linear.x = linear
+    twist.linear.x  = linear
+    twist.linear.y  = strafe   # mecanum strafe: positive = left, negative = right
     twist.angular.z = angular
-    
+
     server.cmd_vel_pub.publish(twist)
     return jsonify({"status": "success"})
+
+@app.route('/api/set_max_vel', methods=['POST'])
+def set_max_vel():
+    data = request.json or {}
+    max_vel = float(data.get('max_vel', 0.06))
+    max_vel_theta = float(data.get('max_vel_theta', max_vel * 5.0))
+    
+    rospy.set_param("/robot/max_vel", max_vel)
+    rospy.set_param("/robot/max_vel_theta", max_vel_theta)
+    rospy.loginfo(f"Setting /robot/max_vel={max_vel}, /robot/max_vel_theta={max_vel_theta}")
+    
+    # Try dynamic reconfigure for TEB
+    try:
+        import dynamic_reconfigure.client
+        client = dynamic_reconfigure.client.Client("teb_planner_node/TebLocalPlannerROS", timeout=0.5)
+        client.update_configuration({
+            "max_vel_x": max_vel,
+            "max_vel_x_backwards": max_vel,
+            "max_vel_y": max_vel,
+            "max_vel_theta": max_vel_theta
+        })
+        rospy.loginfo("TEB Local Planner velocity bounds dynamically reconfigured.")
+    except Exception as e:
+        rospy.logwarn(f"Could not reconfigure TEB Local Planner velocity bounds: {e}")
+        
+    return jsonify({"status": "success", "max_vel": max_vel, "max_vel_theta": max_vel_theta})
 
 @app.route('/api/set_ai_mode', methods=['POST'])
 def set_ai_mode():

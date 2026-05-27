@@ -650,7 +650,7 @@ class RobotWebServer:
             depth_raw = getattr(self, 'depth_raw', None)
             
         if img is not None:
-            results = self.yolo_model.predict(img, conf=0.65, verbose=False)
+            results = self.yolo_model.predict(img, conf=0.8, verbose=False)
             for res in results:
                 for box in res.boxes:
                     label = res.names[int(box.cls[0])].upper()
@@ -1275,7 +1275,7 @@ class RobotWebServer:
                 img = self.color_image.copy() if self.color_image is not None else None
             
             if img is not None:
-                results = self.yolo_model.predict(img, conf=0.4, verbose=False)
+                results = self.yolo_model.predict(img, conf=0.8, verbose=False)
                 for res in results:
                     for box in res.boxes:
                         label = res.names[int(box.cls[0])].upper()
@@ -1312,7 +1312,7 @@ class RobotWebServer:
                 rate.sleep()
                 continue
                 
-            results = self.yolo_model.predict(img, conf=0.4, verbose=False)
+            results = self.yolo_model.predict(img, conf=0.8, verbose=False)
             best_box = None
             for res in results:
                 for box in res.boxes:

@@ -328,51 +328,6 @@ input:checked + .slider:before{transform:translateX(24px);}
     }
 }
 
-/* Exploration Map Legend */
-.legend-container {
-    margin-top: 1rem;
-    border-top: 1px solid rgba(255, 255, 255, 0.1);
-    padding-top: 1rem;
-}
-.legend-container h3 {
-    font-size: 0.8rem;
-    margin-bottom: 0.6rem;
-    color: #94a3b8;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    font-weight: 600;
-}
-.legend-grid {
-    display: grid;
-    grid-template-columns: repeat(2, 1fr);
-    gap: 0.5rem;
-    max-height: 180px;
-    overflow-y: auto;
-    padding-right: 0.2rem;
-}
-.legend-item {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    background: rgba(255, 255, 255, 0.02);
-    padding: 0.4rem 0.6rem;
-    border-radius: 6px;
-    font-size: 0.78rem;
-    color: #cbd5e1;
-    border: 1px solid rgba(255, 255, 255, 0.03);
-}
-.legend-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    display: inline-block;
-}
-.legend-dot.unmapped { background: #06b6d4; }
-.legend-dot.cafe { background: #b45309; }
-.legend-dot.store { background: #fbbf24; }
-.legend-dot.burger { background: #ef4444; }
-.legend-dot.pharmacy { background: #8b5cf6; }
-
 /* Delivery Chatbot Interface */
 .chat-container {
     display: flex;

@@ -23,7 +23,7 @@ import json
 from std_msgs.msg import String
 from gpt_llm_client.srv import LLMQuery, LLMQueryRequest
 from std_srvs.srv import Empty as EmptySrv
-from hw4_exploration.srv import DetectShopfront, DetectShopfrontRequest
+
 
 try:
     from apriltag_ros.msg import AprilTagDetectionArray
@@ -68,7 +68,6 @@ class RobotWebServer:
         self.tasks_fulfilled = 0
         self.overshoot_m = 0.0
         self.detected_tags = {}
-        self.shop_categories = {}
         self.local_costmap = None
         self.motion_candidates = []
         self.selected_motion_pts = []
@@ -91,7 +90,6 @@ class RobotWebServer:
         # Load AprilTag bundles configuration & Store coordinates
         self.yaml_path = "/home/linusv/project_5/HW4/tags.yaml"
         self.bundles = self.load_bundles(self.yaml_path)
-        self.load_stores_from_txt()
         self.load_tag_true_poses()
         self.sign_database = self.load_sign_database()
         
@@ -139,7 +137,6 @@ class RobotWebServer:
         rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.cam_info_cb)
         rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.map_cb)
         rospy.Subscriber('/map/local_map/obstacle', OccupancyGrid, self.local_map_cb)
-        rospy.Subscriber('/semantic_observations', String, self.semantic_cb)
         rospy.Subscriber('/points/selected_motion', PointCloud2, self.motion_cb)
         rospy.Subscriber('/points/motion_primitives', PointCloud2, self.motion_candidates_cb)
         rospy.Subscriber('/car/trunc_target', PoseStamped, self.target_cb)
@@ -911,16 +908,6 @@ class RobotWebServer:
 
 
 
-    def start_delivery_search(self, category):
-        """Starts the complex workflow: Find sign -> Go to sign -> Align -> Crab search."""
-        self.stop_robot() # Reset all states
-        
-        self.active_delivery_task = category.upper()
-        self.task_thread = threading.Thread(target=self.delivery_search_workflow, args=(self.active_delivery_task,))
-        self.task_thread.daemon = True
-        self.task_thread.start()
-        return True
-
     def delivery_search_workflow(self, target_category, is_part_of_task=False):
         success = False
         try:
@@ -1255,166 +1242,6 @@ class RobotWebServer:
         rospy.loginfo("[Shopping List] Sequential shopping list workflow completed.")
         self.active_delivery_task = None
 
-    def visual_servoing_to_shop(self, target_category):
-        """Rotates to find the shop, then uses visual servoing to approach perpendicularly."""
-        if not self.yolo_model:
-            rospy.logerr("YOLO model not loaded. Skipping visual servoing.")
-            return False
-
-        rate = rospy.Rate(10)
-        found = False
-        start_time = rospy.Time.now()
-        
-        # --- PHASE 1: ROTATE TO FIND ---
-        rospy.loginfo("[Visual Servoing] Phase 1: Rotating to find target...")
-        while not rospy.is_shutdown() and self.active_delivery_task and not found:
-            if (rospy.Time.now() - start_time).to_sec() > 25.0: # Timeout
-                break
-                
-            with self.lock:
-                img = self.color_image.copy() if self.color_image is not None else None
-            
-            if img is not None:
-                results = self.yolo_model.predict(img, conf=0.8, verbose=False)
-                for res in results:
-                    for box in res.boxes:
-                        label = res.names[int(box.cls[0])].upper()
-                        if target_category in label or label in target_category or \
-                           ("CAFE" in target_category and "CAFE" in label) or \
-                           ("HAMBURGER" in target_category and "HAMBURGER" in label) or \
-                           ("PHARMACY" in target_category and "PHARMACY" in label) or \
-                           ("PICKUP" in target_category and "PICK" in label):
-                            found = True
-                            break
-                if found: break
-
-            # Slow search rotation
-            cmd = Twist()
-            cmd.angular.z = 0.5
-            self.cmd_vel_pub.publish(cmd)
-            rate.sleep()
-            
-        if not found:
-            self.cmd_vel_pub.publish(Twist())
-            return False
-
-        # --- PHASE 2: APPROACH PERPENDICULARLY ---
-        rospy.loginfo("[Visual Servoing] Phase 2: Approaching shopfront...")
-        arrived = False
-        consecutive_lost_frames = 0
-        
-        while not rospy.is_shutdown() and self.active_delivery_task and not arrived:
-            with self.lock:
-                img = self.color_image.copy() if self.color_image is not None else None
-                depth_raw = getattr(self, 'depth_raw', None)
-            
-            if img is None: 
-                rate.sleep()
-                continue
-                
-            results = self.yolo_model.predict(img, conf=0.8, verbose=False)
-            best_box = None
-            for res in results:
-                for box in res.boxes:
-                    label = res.names[int(box.cls[0])].upper()
-                    if target_category in label or label in target_category or \
-                       ("CAFE" in target_category and "CAFE" in label) or \
-                       ("HAMBURGER" in target_category and "HAMBURGER" in label):
-                        best_box = box.xyxy[0]
-                        break
-            
-            if best_box is None:
-                consecutive_lost_frames += 1
-                # If we've already reached 60cm, just consider it arrived rather than failing
-                if dist_to_shop < 0.6:
-                    rospy.loginfo("[Visual Servoing] Target filled view/lost at close range. Assuming arrival.")
-                    arrived = True
-                    break
-                
-                if consecutive_lost_frames > 20: # Lost for 2 seconds
-                    rospy.logwarn("[Visual Servoing] Lost target visibility.")
-                    break
-                self.cmd_vel_pub.publish(Twist())
-                rate.sleep()
-                continue
-            
-            consecutive_lost_frames = 0
-            
-            # 1. Horizontal Centering (Angular)
-            img_w = img.shape[1]
-            box_center_x = (best_box[0] + best_box[2]) / 2.0
-            x_offset = (box_center_x - img_w/2.0) / (img_w/2.0) # -1 to 1
-            
-            # 2. Distance and Perpendicularity (Depth)
-            dist_to_shop = 2.0 # Default
-            angle_error = 0.0
-            
-            if depth_raw is not None:
-                # Extract depth ROI around the box
-                y1, x1, y2, x2 = int(best_box[1]), int(best_box[0]), int(best_box[3]), int(best_box[2])
-                
-                # Use a larger slice of the image to check depth even if box is at edge
-                roi_y1 = max(0, y1)
-                roi_y2 = min(depth_raw.shape[0], y2)
-                roi_x1 = max(0, x1)
-                roi_x2 = min(depth_raw.shape[1], x2)
-                roi = depth_raw[roi_y1:roi_y2, roi_x1:roi_x2]
-                
-                if roi.size > 0:
-                    valid_depths = roi[roi > 0.1]
-                    if valid_depths.size > 0:
-                        # Use 15th percentile to ensure we are looking at the 'front-most' edge
-                        # This prevents overshooting into the shop interior
-                        dist_to_shop = np.percentile(valid_depths, 15) 
-                        
-                        # Sanity check for Millimeters vs Meters
-                        if dist_to_shop > 50.0: dist_to_shop /= 1000.0
-                        
-                        # Check perpendicularity: depth left vs right
-                        half_w = roi.shape[1] // 2
-                        if half_w > 5:
-                            left_roi = roi[:, :half_w]
-                            right_roi = roi[:, half_w:]
-                            left_v = left_roi[left_roi > 0.1]
-                            right_v = right_roi[right_roi > 0.1]
-                            
-                            if left_v.size > 0 and right_v.size > 0:
-                                left_depth = np.median(left_v)
-                                right_depth = np.median(right_v)
-                                angle_error = (left_depth - right_depth) # Slant
-
-            # 3. Control Logic
-            cmd = Twist()
-            
-            # Distance stop (60cm)
-            if dist_to_shop < 0.60:
-                rospy.loginfo(f"[Visual Servoing] Target reached at {dist_to_shop:.2f}m")
-                arrived = True
-                break
-                
-            # Forward velocity (Proportional to distance)
-            # P-controller for distance: goal is 0.6m
-            dist_error = dist_to_shop - 0.60
-            cmd.linear.x = 0.3 * dist_error
-            
-            # Side strafe (To get perpendicular)
-            # Higher gain for alignment
-            cmd.linear.y = -0.6 * angle_error 
-            
-            # Turn to keep centered
-            cmd.angular.z = -1.5 * x_offset 
-            
-            # Safety checks/Clamping
-            cmd.linear.x = np.clip(cmd.linear.x, 0.0, 0.2)
-            cmd.linear.y = np.clip(cmd.linear.y, -0.2, 0.2)
-            cmd.angular.z = np.clip(cmd.angular.z, -0.6, 0.6)
-            
-            self.cmd_vel_pub.publish(cmd)
-            rate.sleep()
-            
-        self.cmd_vel_pub.publish(Twist()) # Final stop
-        return arrived
-
     def rotate_to_yaw(self, target_yaw, p_gain=1.5, speed_limit=0.8, threshold=0.03):
         """Simple proportional controller for rotation in-place."""
         rate = rospy.Rate(10)
@@ -1521,69 +1348,6 @@ class RobotWebServer:
         self.navigating_to_tag = False
         self.stop_search(keep_delivery=getattr(self, 'is_part_of_task', False))
 
-    def choose_random_free_goal(self):
-        rx, ry, _ = self.get_current_robot_pose()
-        
-        with self.lock:
-            grid_map = self.grid_map if hasattr(self, 'grid_map') else None
-            
-        if grid_map is None:
-            # Fallback if map not ready
-            import random
-            angle = random.uniform(0, 2 * math.pi)
-            gx = rx + 2.0 * math.cos(angle)
-            gy = ry + 2.0 * math.sin(angle)
-            return gx, gy
-            
-        width = grid_map.info.width
-        height = grid_map.info.height
-        resolution = grid_map.info.resolution
-        origin = grid_map.info.origin
-        
-        if width == 0 or height == 0:
-            import random
-            angle = random.uniform(0, 2 * math.pi)
-            gx = rx + 2.0 * math.cos(angle)
-            gy = ry + 2.0 * math.sin(angle)
-            return gx, gy
-            
-        import random
-        map_data = np.array(grid_map.data, dtype=np.int8).reshape((height, width))
-        
-        for _ in range(100):
-            angle = random.uniform(0, 2 * math.pi)
-            distance = random.uniform(1.5, 3.5)
-            
-            gx = rx + distance * math.cos(angle)
-            gy = ry + distance * math.sin(angle)
-            
-            col = int((gx - origin.position.x) / resolution)
-            row = int((gy - origin.position.y) / resolution)
-            
-            if 0 <= col < width and 0 <= row < height:
-                if map_data[row, col] == 0:
-                    inflation_ok = True
-                    check_r = 2
-                    for r in range(-check_r, check_r + 1):
-                        for c in range(-check_r, check_r + 1):
-                            nr = row + r
-                            nc = col + c
-                            if 0 <= nc < width and 0 <= nr < height:
-                                if map_data[nr, nc] != 0:
-                                    inflation_ok = False
-                                    break
-                        if not inflation_ok:
-                            break
-                            
-                    if inflation_ok:
-                        return gx, gy
-                        
-        # Final fallback
-        angle = random.uniform(0, 2 * math.pi)
-        gx = rx + 2.0 * math.cos(angle)
-        gy = ry + 2.0 * math.sin(angle)
-        return gx, gy
-
     def publish_path_to_goal(self, gx, gy):
         path = Path()
         path.header.frame_id = "map"
@@ -1638,23 +1402,6 @@ class RobotWebServer:
         cmd.angular.z = 0.0
         self.cmd_vel_pub.publish(cmd)
         rospy.sleep(1.0)
-
-
-    def project_store_to_map(self, store):
-        store_pt = np.array([store[0], store[1]])
-        with self.lock:
-            R = self.R
-            T = self.T
-        store_map = np.dot(R, store_pt) + T
-        return store_map[0], store_map[1]
-
-    def semantic_cb(self, msg):
-        try:
-            obs = json.loads(msg.data)
-            # semantic logic is disabled as it relies on old pre-mapped stores
-        except Exception as e:
-            rospy.logerr(f"Error in web server semantic_cb: {e}")
-
 
 
     def load_bundles(self, yaml_path):
@@ -1818,23 +1565,6 @@ class RobotWebServer:
         with self.lock:
             self.local_costmap = msg
 
-    def load_stores_from_txt(self):
-        file_path = "/home/linusv/project_5/HW4/Store coordinates.txt"
-        if os.path.exists(file_path):
-            try:
-                with open(file_path, "r") as f:
-                    lines = f.readlines()
-                for line in lines:
-                    line = line.strip()
-                    if line.startswith("#") or not line:
-                        continue
-                    match = re.search(r'\(([^,]+),\s*([^)]+)\)', line)
-                    if match:
-                        pass # Ignore file stores, we use dynamic mapped_shops now
-                rospy.loginfo("Web UI ignored file stores (using dynamic mapped_shops now).")
-            except Exception as e:
-                rospy.logwarn(f"Failed to load stores in Web UI: {e}")
-
     def load_tag_true_poses(self):
         active_yaml = "/home/linusv/project_5/catkin_ws/src/AprilTagLocalization/config/2025/re540_simulation.yaml"
         self.tag_true_poses = {}
@@ -1900,43 +1630,6 @@ class RobotWebServer:
                 rospy.logerr(f"Error loading sign database (YAML): {e}")
         return db
 
-    def estimate_rigid_transform_2d(self, pts_true, pts_meas, true_yaws=None, meas_yaws=None):
-        n = len(pts_true)
-        if n == 0:
-            return self.R, self.T
-        elif n == 1:
-            if true_yaws is not None and meas_yaws is not None and len(true_yaws) > 0 and len(meas_yaws) > 0:
-                theta = meas_yaws[0] - true_yaws[0]
-                R = np.array([
-                    [np.cos(theta), -np.sin(theta)],
-                    [np.sin(theta),  np.cos(theta)]
-                ])
-                T = np.array(pts_meas[0]) - np.dot(R, np.array(pts_true[0]))
-                return R, T
-            else:
-                tx = pts_meas[0][0] - pts_true[0][0]
-                ty = pts_meas[0][1] - pts_true[0][1]
-                return np.eye(2), np.array([tx, ty])
-            
-        pts_true = np.array(pts_true)
-        pts_meas = np.array(pts_meas)
-        
-        centroid_true = np.mean(pts_true, axis=0)
-        centroid_meas = np.mean(pts_meas, axis=0)
-        
-        pts_true_c = pts_true - centroid_true
-        pts_meas_c = pts_meas - centroid_meas
-        
-        H = np.dot(pts_true_c.T, pts_meas_c)
-        U, S, Vt = np.linalg.svd(H)
-        R = np.dot(Vt.T, U.T)
-        
-        if np.linalg.det(R) < 0:
-            Vt[1, :] *= -1
-            R = np.dot(Vt.T, U.T)
-            
-        T = centroid_meas - np.dot(R, centroid_true)
-        return R, T
 
     def generate_map_frames(self):
         rate = rospy.Rate(5) # 5 Hz is perfect
@@ -2008,12 +1701,7 @@ class RobotWebServer:
                                 cv2.arrowedLine(color_map, (r_col, r_row_flipped), (arrow_end_x, arrow_end_y), (255, 255, 255), 2, tipLength=0.3)
                         except Exception:
                             pass
-                                            # Build matched point sets for 2D rigid transform estimation
-                    pts_true = []
-                    pts_meas = []
-                    true_yaws = []
-                    meas_yaws = []
-                    
+                                            
                     # Try to lookup transform map -> odom
                     if self.tf_listener.canTransform('map', 'odom', rospy.Time(0)):
                         try:
@@ -2024,52 +1712,6 @@ class RobotWebServer:
                         except Exception:
                             pass
                     T_map_odom = self.T_map_odom
-                        
-                    for tag_id, tag_pose_odom in self.detected_tags.items():
-                        signboard_name = None
-                        for ids, bundle in self.bundles.items():
-                            if tag_id in ids:
-                                signboard_name = bundle['name']
-                                break
-                        if signboard_name and signboard_name in self.tag_true_poses:
-                            # Get true pose position and yaw
-                            x_true, y_true, psi_deg = self.tag_true_poses[signboard_name]
-                            pts_true.append((x_true, y_true))
-                            
-                            # True yaw in world frame including orientation correction
-                            q_x90 = tf.transformations.quaternion_about_axis(math.radians(90), [0, 1, 0])
-                            q_y_90 = tf.transformations.quaternion_about_axis(math.radians(-90), [1, 0, 0])
-                            q_correction = tf.transformations.quaternion_multiply(q_x90, q_y_90)
-                            q_heading = tf.transformations.quaternion_about_axis(math.radians(psi_deg), [0, 0, 1])
-                            q_true = tf.transformations.quaternion_multiply(q_heading, q_correction)
-                            yaw_true = tf.transformations.euler_from_quaternion(q_true)[2]
-                            true_yaws.append(yaw_true)
-                            
-                            # Measured pose position and yaw in map frame
-                            tag_trans_odom, tag_rot_odom = tag_pose_odom
-                            
-                            # T_odom_tag
-                            T_odom_tag = tf.transformations.quaternion_matrix(tag_rot_odom)
-                            T_odom_tag[:3, 3] = tag_trans_odom
-                            
-                            # T_map_tag = T_map_odom * T_odom_tag
-                            T_map_tag = np.dot(T_map_odom, T_odom_tag)
-                            
-                            pt_map_x = T_map_tag[0, 3]
-                            pt_map_y = T_map_tag[1, 3]
-                            pts_meas.append((pt_map_x, pt_map_y))
-                            
-                            q_meas = tf.transformations.quaternion_from_matrix(T_map_tag)
-                            yaw_meas = tf.transformations.euler_from_quaternion(q_meas)[2]
-                            meas_yaws.append(yaw_meas)
-                            
-                    # Dynamic rigid transform estimation removed for simulation alignment consistency.
-                    # R, T = self.estimate_rigid_transform_2d(pts_true, pts_meas, true_yaws, meas_yaws)
-                    # with self.lock:
-                    #     self.R = R
-                    #     self.T = T
-                    
- 
                                         
                     # Draw persistently detected AprilTags
                     for tag_id, tag_pose_odom in self.detected_tags.items():
@@ -2675,15 +2317,9 @@ def delivery_send():
         
     return jsonify({"reply": reply, "tasks": tasks})
 
-@app.route('/api/semantic_map')
-def api_semantic_map():
-    # Return server.shop_categories for UI legends and mapping
-    return jsonify(server.shop_categories)
-
 @app.route('/api/reset', methods=['POST'])
 def api_reset():
     # 1. Reset local lists/dictionaries in the web server
-    server.shop_categories = {}
     server.detected_tags = {}
     server.grid_map = None
     if hasattr(server, 'trail'):

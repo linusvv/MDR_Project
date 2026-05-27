@@ -50,40 +50,7 @@ class VisionPerceptionNode:
             rospy.logwarn(f"CvBridge conversion error: {e}")
 
     def load_templates(self):
-        if not os.path.exists(self.template_dir):
-            rospy.logwarn(f"Templates directory not found at {self.template_dir}")
-            return
-            
-        storefront_files = [
-            "BLUE CAFE.png", "BLUE STORE.png", "GREEN STORE.png", 
-            "ORANGE CAFE.png", "RED BURGER.png", "RED PHARMACY.png", 
-            "WHITE CAFE.png", "YELLOW BURGER.png"
-        ]
-        
-        self.orb = cv2.ORB_create(nfeatures=1000)
-        self.template_descriptors = {}
-        self.template_keypoints = {}
-        
-        for name in storefront_files:
-            path = os.path.join(self.template_dir, name)
-            if os.path.exists(path):
-                img = cv2.imread(path)
-                if img is not None:
-                    # Downscale the huge template once on startup to avoid memory bloat and aliasing
-                    h, w = img.shape[:2]
-                    scale = 640.0 / max(h, w)
-                    img_resized = cv2.resize(img, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
-                    
-                    self.templates[name.replace(".png", "")] = img_resized
-                    
-                    # Pre-compute ORB keypoints and descriptors
-                    kp, des = self.orb.detectAndCompute(img_resized, None)
-                    if des is not None:
-                        self.template_descriptors[name.replace(".png", "")] = des
-                        self.template_keypoints[name.replace(".png", "")] = kp
-                        rospy.loginfo(f"Loaded template and extracted ORB features: {name} (size: {img_resized.shape[1]}x{img_resized.shape[0]})")
-                    else:
-                        rospy.logwarn(f"Failed to compute ORB descriptors for template: {name}")
+        rospy.loginfo("Local ORB feature matching is disabled.")
 
     def get_latest_frame(self):
         with self.image_lock:
@@ -250,69 +217,6 @@ class VisionPerceptionNode:
             rospy.logwarn(f"Color classification error: {e}")
         return None
 
-    def classify_locally_opencv(self, frame):
-        """
-        Local OpenCV fallback using ORB feature matching and color confirmation.
-        Extremely robust and does not require active API calls.
-        """
-        if not hasattr(self, "orb") or not self.template_descriptors:
-            rospy.logwarn("ORB matching templates not loaded. Bypassing classification.")
-            return None
-            
-        try:
-            # 1. Run color classifier first (very robust to distant views)
-            color_class = self.classify_by_color_histogram(frame)
-            rospy.loginfo(f"[Local Perceptor] HSV Color Segmenter got: {color_class}")
-
-            # 2. Detect ORB features in the camera frame
-            kp_frame, des_frame = self.orb.detectAndCompute(frame, None)
-            if des_frame is None:
-                # If no features, fallback to pure color class if found
-                if color_class:
-                    rospy.loginfo(f"[Local Perceptor] No ORB descriptors, falling back to HSV color class: {color_class}")
-                    return color_class
-                return None
-                
-            bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
-            best_match = None
-            max_good_matches = 0
-            
-            for name, des_temp in self.template_descriptors.items():
-                matches = bf.match(des_temp, des_frame)
-                # Filter matches by distance
-                good_matches = [m for m in matches if m.distance < 64.0]
-                num_good = len(good_matches)
-                rospy.loginfo(f"[ORB Match] storefront {name}: {num_good} good matches")
-                if num_good > max_good_matches:
-                    max_good_matches = num_good
-                    best_match = name
-            
-            rospy.loginfo(f"[Local Perceptor] Best ORB match: {best_match} with {max_good_matches} matches")
-
-            # 3. Decision Logic combining features and colors
-            if best_match:
-                if color_class:
-                    base_best = best_match.split()[0]
-                    base_color = color_class.split()[0]
-                    if base_best == base_color:
-                        if max_good_matches >= 2:
-                            rospy.loginfo(f"[Local Perceptor] ORB + HSV agreement confirmed: {best_match}")
-                            return best_match
-                    else:
-                        rospy.logwarn(f"[Local Perceptor] Conflict: ORB got {best_match}, HSV got {color_class}")
-                        if max_good_matches >= 15:
-                            return best_match
-                else:
-                    if max_good_matches >= 5:
-                        rospy.loginfo(f"[Local Perceptor] High-confidence ORB feature match accepted: {best_match}")
-                        return best_match
-                        
-        except Exception as e:
-            rospy.logwarn(f"ORB local classification error: {e}")
-            
-        return None
-
-
     def handle_detect_shopfront(self, req):
         rospy.loginfo(f"[/detect_shopfront] Requested for target: {req.target_shop}")
         res = DetectShopfrontResponse()
@@ -323,8 +227,8 @@ class VisionPerceptionNode:
             rospy.logwarn("No camera frame available to detect storefront.")
             return res
             
-        # Try local OpenCV classification first
-        detected_store = self.classify_locally_opencv(frame)
+        # Try local OpenCV color classification first
+        detected_store = self.classify_by_color_histogram(frame)
         
         # If local classification is uncertain, call the VLM API
         if detected_store is None:

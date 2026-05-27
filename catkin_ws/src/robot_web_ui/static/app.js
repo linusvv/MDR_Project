@@ -667,7 +667,6 @@ document.addEventListener('DOMContentLoaded', () => {
     const shopsCountEl = document.getElementById('shops-count');
     const mapCoverageEl = document.getElementById('map-coverage');
     const tasksCountEl = document.getElementById('tasks-fulfilled');
-    const legendGrid = document.getElementById('legend-grid');
 
     let lastChatCount = 0;
     const syncChat = (messages) => {
@@ -987,35 +986,6 @@ document.addEventListener('DOMContentLoaded', () => {
         }
     };
 
-    const updateLegend = async () => {
-        try {
-            const res = await fetch('/api/semantic_map');
-            const mapData = await res.json();
-            
-            for (let i = 0; i < 8; i++) {
-                const item = legendGrid.querySelector(`.legend-item[data-idx="${i}"]`);
-                if (!item) continue;
-                
-                if (mapData[i]) {
-                    const store = mapData[i];
-                    const sf = store.storefront;
-                    const cat = store.category;
-                    
-                    let dotClass = 'unmapped';
-                    if (cat === 'Café') dotClass = 'cafe';
-                    else if (cat === 'Convenience store') dotClass = 'store';
-                    else if (cat === 'Fast-food restaurant') dotClass = 'burger';
-                    else if (cat === 'Pharmacy') dotClass = 'pharmacy';
-                    
-                    item.innerHTML = `<span class="legend-dot ${dotClass}"></span> S${i+1}: ${sf} (${cat})`;
-                } else {
-                    item.innerHTML = `<span class="legend-dot unmapped"></span> S${i+1}: Unmapped`;
-                }
-            }
-        } catch (error) {
-            console.error("Failed to fetch semantic map for legend", error);
-        }
-    };
 
     // Reset Robot & Map button click handler
     const btnReset = document.getElementById('btn-reset');
@@ -1041,10 +1011,8 @@ document.addEventListener('DOMContentLoaded', () => {
                 if (chatMessages) {
                     chatMessages.innerHTML = '<div class="msg bot">Hello! I am your AI delivery robot. Tell me what product or storefront you want me to find, and I will search the map or interpret signboards to bring it to you!</div>';
                 }
-                
                 // Force instant telemetry refresh
                 updateTelemetry();
-                updateLegend();
             } catch (error) {
                 console.error("Failed to reset robot and map", error);
                 logConsole("Error: Reset command failed. Check server status.");
@@ -1056,12 +1024,9 @@ document.addEventListener('DOMContentLoaded', () => {
 
     // Trigger initial poll
     updateTelemetry();
-    updateLegend();
 
     // Poll status every 500ms
     setInterval(updateTelemetry, 500);
     // Poll logs every 500ms
     setInterval(updateLogs, 500);
-    // Poll semantic map legend every 1000ms
-    setInterval(updateLegend, 1000);
 });

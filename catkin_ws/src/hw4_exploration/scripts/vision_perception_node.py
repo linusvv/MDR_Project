@@ -20,11 +20,6 @@ class VisionPerceptionNode:
         self.image_lock = threading.Lock()
         self.latest_cv_image = None
         
-        # Load storefront templates for local OpenCV classification fallback
-        self.templates = {}
-        self.template_dir = "/home/linusv/project_5/HW4/Stores"
-        self.load_templates()
-        
         # Subscribe to RealSense RGB camera topic
         self.image_sub = rospy.Subscriber("/camera/color/image_raw", Image, self.image_cb)
         
@@ -48,9 +43,6 @@ class VisionPerceptionNode:
                 self.latest_cv_image = cv_img
         except Exception as e:
             rospy.logwarn(f"CvBridge conversion error: {e}")
-
-    def load_templates(self):
-        rospy.loginfo("Local ORB feature matching is disabled.")
 
     def get_latest_frame(self):
         with self.image_lock:

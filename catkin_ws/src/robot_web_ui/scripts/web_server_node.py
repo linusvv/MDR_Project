@@ -20,7 +20,6 @@ import tf
 import tf.transformations
 
 import json
-from std_msgs.msg import String
 from gpt_llm_client.srv import LLMQuery, LLMQueryRequest
 from std_srvs.srv import Empty as EmptySrv
 
@@ -128,7 +127,6 @@ class RobotWebServer:
 
         # ROS Publishers
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
-        self.user_prompt_pub = rospy.Publisher('/user_prompt', String, queue_size=5)
         self.path_pub = rospy.Publisher('/graph_planner/path/global_path', Path, queue_size=5)
 
         # ROS Subscribers
@@ -1967,7 +1965,6 @@ def api_status():
         "explored_area": round(server.map_coverage_m2, 1) if hasattr(server, 'map_coverage_m2') else 0.0,
         "shops_detected": len(server.mapped_shops) if hasattr(server, "mapped_shops") else 0,
         "tasks_fulfilled": server.tasks_fulfilled if hasattr(server, 'tasks_fulfilled') else 0,
-        "tags_detected": len(server.detected_tags) if hasattr(server, 'detected_tags') else 0,
         "exploration_status": status_str,
         "exploration_state": explore_state,
         "has_api_key": has_key,

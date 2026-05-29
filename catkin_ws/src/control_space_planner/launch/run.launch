@@ -1,10 +1,4 @@
 <launch>
- <!-- Turn on control_space_planner C++ node -->
- <node name="control_space_planner_node" pkg="control_space_planner" type="control_space_planner_node" output="screen"/> 
- 
  <!-- Turn on TEB Local Planner node -->
  <include file="$(find control_space_planner)/launch/run_teb_planner.launch" />
-
- <!-- Turn on Custom Vector Local Planner node -->
- <node name="custom_vector_planner" pkg="control_space_planner" type="custom_vector_planner.py" output="screen"/>
 </launch>

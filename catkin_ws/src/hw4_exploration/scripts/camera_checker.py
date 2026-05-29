@@ -14,10 +14,16 @@ def check_and_start():
     time.sleep(2.5)
     
     rospy.loginfo("[Camera Checker] Launching realsense2_camera rs_aligned_depth.launch...")
-    # Start realsense camera with enable_pointcloud:=true to get the point cloud for costmap generator
+    # Disable unused camera-side pointcloud to save CPU and limit framerates to 15 FPS
     cmd = [
         "roslaunch", "realsense2_camera", "rs_aligned_depth.launch",
-        "enable_pointcloud:=true"
+        "enable_pointcloud:=false",
+        "depth_fps:=15",
+        "color_fps:=15",
+        "depth_width:=640",
+        "depth_height:=480",
+        "color_width:=1280",
+        "color_height:=720"
     ]
     proc = subprocess.Popen(cmd)
     

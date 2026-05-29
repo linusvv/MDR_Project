@@ -4,7 +4,7 @@ from cv_bridge import CvBridge
 from ultralytics import YOLO
 import cv2
 
-model = YOLO("/home/ee478_team1/catkin_ws/src/controller/best.engine", task="detect")
+model = YOLO("/home/ee478_team1/catkin_ws/src/MDR_Project/catkin_ws/src/controller/best.engine", task="detect")
 bridge = CvBridge()
 
 def callback(msg):
@@ -19,6 +19,6 @@ def callback(msg):
     cv2.waitKey(1)
 
 rospy.init_node("yolo_detector")
-rospy.Subscriber("/camera/color/image_raw", Image, callback)
+rospy.Subscriber("/usb_cam/image_raw", Image, callback)
 print("Warte auf Kamerabilder...")
 rospy.spin()

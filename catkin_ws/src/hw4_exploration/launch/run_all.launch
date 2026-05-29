@@ -49,7 +49,7 @@
         <node pkg="nodelet" type="nodelet" name="depth_image_proc_manager" args="manager" output="screen" />
         <node pkg="nodelet" type="nodelet" name="depth_to_pointcloud" args="load depth_image_proc/point_cloud_xyz depth_image_proc_manager" output="screen">
             <remap from="camera_info" to="/camera/aligned_depth_to_color/camera_info" />
-            <remap from="image_rect" to="/camera/aligned_depth_to_color/image_raw" />
+            <remap from="image_rect" to="/camera/aligned_depth_to_color/image_raw_throttle" />
             <remap from="points" to="/camera/depth/points" />
         </node>
 
@@ -124,7 +124,17 @@
     <node name="robot_web_ui_server" pkg="robot_web_ui" type="web_server_node.py" output="screen">
         <param name="depth_topic" value="/camera/depth/image_raw" if="$(arg sim)" />
         <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
+        <param name="enable_camera_viz" value="false" />
     </node>
+
+    <!-- 11. Start Web Video Server and Throttles for much faster UI streaming -->
+    <node name="web_video_server" pkg="web_video_server" type="web_video_server" output="screen">
+        <param name="port" value="8080" />
+    </node>
+    <!-- Throttle the camera streams to 5 Hz to save bandwidth -->
+    <node name="throttle_color" pkg="topic_tools" type="throttle" args="messages /camera/color/image_raw 5.0 /camera/color/image_raw_throttle" />
+    <node name="throttle_depth" pkg="topic_tools" type="throttle" args="messages /camera/aligned_depth_to_color/image_raw 5.0 /camera/aligned_depth_to_color/image_raw_throttle" unless="$(arg sim)" />
+    <node name="throttle_depth_sim" pkg="topic_tools" type="throttle" args="messages /camera/depth/image_raw 5.0 /camera/depth/image_raw_throttle" if="$(arg sim)" />
 
     <group if="$(arg use_rviz)">
         <node pkg="rviz" type="rviz" name="rviz_display" args="-d $(find hw4_exploration)/rviz/ee478_rtabmap.rviz" output="screen" />

@@ -56,7 +56,7 @@ private:
 
 HeightmapToCostMap::HeightmapToCostMap() : cloud_topic_("/points/velodyne_obstacles"), map_topic_("/map/local_map/obstacle")
 {
-    sub_ = nh_.subscribe(cloud_topic_, 30, &HeightmapToCostMap::cloud_cb, this);
+    sub_ = nh_.subscribe(cloud_topic_, 1, &HeightmapToCostMap::cloud_cb, this);
 
     cost_map_pub_ = nh_.advertise<nav_msgs::OccupancyGrid>(map_topic_, 10);
 
@@ -151,6 +151,8 @@ void HeightmapToCostMap::generate_costmap()
 
             cost_map_pub_.publish(oMap);
             if (point_count == 0) ROS_INFO_THROTTLE(2, "[HeightmapToCostMap] Published empty map: 0 points survived filter (MIN: %f, MAX: %f)", MIN_OBSTACLE_HEIGHT, MAX_OBSTACLE_HEIGHT);
+            
+            bGetPoint = false; // WAIT FOR NEW POINTCLOUD BEFORE REPROCESSING
         }
         else
         {

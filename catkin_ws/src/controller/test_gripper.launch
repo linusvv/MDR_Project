@@ -1,0 +1,22 @@
+<launch>
+    <!-- 
+        Dieses Launch-File startet den Hiwonder Servo Manager und die Test-Skripte.
+        Falls der Paket- oder Typ-Name des Managers anders ist, passe die nächste Zeile an.
+        Du findest den richtigen Namen normalerweise in der Dokumentation deines Roboter-Arms.
+    -->
+    <node name="hiwonder_servo_manager" pkg="hiwonder_servo_driver" type="hiwonder_servo_manager" output="screen">
+        <!-- 
+            Parameter, um das Senden von Servo-Zuständen zu erzwingen.
+            Der Parameter-Name kann je nach Treiber-Version variieren (z.B. state_publish_rate, publish_states, etc.).
+            Dieser hier ist eine häufige Variante.
+        -->
+        <param name="state_publish_rate" value="10"/> 
+    </node>
+
+    <!-- Starte den Gripper-Status-Monitor -->
+    <node name="gripper_status_monitor" pkg="controller" type="gripper_status.py" output="screen" />
+
+    <!-- Starte die Teleop-Steuerung, um den Gripper zu bewegen -->
+    <node name="armpi_teleop_control" pkg="controller" type="armpi_teleop.py" output="screen" launch-prefix="xterm -e" />
+
+</launch>

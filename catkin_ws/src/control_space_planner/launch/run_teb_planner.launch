@@ -8,8 +8,8 @@
                 global_frame: odom
                 robot_base_frame: base_footprint
                 transform_tolerance: 2.0
-                update_frequency: 30.0
-                publish_frequency: 30.0
+                update_frequency: 10.0
+                publish_frequency: 5.0
                 rolling_window: true
                 width: 10.0
                 height: 10.0
@@ -23,7 +23,6 @@
             TebLocalPlannerROS:
                 odom_topic: /odom
                 map_frame: odom
-                transform_tolerance: 2.0
                 
                 # Trajectory Configuration
                 teb_autosize: True
@@ -34,19 +33,19 @@
                 allow_init_with_backwards_motion: False
                 max_global_plan_lookahead_dist: 1.0 # Short lookahead to focus on immediate path
                 global_plan_viapoint_sep: 0.1 # Relaxed via-point spacing to avoid oscillation at start
-                weight_kinematics_nh: 10
-                weight_kinematics_forward_drive: 15
+                weight_kinematics_nh: 1000
+                weight_kinematics_forward_drive: 1000
                 weight_kinematics_turning_radius: 15
                 weight_optimaltime: 0.5
                 
                 # Robot Configuration
-                max_vel_x: 1.3
-                max_vel_y: 0.3     # Soft sideways sliding to drift corners
-                max_vel_theta: 1.5 # High turn speed for quick corrections
-                acc_lim_x: 2.5
-                acc_lim_y: 0.8
-                acc_lim_theta: 2.0
-                min_turning_radius: 0.0 # Re-enable differential turning to prevent math locks
+                max_vel_x: 0.09
+                max_vel_y: 0.02     # Strictly NO sideways movement (Ackermann/diff drive only)
+                max_vel_theta: 0.5 # High turn speed for quick corrections
+                acc_lim_x: 0.5
+                acc_lim_y: 0.02
+                acc_lim_theta: 0.5
+                min_turning_radius: 0.0 # Differential drive turning (turn in place)
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  
                 footprint_model:

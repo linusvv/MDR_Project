@@ -60,7 +60,7 @@ HeightMap::HeightMap(ros::NodeHandle node, ros::NodeHandle priv_nh)
 
   // subscribe to Velodyne data points
   // TODO: find and change the topic name of the point cloud data
-  velodyne_scan_ = node.subscribe("/camera/depth/points", 10,
+  velodyne_scan_ = node.subscribe("/camera/depth/points", 1,
                                   &HeightMap::processData, this,
                                   ros::TransportHints().tcpNoDelay(true));
 }
@@ -229,12 +229,13 @@ void HeightMap::processData(const VPointCloud::ConstPtr &scan)
     return;
   }
   
-  // pass along original time stamp and frame ID
-  obstacle_cloud_.header.stamp = scan->header.stamp;
+  // Use current time to avoid TF extrapolation into the past errors in costmap
+  uint64_t current_time_pcl;
+  pcl_conversions::toPCL(ros::Time::now(), current_time_pcl);
+  obstacle_cloud_.header.stamp = current_time_pcl;
   obstacle_cloud_.header.frame_id = "base_footprint";
 
-  // pass along original time stamp and frame ID
-  clear_cloud_.header.stamp = scan->header.stamp;
+  clear_cloud_.header.stamp = current_time_pcl;
   clear_cloud_.header.frame_id = "base_footprint";
 
   // set the exact point cloud size -- the vectors should already have

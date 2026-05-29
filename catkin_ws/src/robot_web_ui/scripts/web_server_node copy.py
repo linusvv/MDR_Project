@@ -137,33 +137,23 @@ class RobotWebServer:
         # Visualization Toggles
         self.viz_apriltag = True
         self.viz_yolo = True
-        self.enable_camera_viz = rospy.get_param('~enable_camera_viz', False)
 
         # ROS Publishers
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
         self.path_pub = rospy.Publisher('/graph_planner/path/global_path', Path, queue_size=5)
 
-        if self.enable_camera_viz:
-            self.annotated_color_pub = rospy.Publisher('/camera/color/image_annotated', Image, queue_size=2)
-            self.depth_color_pub = rospy.Publisher('/camera/depth/image_color', Image, queue_size=2)
-        else:
-            rospy.loginfo("Web UI camera visualization disabled.")
-            self.annotated_color_pub = None
-            self.depth_color_pub = None
+        self.annotated_color_pub = rospy.Publisher('/camera/color/image_annotated', Image, queue_size=2)
+        self.depth_color_pub = rospy.Publisher('/camera/depth/image_color', Image, queue_size=2)
 
         # Publish a rendered image of the local planner so external servers
         # (e.g. web_video_server) can stream it directly from a ROS topic.
         self.local_planner_pub = rospy.Publisher('/local_planner/image', Image, queue_size=2)
 
         # ROS Subscribers
-        if self.enable_camera_viz:
-            rospy.Subscriber('/camera/color/image_raw_throttle', Image, self.color_cb)
-            depth_topic = rospy.get_param('~depth_topic', '/camera/aligned_depth_to_color/image_raw') + '_throttle'
-            rospy.Subscriber(depth_topic, Image, self.depth_cb)
-            rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.cam_info_cb)
-        else:
-            rospy.loginfo("Web UI camera subscribers disabled.")
-
+        rospy.Subscriber('/camera/color/image_raw_throttle', Image, self.color_cb)
+        depth_topic = rospy.get_param('~depth_topic', '/camera/aligned_depth_to_color/image_raw') + '_throttle'
+        rospy.Subscriber(depth_topic, Image, self.depth_cb)
+        rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.cam_info_cb)
         rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.map_cb)
         rospy.Subscriber('/map/local_map/obstacle', OccupancyGrid, self.local_map_cb)
         rospy.Subscriber('/teb_planner_node/TebLocalPlannerROS/local_plan', Path, self.local_plan_cb)
@@ -212,9 +202,6 @@ class RobotWebServer:
         rospy.logwarn("[EMERGENCY STOP] Robot and planners stopped.")
 
     def color_cb(self, msg):
-        if not self.enable_camera_viz:
-            return
-
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             
@@ -229,16 +216,12 @@ class RobotWebServer:
                     cv_image = self.draw_path(cv_image)
                     
             self.color_image = cv_image
-            if self.annotated_color_pub is not None:
-                msg_out = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
-                self.annotated_color_pub.publish(msg_out)
+            msg_out = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
+            self.annotated_color_pub.publish(msg_out)
         except Exception as e:
             rospy.logerr(f"Color Image Error: {e}")
 
     def depth_cb(self, msg):
-        if not self.enable_camera_viz:
-            return
-
         try:
             # Depth images are typically 16UC1 or 32FC1.
             cv_image = self.bridge.imgmsg_to_cv2(msg, "32FC1")
@@ -259,9 +242,8 @@ class RobotWebServer:
             cv_image_color = cv2.applyColorMap(vis_image, cv2.COLORMAP_JET)
             self.depth_image = cv_image_color
             
-            if self.depth_color_pub is not None:
-                msg_out = self.bridge.cv2_to_imgmsg(cv_image_color, "bgr8")
-                self.depth_color_pub.publish(msg_out)
+            msg_out = self.bridge.cv2_to_imgmsg(cv_image_color, "bgr8")
+            self.depth_color_pub.publish(msg_out)
         except Exception as e:
             rospy.logerr(f"Depth Image Error: {e}")
 

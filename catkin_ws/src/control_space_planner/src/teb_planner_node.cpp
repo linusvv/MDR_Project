@@ -10,7 +10,7 @@
 
 class TebPlannerNode {
 public:
-    TebPlannerNode(ros::NodeHandle& nh) : nh_(nh), tf_listener_(tf_buffer_) {
+    TebPlannerNode(ros::NodeHandle& nh) : nh_(nh), tf_buffer_(ros::Duration(60.0)), tf_listener_(tf_buffer_) {
         // Subscribers & Publishers
         subGoalPoint = nh_.subscribe("/graph_planner/path/global_path", 1, &TebPlannerNode::CallbackGoalPoint, this);
         pubCommand = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1, true);

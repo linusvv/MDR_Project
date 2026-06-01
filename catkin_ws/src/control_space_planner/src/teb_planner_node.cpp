@@ -142,12 +142,8 @@ public:
             return;
         }
 
-        // Run planning optimization at 25 Hz (every 2nd iteration of the 50 Hz loop)
-        plan_divider_++;
-        if (plan_divider_ >= 2) {
-            plan_divider_ = 0;
-            Plan();
-        }
+        // Run planning optimization at 50 Hz (every iteration)
+        Plan();
 
         // Continually publish cmd_vel at 20 Hz (only while path_received_ is true)
         if (path_received_) {

@@ -2,14 +2,30 @@
     <arg name="use_rviz" default="false"/>
     <arg name="sim" default="false"/>
 
+    <!-- 0. Start the Tag Pose Injector to continuously correct RTAB-Map global pose -->
+    <node name="tag_pose_injector" pkg="hw4_exploration" type="tag_pose_injector.py" output="screen" />
+
     <!-- ==================== SIMULATION SPECIFIC SETUP ==================== -->
     <group if="$(arg sim)">
         <!-- 1. Start Gazebo simulation with mecanum robot -->
         <include file="$(find nexus_4wd_mecanum_gazebo)/launch/nexus_4wd_mecanum_world.launch" />
 
+        <!-- 2. Start AprilTag Localization for global pose correction -->
+        <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
+            <arg name="tag_file_name" value="2025/re540_simulation" />
+            <arg name="camera_name" value="/camera/color" />
+            <arg name="image_topic" value="image_raw_throttle" />
+            <arg name="world_frame_name" value="map" />
+            <arg name="camera_frame_name" value="camera_link" />
+            <arg name="image_frame_name" value="camera_color_optical_frame" />
+            <arg name="with_visualization" value="false" />
+            <arg name="with_realsense_tf" value="false" />
+            <arg name="broadcast_world2cam_tf" value="false" />
+        </include>
+
         <!-- 3. Start RTAB-Map SLAM (Configured to use stable Wheel Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 1000 --Kp/MaxFeatures 1000 --Rtabmap/LoopThr 0.11 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.35 --Grid/RayTracing true"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.11 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.35 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
             <arg name="rgb_topic" value="/camera/color/image_raw"/>
             <arg name="depth_topic" value="/camera/depth/image_raw"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
@@ -24,19 +40,6 @@
             <arg name="approx_sync" value="true"/>
             <arg name="rviz" value="false"/>
             <arg name="rtabmap_viz" value="false"/>
-        </include>
-
-        <!-- 3.5 Start AprilTag Localization for global pose correction -->
-        <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
-            <arg name="tag_file_name" value="2025/re540_simulation" />
-            <arg name="camera_name" value="/camera/color" />
-            <arg name="image_topic" value="image_raw_throttle" />
-            <arg name="world_frame_name" value="map" />
-            <arg name="camera_frame_name" value="camera_link" />
-            <arg name="image_frame_name" value="camera_color_optical_frame" />
-            <arg name="with_visualization" value="false" />
-            <arg name="with_realsense_tf" value="false" />
-            <arg name="broadcast_world2cam_tf" value="false" />
         </include>
     </group>
 
@@ -60,9 +63,22 @@
         <!-- 1.7 Start cmd_vel to chassis_control velocity bridge -->
         <node name="cmd_vel_to_chassis" pkg="hw4_exploration" type="cmd_vel_to_chassis.py" output="screen" />
 
+        <!-- 2. Start AprilTag Localization (Real room tag list) -->
+        <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
+            <arg name="tag_file_name" value="2025/re540_n1_room111" />
+            <arg name="camera_name" value="/camera/color" />
+            <arg name="image_topic" value="image_raw_throttle" />
+            <arg name="world_frame_name" value="map" />
+            <arg name="camera_frame_name" value="camera_link" />
+            <arg name="image_frame_name" value="camera_color_optical_frame" />
+            <arg name="with_visualization" value="false" />
+            <arg name="with_realsense_tf" value="false" />
+            <arg name="broadcast_world2cam_tf" value="false" />
+        </include>
+
         <!-- 3. Start RTAB-Map SLAM (Configured for Visual Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 600 --Kp/MaxFeatures 600 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 4 --Grid/MaxObstacleHeight 0.35 --Grid/RayTracing true"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 4 --Grid/MaxObstacleHeight 0.35 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
             <arg name="rgb_topic" value="/camera/color/image_raw_throttle"/>
             <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw_throttle"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
@@ -77,20 +93,7 @@
             <arg name="approx_sync" value="true"/>
             <arg name="rviz" value="false"/>
             <arg name="rtabmap_viz" value="false"/>
-            <arg name="odom_args" value="--Odom/ResetCountdown 0 --Vis/MaxFeatures 400"/>
-        </include>
-
-        <!-- 3.5 Start AprilTag Localization (Real room tag list) -->
-        <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
-            <arg name="tag_file_name" value="2025/re540_n1_room111" />
-            <arg name="camera_name" value="/camera/color" />
-            <arg name="image_topic" value="image_raw_throttle" />
-            <arg name="world_frame_name" value="map" />
-            <arg name="camera_frame_name" value="camera_link" />
-            <arg name="image_frame_name" value="camera_color_optical_frame" />
-            <arg name="with_visualization" value="false" />
-            <arg name="with_realsense_tf" value="false" />
-            <arg name="broadcast_world2cam_tf" value="false" />
+            <arg name="odom_args" value="--Odom/ResetCountdown 2 --Vis/MaxFeatures 2000 --Vis/MinInliers 10 --OdomF2M/MaxSize 3000 --Odom/KeyFrameThr 0.6"/>
         </include>
     </group>
 
@@ -98,9 +101,6 @@
 
     <!-- 2. Start local costmap generator -->
     <include file="$(find local_costmap_generator)/launch/run.launch" />
-
-    <!-- 3.6 Start the Tag Pose Injector to continuously correct RTAB-Map global pose -->
-    <node name="tag_pose_injector" pkg="hw4_exploration" type="tag_pose_injector.py" output="screen" />
 
     <!-- 3.7 Start the Map Odom Publisher -->
     <node name="map_odom_publisher" pkg="hw4_exploration" type="map_odom_publisher.py" output="screen" />

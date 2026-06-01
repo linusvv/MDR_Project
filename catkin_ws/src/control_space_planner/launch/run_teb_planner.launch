@@ -31,45 +31,45 @@
                 max_samples: 50
                 global_plan_overwrite_orientation: True
                 allow_init_with_backwards_motion: False
-                max_global_plan_lookahead_dist: 1.0 # Short lookahead to focus on immediate path
-                global_plan_viapoint_sep: 0.1 # Relaxed via-point spacing to avoid oscillation at start
-                weight_kinematics_nh: 1000.0 # Maintain Ackerman constraints
-                weight_kinematics_forward_drive: 1000.0 # Maintain Ackerman constraints
+                max_global_plan_lookahead_dist: 2.5 # Increased lookahead for smoother trajectories
+                global_plan_viapoint_sep: 0.5 # Relaxed via-point spacing to avoid oscillation
+                weight_kinematics_nh: 1000.0 # Reverted: Ackermann forward driving only
+                weight_kinematics_forward_drive: 1000.0 # Reverted: Ackermann constraints
                 weight_kinematics_turning_radius: 15.0
-                weight_optimaltime: 0.5
+                weight_optimaltime: 1.5
                 
                 # Robot Configuration
                 max_vel_x: 0.16
-                max_vel_y: 0.02     # Strictly NO sideways movement (Ackermann/diff drive only)
-                max_vel_theta: 0.7 # High turn speed for quick corrections
+                max_vel_y: 0.0     # Sideways movement disabled for front-sensor setup
+                max_vel_theta: 0.7
                 acc_lim_x: 1.0
-                acc_lim_y: 0.02
+                acc_lim_y: 0.0      # Sideways movement disabled
                 acc_lim_theta: 1.5
-                min_turning_radius: 0.0 # Differential drive turning (turn in place)
+                min_turning_radius: 0.0
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  
                 footprint_model:
                     type: "circular"
-                    radius: 0.2
+                    radius: 0.30    # Increased radius because corners of square robot stick out
 
                 # Goal Tolerance
-                xy_goal_tolerance: 0.5
-                yaw_goal_tolerance: 0.5
+                xy_goal_tolerance: 0.15
+                yaw_goal_tolerance: 0.15
                 free_goal_vel: False
 
                 # Obstacles
-                min_obstacle_dist: 0.25 # Reduced from 0.5 to allow navigating narrow corridors
-                inflation_dist: 0.4 # Reduced from 0.6 to match standard costmap margin
+                min_obstacle_dist: 0.25 
+                inflation_dist: 0.15 # Reduced to make costmap inflation smaller
                 include_costmap_obstacles: True
                 costmap_obstacles_behind_robot_dist: 1.0
-                obstacle_poses_affected: 30
+                obstacle_poses_affected: 20 # Reduced from 30 to speed up 50Hz planning
                 
                 # Optimization
-                no_inner_iterations: 5
-                no_outer_iterations: 4
+                no_inner_iterations: 3 # Reduced for 50Hz loop speed
+                no_outer_iterations: 2 # Reduced for 50Hz loop speed
                 penalty_epsilon: 0.01  # Must stay below min speed (0.02 m/s); was 0.1 causing negative bound warnings
-                weight_obstacle: 60 # STRONGLY prioritize obstacle avoidance
-                weight_viopoint: 80 # Heavy path following
+                weight_obstacle: 50 # Strongly prioritize obstacle avoidance
+                weight_viopoint: 50.0 # Increased significantly so it actively tracks the global route
                 weight_adapt_factor: 2.0
         </rosparam>
     </node>

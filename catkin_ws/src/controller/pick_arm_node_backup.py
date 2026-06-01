@@ -32,8 +32,8 @@ import rospy
 from geometry_msgs.msg import Point
 from hiwonder_servo_msgs.msg import MultiRawIdPosDur, RawIdPosDur
 from chassis_control.msg import SetVelocity
-from std_msgs.msg import Float64, String, Bool
-
+from std_msgs.msg import Float64
+from hiwonder_servo_msgs.msg import ServoStateList, JointState as ServoJointState
 
 _pkg_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(_pkg_path, 'armpi_pro_kinematics'))
@@ -45,19 +45,18 @@ from kinematics import ik_transform
 # ── Arm Parameters ───────────────────────────────────────────────────────
 # ════════════════════════════════════════════════════════════════════════════
 Z_APPROACH     = 0.12       # Approach height (m)
-# Z_GRASP        = -0.015     # Grasp height (m)  <- tune based on physical measurement
-Z_GRASP        = 0.03       # test hight so see if 60° works
+Z_GRASP        = -0.015     # Grasp height (m)  <- tune based on physical measurement
 MOVE_SLEEP     = 1.2        # Dwell time after each motion (s)
 GRIP_SLEEP     = 0.6        # Dwell time after gripper actuation (s)
 
 SERVO_DURATION = 800        # Servo travel time (ms)
 GRIPPER_OPEN   = 200        # Servo 1 pulse width (open)
-GRIPPER_CLOSE  = 600        # Servo 1 pulse width (closed) <- increased for tighter grip
+GRIPPER_CLOSE  = 500        # Servo 1 pulse width (closed) <- adjust for object size
 SERVO2_DEFAULT = 500        # Fixed pulse value for joint 5
 
-PITCH          = -140       # End-effector pitch angle (deg) — tilted downward
+PITCH          = -90        # End-effector pitch angle (deg)
 PITCH_MIN      = -150
-PITCH_MAX      = -90
+PITCH_MAX      = -30
 
 HOME           = (0.00, 0.15, 0.12)    # Home position (waypoint after lift)
 
@@ -78,7 +77,7 @@ TOL_Y             = 0.020   # Forward alignment tolerance ±2 cm
 FORWARD_SPEED     = 80      # Forward/backward speed (mm/s)
 STRAFE_SPEED      = 60      # Lateral strafe speed (mm/s)
 CREEP_SPEED       = 50      # Fine approach speed (mm/s)
-CREEP_TIME        = 0.2     # Fine approach duration (s)  ->  50mm/s x 0.2s ~ 10mm
+CREEP_TIME        = 0.6     # Fine approach duration (s)  ->  50mm/s x 0.6s ~ 3 cm
 
 VALID_Y_MIN       = -0.30   # Valid detection range lower bound
 VALID_Y_MAX       =  0.60   # Valid detection range upper bound
@@ -98,12 +97,13 @@ _servo_pub     = None
 _ik            = None
 vel_pub        = None
 _joint_pubs    = {}     # {1: Publisher, ...} for /joint{n}_controller/command
+_gripper_state = None   # Latest /r_joint_controller/state message
 
-# check variables
-target_item = "None"
-target_visible = False
-heartbeat_pub = None
-target_visible_pub = None
+# ── Grasp verification threshold ──────────────────────────────────────────
+# |goal_pos - current_pos| in radians.
+# If object blocks gripper, current_pos cannot reach goal_pos -> |error| increases.
+# Tune this value based on actual robot behavior.
+GRASP_ERROR_THRESHOLD = 0.1   # rad
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -199,10 +199,6 @@ def pick_and_place(px, py, pz):
     Place position is defined by set_final_pose() joint absolute values.
     """
     
-    global heartbeat_pub
-    if heartbeat_pub is not None:
-        heartbeat_pub.publish(String("picking up object"))
-    
     rospy.loginfo(f'=== PICK  ({px:.3f}, {py:.3f}, {pz:.3f})')
 
     # ── PICK PHASE ────────────────────────────────────────────────────────
@@ -226,6 +222,13 @@ def pick_and_place(px, py, pz):
     set_gripper(GRIPPER_CLOSE)
     rospy.sleep(GRIP_SLEEP)
 
+    # 4-1. Verify grasp (check gripper error to confirm object is held)
+    if not verify_grasp():
+        rospy.logerr('Pick aborted: grasp failed — opening gripper and returning home')
+        set_gripper(GRIPPER_OPEN)
+        rospy.sleep(GRIP_SLEEP)
+        move_to(*HOME, 'home')
+        return False
 
     # 5. Lift object
     if not move_to(px, py, Z_APPROACH, 'lift'):
@@ -237,8 +240,6 @@ def pick_and_place(px, py, pz):
     set_final_pose()
 
     rospy.loginfo('=== Pick & Place DONE ===')
-    if heartbeat_pub is not None:
-        heartbeat_pub.publish(String("picked up object"))
     return True
 
 
@@ -258,6 +259,46 @@ def chassis_stop():
     chassis_cmd(0, 90, 0)
 
 
+# ════════════════════════════════════════════════════════════════════════════
+# ── Grasp Verification ───────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+
+def gripper_state_cb(msg):
+    global _gripper_state
+    _gripper_state = msg   # hiwonder_servo_msgs/JointState
+
+
+def verify_grasp():
+    """
+    Verify grasp using error field from /r_joint_controller/state.
+
+    JointState fields:
+      goal_pos    : commanded target position (rad)
+      current_pos : actual current position   (rad)
+      error       : goal_pos - current_pos
+
+    If object blocks gripper: current_pos cannot reach goal_pos -> |error| large
+    If nothing is held:       gripper fully closes             -> error ~ 0
+
+    Returns True  : grasp confirmed
+            False : grasp failed (gripper closed fully, nothing held)
+    """
+    if _gripper_state is None:
+        rospy.logwarn('[pick_arm] No gripper state received — skipping grasp check')
+        return True
+
+    error = abs(_gripper_state.error)
+    rospy.loginfo(
+        f'[pick_arm] Gripper  goal={_gripper_state.goal_pos:.4f}  '
+        f'current={_gripper_state.current_pos:.4f}  |error|={error:.4f} rad')
+
+    if error > GRASP_ERROR_THRESHOLD:
+        rospy.loginfo(f'[pick_arm] Grasp confirmed  (|error|={error:.4f} > {GRASP_ERROR_THRESHOLD})')
+        return True
+    else:
+        rospy.logwarn(f'[pick_arm] Grasp failed — gripper fully closed  (|error|={error:.4f})')
+        return False
+
 
 # ════════════════════════════════════════════════════════════════════════════
 # ── ROS Callbacks ────────────────────────────────────────────────────────
@@ -273,11 +314,6 @@ def arm_point_cb(msg):
     last_arm_pt   = msg
     last_detect_t = rospy.Time.now()
 
-def target_item_cb(msg):
-    global target_item
-    target_item = msg.data
-    rospy.loginfo(f'[pick_arm] Target item updated: {target_item}')
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # ── Control Loop  10 Hz ──────────────────────────────────────────────────
@@ -289,36 +325,25 @@ def control_loop(event):
     Handles state machine transitions and chassis commands.
     In ALIGNED state, calls pick_and_place() directly (blocking) then returns to IDLE.
     """
-    global state, creep_start_t, target_visible
+    global state, creep_start_t
 
     now = rospy.Time.now()
 
-    # Update target_visible state
-    if last_detect_t is None:
-        target_visible = False
-    else:
-        dt = (now - last_detect_t).to_sec()
-        target_visible = (dt < DETECTION_TIMEOUT)
-
-    if target_visible_pub is not None:
-        target_visible_pub.publish(Bool(target_visible))
-
     # ── Detection timeout check ───────────────────────────────────────────
-    if not target_visible:
-        if state in [APPROACHING, CREEPING]:
+    if last_detect_t is None:
+        if state == APPROACHING:
             rospy.logwarn_throttle(3, '[pick_arm] No detection — stopping chassis')
             chassis_stop()
             state = IDLE
-        if heartbeat_pub is not None and state == IDLE:
-            heartbeat_pub.publish(String("idle"))
         return
+
+    dt = (now - last_detect_t).to_sec()
 
     # ── IDLE ──────────────────────────────────────────────────────────────
     if state == IDLE:
-        rospy.loginfo('[pick_arm] Object detected -> APPROACHING')
-        state = APPROACHING
-        if heartbeat_pub is not None:
-            heartbeat_pub.publish(String("detecting object"))
+        if dt < DETECTION_TIMEOUT:
+            rospy.loginfo('[pick_arm] Object detected -> APPROACHING')
+            state = APPROACHING
 
     # ── APPROACHING ───────────────────────────────────────────────────────
     elif state == APPROACHING:
@@ -363,8 +388,6 @@ def control_loop(event):
 
     # ── CREEPING ──────────────────────────────────────────────────────────
     elif state == CREEPING:
-        if heartbeat_pub is not None:
-            heartbeat_pub.publish(String("approaching object"))
         if creep_start_t is None:
             creep_start_t = now
         elapsed = (now - creep_start_t).to_sec()
@@ -400,9 +423,6 @@ if __name__ == '__main__':
         MultiRawIdPosDur, queue_size=1)
     vel_pub = rospy.Publisher(
         '/chassis_control/set_velocity', SetVelocity, queue_size=1)
-        
-    target_visible_pub = rospy.Publisher('/target_visible', Bool, queue_size=1)
-    heartbeat_pub = rospy.Publisher('/pick_arm_heartbeat', String, queue_size=1)
 
     rospy.sleep(0.5)
 
@@ -415,13 +435,13 @@ if __name__ == '__main__':
 
     # ── Subscribers ───────────────────────────────────────────────────────
     rospy.Subscriber('/yolo/arm_point',           Point,           arm_point_cb)
-    rospy.Subscriber('/target_item',              String,          target_item_cb)
+    rospy.Subscriber('/r_joint_controller/state', ServoJointState, gripper_state_cb)
 
     # ── 10 Hz control loop ────────────────────────────────────────────────
     rospy.Timer(rospy.Duration(0.1), control_loop)
 
     rospy.loginfo('[pick_arm] Node ready.')
-    rospy.loginfo('  Subscribing : /yolo/arm_point  /target_item')
+    rospy.loginfo('  Subscribing : /yolo/arm_point  /r_joint_controller/state')
     rospy.loginfo('  Publishing  : /chassis_control/set_velocity')
     rospy.loginfo('               /servo_controllers/port_id_1/multi_id_pos_dur')
     rospy.loginfo(

@@ -34,7 +34,7 @@ public:
     float MAP_MAX_Y =  10; // map max y position
 
     float MIN_OBSTACLE_HEIGHT = 0.04; // [m] ignore ground points
-    float MAX_OBSTACLE_HEIGHT = 0.30; // [m] Limit to 30cm to allow passing under floating signboards
+    float MAX_OBSTACLE_HEIGHT = 0.10; // [m] Limit to 10cm to allow passing under floating signboards
 
     float INFLATION_RADIUS = 0.6; // [m] Increased to 1.5x (0.4m -> 0.6m) for a larger dangerous zone
     float INFLATION_RES    = RESOLUTION_; // [m] resolution of inflation
@@ -156,7 +156,7 @@ void HeightmapToCostMap::generate_costmap()
         }
         else
         {
-            ROS_INFO_THROTTLE(5, "No point cloud yet!!!");
+            ROS_INFO_ONCE("No point cloud yet!!!");
         }
 }
 

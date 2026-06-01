@@ -17,7 +17,7 @@ except ImportError:
             self.velocity_y = 0.0
 
 # How long (seconds) without a /cmd_vel message before sending a stop command
-CMD_VEL_TIMEOUT = 10.0
+CMD_VEL_TIMEOUT = 0.5
 
 class CmdVelToChassis:
     def __init__(self):

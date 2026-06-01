@@ -1,20 +1,20 @@
 document.addEventListener('DOMContentLoaded', () => {
     // Setup web_video_server image streams depending on the current IP
     const host = window.location.hostname;
-    // Camera streams disabled to avoid web UI bottleneck. Enable manually if needed.
-    // document.getElementById('color-stream').src = `http://${host}:8080/stream?topic=/camera/color/image_annotated&type=mjpeg`;
-    // document.getElementById('depth-stream').src = `http://${host}:8080/stream?topic=/camera/depth/image_color&type=mjpeg`;
+    // Camera streams enabled using tailscale host
+    document.getElementById('color-stream').src = `http://ubuntu.tail9aaeee.ts.net:8080/stream?topic=/camera/color/image_annotated&type=mjpeg`;
+    document.getElementById('depth-stream').src = `http://ubuntu.tail9aaeee.ts.net:8080/stream?topic=/camera/depth/image_color&type=mjpeg`;
     // If web_video_server is available, prefer streaming the local planner
     // via the /local_planner/image topic. The template still provides a
     // Flask fallback at /video_local_planner.
     try {
         const localEl = document.getElementById('local-planner-stream');
         if (localEl) {
-            localEl.src = `http://${host}:8080/stream?topic=/local_planner/image&type=mjpeg`;
+            localEl.src = `/video_local_planner`;
         }
     } catch (e) {
         // Ignore if element not present or assignment fails
-        console.debug('Local planner stream not set via web_video_server', e);
+        console.debug('Local planner stream not set via Flask', e);
     }
 
     const rosConsoleEl = document.getElementById('ros-console-output');

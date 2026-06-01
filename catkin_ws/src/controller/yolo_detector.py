@@ -289,7 +289,9 @@ if __name__ == '__main__':
     rospy.Subscriber('/camera/color/camera_info', CameraInfo, camera_info_cb)
 
     # 타겟 클래스 동적 설정
-    rospy.Subscriber('/yolo/class', String, class_cb)
+    # for yolo testing:
+    #rospy.Subscriber('/yolo/class', String, class_cb)
+    rospy.Subscriber('/target_item', String, class_cb)
 
     # RGB + Depth 동기화 구독
     color_sub = message_filters.Subscriber('/camera/color/image_raw', Image)

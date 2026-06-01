@@ -84,6 +84,12 @@ class RobotWebServer:
         rospy.set_param("/use_local_ai", True)
         rospy.set_param("/local_planner_type", "teb")
         
+        # Set default velocity bounds
+        if not rospy.has_param("/robot/max_vel"):
+            rospy.set_param("/robot/max_vel", 0.20)
+        if not rospy.has_param("/robot/max_vel_theta"):
+            rospy.set_param("/robot/max_vel_theta", 0.80)
+            
         self.lock = threading.Lock()
         self.tf_listener = tf.TransformListener()
 
@@ -198,6 +204,7 @@ class RobotWebServer:
         
         # 1. Stop the global/graph planner
         rospy.set_param("/exploration_state", "IDLE")
+        rospy.set_param("/exploration_paused", True)
         
         # 2. Clear current path to stop local C++ planner
         empty_path = Path()
@@ -635,7 +642,7 @@ class RobotWebServer:
         start_time = rospy.Time.now()
         arrived = False
         
-        while not rospy.is_shutdown() and self.navigating_to_pose_active and self.active_delivery_task:
+        while not rospy.is_shutdown() and self.navigating_to_pose_active:
             rx, ry, ryaw = self.get_current_robot_pose()
             dist = math.hypot(rx - x, ry - y)
             
@@ -1622,7 +1629,9 @@ class RobotWebServer:
             self.local_costmap = msg
 
     def load_tag_true_poses(self):
-        tag_config = rospy.get_param('/apriltag_localization_node/tag_config_name', '2025/re540_simulation')
+        tag_config = rospy.get_param('/hw4/apriltag_localization_node/tag_config_name', None)
+        if tag_config is None:
+            tag_config = rospy.get_param('/apriltag_localization_node/tag_config_name', '2025/re540_simulation')
         if not tag_config.endswith('.yaml'):
             tag_config += '.yaml'
         
@@ -1706,10 +1715,72 @@ class RobotWebServer:
                 rospy.logerr(f"Error loading sign database (YAML): {e}")
         return db
 
+    def estimate_world_to_map_transform(self):
+        try:
+            with self.lock:
+                detected = dict(self.detected_tags)
+                T_map_odom = self.T_map_odom.copy()
+                true_poses = dict(self.tag_true_poses)
+                bundles = self.bundles.copy()
+                
+            pts_world = []
+            pts_map = []
+            
+            for ids_tuple, bundle_info in bundles.items():
+                name = bundle_info['name']
+                if name in true_poses:
+                    for tid in ids_tuple:
+                        if tid in detected:
+                            tag_trans_odom, _ = detected[tid]
+                            pt_odom = np.array([tag_trans_odom[0], tag_trans_odom[1], 0.0, 1.0])
+                            pt_map = np.dot(T_map_odom, pt_odom)
+                            
+                            x_true, y_true, _ = true_poses[name]
+                            pts_world.append([x_true, y_true])
+                            pts_map.append([pt_map[0], pt_map[1]])
+                            break
+                            
+            n_points = len(pts_world)
+            if n_points < 1:
+                return
+                
+            if n_points == 1:
+                p_w = np.array(pts_world[0])
+                p_m = np.array(pts_map[0])
+                with self.lock:
+                    self.R = np.eye(2)
+                    self.T = p_m - p_w
+                return
+                
+            A = np.array(pts_world)
+            B = np.array(pts_map)
+            
+            centroid_A = np.mean(A, axis=0)
+            centroid_B = np.mean(B, axis=0)
+            
+            A_centered = A - centroid_A
+            B_centered = B - centroid_B
+            
+            H = np.dot(A_centered.T, B_centered)
+            U, S, Vt = np.linalg.svd(H)
+            R_est = np.dot(Vt.T, U.T)
+            
+            if np.linalg.det(R_est) < 0:
+                Vt[1, :] *= -1
+                R_est = np.dot(Vt.T, U.T)
+                
+            T_est = centroid_B - np.dot(R_est, centroid_A)
+            
+            with self.lock:
+                self.R = R_est
+                self.T = T_est
+        except Exception as e:
+            rospy.logwarn_throttle(5.0, f"Error estimating world to map transform: {e}")
 
     def generate_map_frames(self):
         rate = rospy.Rate(5) # 5 Hz is perfect
         while not rospy.is_shutdown():
+            self.estimate_world_to_map_transform()
             map_img = None
             with self.lock:
                 grid_map = self.grid_map
@@ -2110,8 +2181,8 @@ def cmd_vel():
 @app.route('/api/set_max_vel', methods=['POST'])
 def set_max_vel():
     data = request.json or {}
-    max_vel = float(data.get('max_vel', 0.06))
-    max_vel_theta = float(data.get('max_vel_theta', max_vel * 5.0))
+    max_vel = float(data.get('max_vel', 0.20))
+    max_vel_theta = float(data.get('max_vel_theta', max_vel * 4.0))
     
     rospy.set_param("/robot/max_vel", max_vel)
     rospy.set_param("/robot/max_vel_theta", max_vel_theta)

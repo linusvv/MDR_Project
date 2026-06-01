@@ -10,7 +10,7 @@
 
 class TebPlannerNode {
 public:
-    TebPlannerNode(ros::NodeHandle& nh) : nh_(nh), tf_buffer_(ros::Duration(60.0)), tf_listener_(tf_buffer_) {
+    TebPlannerNode(ros::NodeHandle& nh) : nh_(nh), tf_buffer_(ros::Duration(60.0)), tf_listener_(tf_buffer_), plan_divider_(0) {
         // Subscribers & Publishers
         subGoalPoint = nh_.subscribe("/graph_planner/path/global_path", 1, &TebPlannerNode::CallbackGoalPoint, this);
         pubCommand = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1, true);
@@ -27,41 +27,31 @@ public:
     }
 
     void CallbackGoalPoint(const nav_msgs::Path& msg) {
-        if (msg.poses.empty() || !teb_planner_) return;
+        if (!teb_planner_) return;
+        if (msg.poses.empty()) {
+            path_received_ = false;
+            last_cmd_vel_ = geometry_msgs::Twist();
+            pubCommand.publish(last_cmd_vel_);
+            return;
+        }
         
         global_path_ = msg;
         path_received_ = true;
         last_closest_idx_ = 0; // reset on new path
+        plan_divider_ = 3;     // Trigger plan calculation on next loop iteration
     }
 
     void Plan() {
-        std::string planner_type;
-        nh_.param<std::string>("/local_planner_type", planner_type, "control_space");
-        if (planner_type != "teb") return;
-
-        // Check emergency stop condition
-        bool is_paused = false;
-        nh_.param<bool>("/exploration_paused", is_paused, false);
-        std::string state = "IDLE";
-        nh_.param<std::string>("/exploration_state", state, "IDLE");
-        if (is_paused || state == "IDLE" || state == "STOP" || state == "RECOVERY") {
-            if (path_received_) {
-                geometry_msgs::Twist cmd_vel;
-                cmd_vel.linear.x = 0.0;
-                cmd_vel.linear.y = 0.0;
-                cmd_vel.angular.z = 0.0;
-                pubCommand.publish(cmd_vel);
-                path_received_ = false;
-            }
+        if (!teb_planner_ || !costmap_ros_ || !path_received_) {
+            last_cmd_vel_ = geometry_msgs::Twist();
             return;
         }
-
-        if (!teb_planner_ || !costmap_ros_ || !path_received_) return;
 
         // TEB requires the robot's current pose from the costmap
         geometry_msgs::PoseStamped robot_pose;
         if (!costmap_ros_->getRobotPose(robot_pose)) {
             ROS_WARN_THROTTLE(1.0, "Could not get robot pose from costmap. Will not command velocity.");
+            last_cmd_vel_ = geometry_msgs::Twist();
             return;
         }
 
@@ -100,9 +90,9 @@ public:
 
         // Arrival rule evaluation
         if (teb_planner_->isGoalReached()) {
-            cmd_vel.linear.x = 0;
-            cmd_vel.angular.z = 0;
-            pubCommand.publish(cmd_vel);
+            last_cmd_vel_ = geometry_msgs::Twist();
+            pubCommand.publish(last_cmd_vel_); // Publish immediate stop command
+            path_received_ = false;            // Deactivate repeater
             ROS_INFO_THROTTLE(1.0, "Goal Reached!");
             return;
         }
@@ -111,21 +101,46 @@ public:
         if (teb_planner_->computeVelocityCommands(cmd_vel)) {
             // Get obstacle distance for info only
             double min_obstacle_dist = getMinObstacleDistance(robot_pose.pose.position.x, robot_pose.pose.position.y);
-            
-            // No speed ramp - always go full speed
-            // Adjust turning radius: tighter turns in tight spaces, wider turns in open space
-            double angular_factor = 0.4 + (std::min(min_obstacle_dist, 1.2) / 1.2) * 0.6; // 0.4 to 1.0
-            cmd_vel.angular.z *= angular_factor;
-            
-            pubCommand.publish(cmd_vel);
-            ROS_INFO_THROTTLE(1.0, "TEB OK: cmd_vel [v: %.2f, w: %.2f] (obstacle_dist: %.2f m)", cmd_vel.linear.x, cmd_vel.angular.z, min_obstacle_dist);
+            last_cmd_vel_ = cmd_vel;
+            ROS_INFO_THROTTLE(1.0, "TEB OK: cmd_vel [vx: %.2f, vy: %.2f, w: %.2f] (obstacle_dist: %.2f m)", 
+                              cmd_vel.linear.x, cmd_vel.linear.y, cmd_vel.angular.z, min_obstacle_dist);
         } else {
             ROS_WARN_THROTTLE(1.0, "TEB failed to compute velocity commands.");
             ROS_WARN_THROTTLE(1.0, "Robot is currently stuck at X: %.2f, Y: %.2f", robot_pose.pose.position.x, robot_pose.pose.position.y);
+            last_cmd_vel_ = geometry_msgs::Twist(); // Stop on failure
+        }
+    }
 
-            cmd_vel.linear.x = 0.0;
-            cmd_vel.angular.z = 0.0;
-            pubCommand.publish(cmd_vel); // Stop on failure
+    void SpinOnce() {
+        std::string planner_type;
+        nh_.param<std::string>("/local_planner_type", planner_type, "control_space");
+        if (planner_type != "teb") return;
+
+        // Only repeat/publish if we have an active path/goal we are approaching
+        if (!path_received_) return;
+
+        // Check emergency stop condition
+        bool is_paused = false;
+        nh_.param<bool>("/exploration_paused", is_paused, false);
+        std::string state = "IDLE";
+        nh_.param<std::string>("/exploration_state", state, "IDLE");
+        if (is_paused || state == "IDLE" || state == "STOP" || state == "RECOVERY") {
+            last_cmd_vel_ = geometry_msgs::Twist();
+            pubCommand.publish(last_cmd_vel_);
+            path_received_ = false; // Deactivate repeater
+            return;
+        }
+
+        // Run planning optimization at 25 Hz (every 2nd iteration of the 50 Hz loop)
+        plan_divider_++;
+        if (plan_divider_ >= 2) {
+            plan_divider_ = 0;
+            Plan();
+        }
+
+        // Continually publish cmd_vel at 20 Hz (only while path_received_ is true)
+        if (path_received_) {
+            pubCommand.publish(last_cmd_vel_);
         }
     }
 
@@ -142,6 +157,8 @@ private:
     nav_msgs::Path global_path_;
     bool path_received_ = false;
     int last_closest_idx_ = 0;
+    geometry_msgs::Twist last_cmd_vel_;
+    int plan_divider_;
 
     // Calculate minimum distance to obstacles using costmap
     double getMinObstacleDistance(double robot_x, double robot_y) {
@@ -193,11 +210,11 @@ int main(int argc, char** argv) {
     ros::NodeHandle nh;
     
     TebPlannerNode node(nh);
-    ros::Rate rate(50); // Typical local planner run rate
+    ros::Rate rate(50); // 50 Hz continuous repeater rate
     
     while (ros::ok()) {
         ros::spinOnce();
-        node.Plan();
+        node.SpinOnce();
         rate.sleep();
     }
     return 0;

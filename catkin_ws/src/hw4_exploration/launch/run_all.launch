@@ -9,7 +9,7 @@
 
         <!-- 3. Start RTAB-Map SLAM (Configured to use stable Wheel Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 400 --Kp/MaxFeatures 400 --Rtabmap/LoopThr 0.3 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 2 --Grid/MaxObstacleHeight 0.3 --Grid/RayTracing true"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 1000 --Kp/MaxFeatures 1000 --Rtabmap/LoopThr 0.11 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.1 --Grid/RayTracing true"/>
             <arg name="rgb_topic" value="/camera/color/image_raw"/>
             <arg name="depth_topic" value="/camera/depth/image_raw"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
@@ -48,7 +48,7 @@
         <!-- 1.5 Convert depth image to point cloud for local costmap -->
         <node pkg="nodelet" type="nodelet" name="depth_image_proc_manager" args="manager" output="screen" />
         <node pkg="nodelet" type="nodelet" name="depth_to_pointcloud" args="load depth_image_proc/point_cloud_xyz depth_image_proc_manager" output="screen">
-            <remap from="camera_info" to="/camera/aligned_depth_to_color/camera_info" />
+            <remap from="camera_info" to="/camera/color/camera_info" />
             <remap from="image_rect" to="/camera/aligned_depth_to_color/image_raw_throttle" />
             <remap from="points" to="/camera/depth/points" />
         </node>
@@ -62,11 +62,11 @@
 
         <!-- 3. Start RTAB-Map SLAM (Configured for Visual Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 400 --Kp/MaxFeatures 400 --Rtabmap/LoopThr 0.3 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 2 --Grid/MaxObstacleHeight 0.3 --Grid/RayTracing true"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 1000 --Kp/MaxFeatures 1000 --Rtabmap/LoopThr 0.11 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.1 --Grid/RayTracing true"/>
             <arg name="rgb_topic" value="/camera/color/image_raw"/>
             <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
-            <arg name="depth_camera_info_topic" value="/camera/aligned_depth_to_color/camera_info"/>
+            <arg name="depth_camera_info_topic" value="/camera/color/camera_info"/>
             <arg name="frame_id" value="base_footprint"/>
             <arg name="odom_topic" value="/odom"/>
             <arg name="visual_odometry" value="true"/>
@@ -77,7 +77,7 @@
             <arg name="approx_sync" value="true"/>
             <arg name="rviz" value="false"/>
             <arg name="rtabmap_viz" value="false"/>
-            <arg name="odom_args" value="--Odom/ResetCountdown 1"/>
+            <arg name="odom_args" value="--Odom/ResetCountdown 0 --Vis/MaxFeatures 1000"/>
         </include>
 
         <!-- 3.5 Start AprilTag Localization (Real room tag list) -->

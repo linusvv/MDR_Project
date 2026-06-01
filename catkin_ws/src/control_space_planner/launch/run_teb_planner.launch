@@ -8,8 +8,8 @@
                 global_frame: odom
                 robot_base_frame: base_footprint
                 transform_tolerance: 2.0
-                update_frequency: 10.0
-                publish_frequency: 5.0
+                update_frequency: 25.0
+                publish_frequency: 10.0
                 rolling_window: true
                 width: 10.0
                 height: 10.0
@@ -18,7 +18,7 @@
                  - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
                 obstacle_layer:
                     observation_sources: point_cloud_sensor
-                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: -1.0, max_obstacle_height: 2.0}
+                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: -1.0, max_obstacle_height: 0.1}
             
             TebLocalPlannerROS:
                 odom_topic: /odom
@@ -33,18 +33,18 @@
                 allow_init_with_backwards_motion: False
                 max_global_plan_lookahead_dist: 1.0 # Short lookahead to focus on immediate path
                 global_plan_viapoint_sep: 0.1 # Relaxed via-point spacing to avoid oscillation at start
-                weight_kinematics_nh: 1000
-                weight_kinematics_forward_drive: 1000
-                weight_kinematics_turning_radius: 15
+                weight_kinematics_nh: 1000.0 # Maintain Ackerman constraints
+                weight_kinematics_forward_drive: 1000.0 # Maintain Ackerman constraints
+                weight_kinematics_turning_radius: 15.0
                 weight_optimaltime: 0.5
                 
                 # Robot Configuration
-                max_vel_x: 0.09
+                max_vel_x: 0.16
                 max_vel_y: 0.02     # Strictly NO sideways movement (Ackermann/diff drive only)
-                max_vel_theta: 0.5 # High turn speed for quick corrections
-                acc_lim_x: 0.5
+                max_vel_theta: 0.7 # High turn speed for quick corrections
+                acc_lim_x: 1.0
                 acc_lim_y: 0.02
-                acc_lim_theta: 0.5
+                acc_lim_theta: 1.5
                 min_turning_radius: 0.0 # Differential drive turning (turn in place)
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  
@@ -65,8 +65,8 @@
                 obstacle_poses_affected: 30
                 
                 # Optimization
-                no_inner_iterations: 15
-                no_outer_iterations: 6
+                no_inner_iterations: 5
+                no_outer_iterations: 4
                 penalty_epsilon: 0.1
                 weight_obstacle: 60 # STRONGLY prioritize obstacle avoidance
                 weight_viopoint: 80 # Heavy path following

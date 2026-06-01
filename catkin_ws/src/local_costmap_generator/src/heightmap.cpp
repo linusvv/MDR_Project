@@ -45,7 +45,7 @@ HeightMap::HeightMap(ros::NodeHandle node, ros::NodeHandle priv_nh)
   priv_nh.param("full_clouds", full_clouds_, false);
   priv_nh.param("grid_dimensions", grid_dim_, 200); // [cell] size of map; 200 cell = 20 [m] / 0.1 [m/cell]; 20 is calculated from MAP_MAX_X - MAP_MIN_X at 'heightmap_to_costmap.cpp'
   priv_nh.param("height_threshold", height_diff_threshold_, 0.05); // Reduced from 0.25m to catch lower parts of walls
-  priv_nh.param("max_obstacle_height", max_obstacle_height_, 0.30); // Ignore points at or above this height (30cm to clear floating signs)
+  priv_nh.param("max_obstacle_height", max_obstacle_height_, 0.10); // Ignore points at or above this height (10cm to clear floating signs)
   
   ROS_INFO_STREAM("height map parameters: "
                   << grid_dim_ << "x" << grid_dim_ << ", "

@@ -35,6 +35,8 @@ void MotionPlanner::CallbackOccupancyGrid(const nav_msgs::OccupancyGrid& msg)
 void MotionPlanner::CallbackGoalPoint(const nav_msgs::Path& msg)
 {
   if (msg.poses.empty()) {
+      this->bGetGoal = false;
+      this->StopRobot();
       return;
   }
   this->globalPath = msg;

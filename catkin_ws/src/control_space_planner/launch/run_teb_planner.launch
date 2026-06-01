@@ -5,11 +5,11 @@
         <!-- local_costmap configurations needed by TEB -->
         <rosparam>
             local_costmap:
-                global_frame: odom
+                global_frame: map
                 robot_base_frame: base_footprint
-                transform_tolerance: 2.0
-                update_frequency: 25.0
-                publish_frequency: 10.0
+                transform_tolerance: 10.0  # Extra headroom for RTAB-Map processing stalls
+                update_frequency: 5.0
+                publish_frequency: 5.0
                 rolling_window: true
                 width: 10.0
                 height: 10.0
@@ -18,7 +18,7 @@
                  - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
                 obstacle_layer:
                     observation_sources: point_cloud_sensor
-                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: -1.0, max_obstacle_height: 0.1}
+                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: 0.02, max_obstacle_height: 0.35}
             
             TebLocalPlannerROS:
                 odom_topic: /odom
@@ -67,7 +67,7 @@
                 # Optimization
                 no_inner_iterations: 5
                 no_outer_iterations: 4
-                penalty_epsilon: 0.1
+                penalty_epsilon: 0.01  # Must stay below min speed (0.02 m/s); was 0.1 causing negative bound warnings
                 weight_obstacle: 60 # STRONGLY prioritize obstacle avoidance
                 weight_viopoint: 80 # Heavy path following
                 weight_adapt_factor: 2.0

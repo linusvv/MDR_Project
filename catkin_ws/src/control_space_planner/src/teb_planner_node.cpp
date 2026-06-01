@@ -13,7 +13,7 @@ public:
     TebPlannerNode(ros::NodeHandle& nh) : nh_(nh), tf_buffer_(ros::Duration(60.0)), tf_listener_(tf_buffer_), plan_divider_(0) {
         // Subscribers & Publishers
         subGoalPoint = nh_.subscribe("/graph_planner/path/global_path", 1, &TebPlannerNode::CallbackGoalPoint, this);
-        pubCommand = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1, true);
+        pubCommand = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1);  // No latch: other planners must not receive stale TEB velocities
 
         // Initialize Costmap and TEB Planner objects gracefully
         try {
@@ -114,7 +114,18 @@ public:
     void SpinOnce() {
         std::string planner_type;
         nh_.param<std::string>("/local_planner_type", planner_type, "control_space");
-        if (planner_type != "teb") return;
+        if (planner_type != "teb") {
+            // Another planner (e.g. auto_pick / control_space) is active.
+            // If we were previously repeating, flush a stop command and disarm the repeater
+            // so the TEB repeater never overwrites another controller's cmd_vel.
+            if (path_received_) {
+                path_received_ = false;
+                last_cmd_vel_ = geometry_msgs::Twist();
+                pubCommand.publish(last_cmd_vel_); // explicit zero-velocity stop
+                ROS_INFO_ONCE("[TEB] Non-TEB planner active – repeater disarmed.");
+            }
+            return;
+        }
 
         // Only repeat/publish if we have an active path/goal we are approaching
         if (!path_received_) return;

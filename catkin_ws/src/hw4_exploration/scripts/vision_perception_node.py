@@ -20,8 +20,8 @@ class VisionPerceptionNode:
         self.image_lock = threading.Lock()
         self.latest_cv_image = None
         
-        # Subscribe to RealSense RGB camera topic
-        self.image_sub = rospy.Subscriber("/camera/color/image_raw", Image, self.image_cb)
+        # Subscribe to RealSense RGB camera topic (Throttled for performance)
+        self.image_sub = rospy.Subscriber("/camera/color/image_raw_throttle", Image, self.image_cb)
         
         # Do not wait for LLM service at startup to prevent deadlock.
         # It will be connected on-demand when Remote AI mode is enabled.

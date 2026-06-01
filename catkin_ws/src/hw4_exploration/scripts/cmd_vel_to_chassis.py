@@ -86,10 +86,12 @@ class CmdVelToChassis:
                 self.current_vel_msg.velocity = 0.0
                 self.current_vel_msg.direction = self.last_direction_deg
                 self.current_vel_msg.angular = 0.0
+                self.vel_pub.publish(self.current_vel_msg)
                 self.is_stopped = True
-                rospy.logdebug("[cmd_vel_to_chassis] Watchdog: no /cmd_vel for %.2fs — sending stop.", elapsed)
+                rospy.loginfo("[cmd_vel_to_chassis] Watchdog: no /cmd_vel for %.2fs — sending stop and idling.", elapsed)
+            return
         
-        # Always publish the current command at 60Hz
+        # Always publish the current command at 60Hz when active
         self.vel_pub.publish(self.current_vel_msg)
 
 if __name__ == '__main__':

@@ -54,7 +54,8 @@ private:
   double m_per_cell_;
   double height_diff_threshold_;
   bool full_clouds_;
-  double max_obstacle_height_;
+  double max_obstacle_height_;   // discard points above this (floating objects)
+  double min_obstacle_height_;   // discard points below this (floor / camera noise)
 
   // Point clouds generated in processData
   VPointCloud obstacle_cloud_;            

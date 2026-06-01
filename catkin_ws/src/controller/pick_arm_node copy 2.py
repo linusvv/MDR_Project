@@ -28,14 +28,11 @@ Optional topic:
 import os
 import sys
 
-import numpy as np
 import rospy
 from geometry_msgs.msg import Point
-from sensor_msgs.msg import Image, CameraInfo
 from hiwonder_servo_msgs.msg import MultiRawIdPosDur, RawIdPosDur
 from chassis_control.msg import SetVelocity
 from std_msgs.msg import Float64, String, Bool
-from cv_bridge import CvBridge
 
 
 _pkg_path = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -62,9 +59,7 @@ PITCH          = -140       # End-effector pitch angle (deg) — tilted downward
 PITCH_MIN      = -150
 PITCH_MAX      = -90
 
-HOME           = (0.00, 0.15, 0.06)    # Home position (lowered as requested)
-GRASP_OFFSET_X = 0.000                 # Tweak this if it always grabs too far left/right
-GRASP_OFFSET_Y = 0.000                 # Tweak this if it always grabs too far forward/backward
+HOME           = (0.00, 0.15, 0.12)    # Home position (waypoint after lift)
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -83,30 +78,11 @@ TOL_Y             = 0.020   # Forward alignment tolerance ±2 cm
 FORWARD_SPEED     = 80      # Forward/backward speed (mm/s)
 STRAFE_SPEED      = 60      # Lateral strafe speed (mm/s)
 CREEP_SPEED       = 50      # Fine approach speed (mm/s)
-CREEP_TIME        = 0.18    # Fine approach duration (s)
+CREEP_TIME        = 0.2     # Fine approach duration (s)  ->  50mm/s x 0.2s ~ 10mm
 
 VALID_Y_MIN       = -0.30   # Valid detection range lower bound
 VALID_Y_MAX       =  0.60   # Valid detection range upper bound
 DETECTION_TIMEOUT = 2.0     # Stop chassis if no detection for this duration (s)
-
-
-# ════════════════════════════════════════════════════════════════════════════
-# ── Grasp Verification Parameters ────────────────────────────────────────
-# ════════════════════════════════════════════════════════════════════════════
-VERIFY_POSE       = (0.000, 0.230, 0.020)   # Arm pose for depth check (m)
-VERIFY_PITCH      = -180                     # End-effector pitch during verification
-VERIFY_PITCH_MIN  = -185
-VERIFY_PITCH_MAX  = -150
-GRASP_DEPTH_THRES = 0.04    # Object detected if any pixel depth in patch < 4 cm
-VERIFY_RADIUS     = 50      # Pixel sampling radius around expected gripper location
-BACK_SPEED        = 60      # Chassis backup speed (mm/s)
-BACK_TIME         = 0.83    # Backup duration (s)  ->  60mm/s x 0.83s ~ 50mm
-
-# ── Linear calibration constants (mirror of yolo_detector.py) ────────────
-#   arm_x = Ax*X_cam + Bx*Z_cam + Cx
-#   arm_y = Ay*X_cam + By*Z_cam + Cy
-CAL_Ax = 1.445;  CAL_Bx = -0.350;  CAL_Cx = 0.035
-CAL_Ay = 0.015;  CAL_By = -0.316;  CAL_Cy = 0.299
 
 
 # ════════════════════════════════════════════════════════════════════════════
@@ -129,12 +105,6 @@ target_visible = False
 heartbeat_pub = None
 target_visible_pub = None
 
-# ── Camera intrinsics (updated from /camera/color/camera_info) ───────────
-_cam_fx = 917.3;  _cam_fy = 915.3   # focal length (px) — default from prior log
-_cam_cx = 642.8;  _cam_cy = 356.2   # principal point (px)
-_cam_intrinsic_ready = False
-_cv_bridge = CvBridge()
-
 
 # ════════════════════════════════════════════════════════════════════════════
 # ── Arm Control Helpers ──────────────────────────────────────────────────
@@ -154,149 +124,18 @@ def init_joints():
             f'/joint{n}_controller/command', Float64, queue_size=1)
 
 
-def camera_info_cb(msg):
-    """Latch camera intrinsics from /camera/color/camera_info on first message."""
-    global _cam_fx, _cam_fy, _cam_cx, _cam_cy, _cam_intrinsic_ready
-    if not _cam_intrinsic_ready:
-        _cam_fx = msg.K[0]
-        _cam_fy = msg.K[4]
-        _cam_cx = msg.K[2]
-        _cam_cy = msg.K[5]
-        _cam_intrinsic_ready = True
-        rospy.loginfo(
-            f'[pick_arm] Camera intrinsics: '
-            f'fx={_cam_fx:.1f} fy={_cam_fy:.1f} cx={_cam_cx:.1f} cy={_cam_cy:.1f}')
-
-
-def arm_to_pixel(arm_x, arm_y):
-    """
-    Inverse of the linear calibration transform (yolo_detector):
-      arm frame (arm_x, arm_y) -> camera frame (X_cam, Z_cam) -> pixel (u, v)
-
-    Y_cam is not included in the calibration, so v defaults to the principal point cy.
-    Returns (u, v) or None if Z_cam <= 0.
-    """
-    det   = CAL_Ax * CAL_By - CAL_Bx * CAL_Ay
-    X_cam = (CAL_By * (arm_x - CAL_Cx) - CAL_Bx * (arm_y - CAL_Cy)) / det
-    Z_cam = (CAL_Ax * (arm_y - CAL_Cy) - CAL_Ay * (arm_x - CAL_Cx)) / det
-    if Z_cam <= 0:
-        return None
-    u = int(X_cam * _cam_fx / Z_cam + _cam_cx)
-    v = int(_cam_cy)
-    return u, v
-
-
-def verify_grasp_depth():
-    """
-    Depth-based grasp verification.
-      1. Back chassis ~5 cm.
-      2. Move arm to VERIFY_POSE with pitch = -180.
-      3. Sample depth around expected end-effector pixel.
-      4. Return True if min depth in patch < GRASP_DEPTH_THRES (4 cm).
-
-    After this call the chassis is ~5 cm behind the pick position and the
-    arm is at VERIFY_POSE — pick_and_place() must handle lift from there.
-    """
-    rospy.loginfo('[pick_arm] Grasp verify: backing up ~5 cm...')
-    chassis_cmd(BACK_SPEED, 270, 0)   # 270 deg = backward
-    rospy.sleep(BACK_TIME)
-    chassis_stop()
-
-    # Move arm to verification pose (pitch = -180, arm pointing up toward camera)
-    rospy.loginfo('[pick_arm] Grasp verify: moving arm to verify pose...')
-    vx, vy, vz = VERIFY_POSE
-    target = _ik.setPitchRanges((vx, vy, vz), VERIFY_PITCH, VERIFY_PITCH_MIN, VERIFY_PITCH_MAX)
-    if target:
-        sd = target[1]
-        send_servos({
-            2: SERVO2_DEFAULT,
-            3: sd['servo3'],
-            4: sd['servo4'],
-            5: sd['servo5'],
-            6: sd['servo6'],
-        })
-    else:
-        rospy.logwarn('[pick_arm] Grasp verify: no IK solution for verify pose — assuming PASS')
-        return True
-    rospy.sleep(1.2)   # wait for arm to settle
-
-    # Compute expected pixel location of end effector
-    uv = arm_to_pixel(vx, vy)
-    if uv is None:
-        rospy.logwarn('[pick_arm] Grasp verify: invalid pixel projection — assuming PASS')
-        return True
-    u, v = uv
-    rospy.loginfo(f'[pick_arm] Grasp verify: sampling depth at pixel ({u}, {v}) r={VERIFY_RADIUS}')
-
-    # Grab one aligned depth frame
-    try:
-        depth_msg = rospy.wait_for_message(
-            '/camera/aligned_depth_to_color/image_raw', Image, timeout=2.0)
-    except rospy.ROSException:
-        rospy.logwarn('[pick_arm] Grasp verify: depth timeout — assuming PASS')
-        return True
-
-    depth = _cv_bridge.imgmsg_to_cv2(depth_msg, desired_encoding='passthrough')
-    h, w  = depth.shape
-
-    # Sample patch around expected gripper pixel
-    u0, u1 = max(0, u - VERIFY_RADIUS), min(w, u + VERIFY_RADIUS + 1)
-    v0, v1 = max(0, v - VERIFY_RADIUS), min(h, v + VERIFY_RADIUS + 1)
-    patch  = depth[v0:v1, u0:u1].astype(np.float32) * 0.001   # mm -> m
-    valid  = patch[patch > 0]
-
-    if len(valid) == 0:
-        rospy.logwarn('[pick_arm] Grasp verify: no valid depth pixels in patch — assuming PASS')
-        return True
-
-    min_depth = float(np.min(valid))
-    rospy.loginfo(
-        f'[pick_arm] Grasp verify: min_depth={min_depth*100:.1f} cm  '
-        f'threshold={GRASP_DEPTH_THRES*100:.0f} cm')
-
-    if min_depth < GRASP_DEPTH_THRES:
-        rospy.loginfo('[pick_arm] Grasp verify: PASS — object detected in gripper')
-        return True
-    else:
-        rospy.logwarn('[pick_arm] Grasp verify: FAIL — gripper appears empty')
-        return False
-
-
 def set_final_pose():
     """
     Move arm to final place pose using absolute joint angles (rad), then open gripper.
-    Interpolates slowly over 4 seconds to avoid fast snapping.
+      joint1=0, joint2=-0.4, joint3=1.0, joint4=1.0, joint5=0, gripper open
     """
-    import sensor_msgs.msg
-    rospy.loginfo('[pick_arm] Moving to final place pose (slowly)...')
-    target_j = [0.0, -0.4, 1.0, 1.0, 0.0]
-    
-    current_j = None
-    try:
-        js = rospy.wait_for_message('/joint_states', sensor_msgs.msg.JointState, timeout=1.0)
-        current_j = [0.0, 0.0, 0.0, 0.0, 0.0]
-        for i in range(1, 6):
-            j_name = 'joint' + str(i)
-            if j_name in js.name:
-                idx = js.name.index(j_name)
-                current_j[i-1] = js.position[idx]
-    except Exception as e:
-        rospy.logwarn('Could not get joint_states')
-    
-    if current_j is not None:
-        steps = 40
-        delay = 4.0 / steps
-        for step in range(1, steps + 1):
-            fraction = step / float(steps)
-            for i in range(5):
-                val = current_j[i] + fraction * (target_j[i] - current_j[i])
-                _joint_pubs[i+1].publish(Float64(data=val))
-            rospy.sleep(delay)
-    else:
-        for i in range(5):
-            _joint_pubs[i+1].publish(Float64(data=target_j[i]))
-        rospy.sleep(4.0)
-    
+    rospy.loginfo('[pick_arm] Moving to final place pose...')
+    _joint_pubs[1].publish(Float64(data= 0.0))
+    _joint_pubs[2].publish(Float64(data=-0.4))
+    _joint_pubs[3].publish(Float64(data= 1.0))
+    _joint_pubs[4].publish(Float64(data= 1.0))
+    _joint_pubs[5].publish(Float64(data= 0.0))
+    rospy.sleep(MOVE_SLEEP)
     set_gripper(GRIPPER_OPEN)
     rospy.sleep(GRIP_SLEEP)
     rospy.loginfo('[pick_arm] Final pose reached')
@@ -319,7 +158,7 @@ def set_gripper(pulse):
     send_servos({1: pulse}, duration=400)
 
 
-def move_to(x, y, z, label='', step_down=False, current_z=None, duration=SERVO_DURATION):
+def move_to(x, y, z, label='', step_down=False, current_z=None):
     """
     Solve IK and send servo commands to move arm to (x, y, z).
     If step_down=True, descend incrementally from current_z to z in 0.02m steps
@@ -333,7 +172,7 @@ def move_to(x, y, z, label='', step_down=False, current_z=None, duration=SERVO_D
             if target:
                 sd = target[1]
                 send_servos({2: SERVO2_DEFAULT, 3: sd['servo3'],
-                             4: sd['servo4'],   5: sd['servo5'], 6: sd['servo6']}, duration=duration)
+                             4: sd['servo4'],   5: sd['servo5'], 6: sd['servo6']})
                 rospy.sleep(0.3)
 
     target = _ik.setPitchRanges((x, y, z), PITCH, PITCH_MIN, PITCH_MAX)
@@ -345,7 +184,7 @@ def move_to(x, y, z, label='', step_down=False, current_z=None, duration=SERVO_D
             4: sd['servo4'],
             5: sd['servo5'],
             6: sd['servo6'],
-        }, duration=duration)
+        })
         rospy.loginfo(f'  -> {label}  ({x:.3f}, {y:.3f}, {z:.3f})')
         return True
     else:
@@ -363,10 +202,6 @@ def pick_and_place(px, py, pz):
     global heartbeat_pub
     if heartbeat_pub is not None:
         heartbeat_pub.publish(String("picking up object"))
-    
-    # Apply manual grasp offsets to correct pose estimation errors
-    px += GRASP_OFFSET_X
-    py += GRASP_OFFSET_Y
     
     rospy.loginfo(f'=== PICK  ({px:.3f}, {py:.3f}, {pz:.3f})')
 
@@ -391,44 +226,15 @@ def pick_and_place(px, py, pz):
     set_gripper(GRIPPER_CLOSE)
     rospy.sleep(GRIP_SLEEP)
 
-        # 4.5. Verify grasp via depth camera
-    #      verify_grasp_depth() backs chassis ~5 cm and moves arm to VERIFY_POSE,
-    #      so the lift in step 5 departs from VERIFY_POSE, not (px, py).
-    # grasped = verify_grasp_depth()
-    # if not grasped:
-    #    rospy.logwarn('[pick_arm] Grasp FAILED — opening gripper and returning to HOME')
-    #    set_gripper(GRIPPER_OPEN)
-    #    rospy.sleep(GRIP_SLEEP)
-    #    move_to(*HOME, 'home_abort')
-    #    rospy.sleep(MOVE_SLEEP)
-    #    if heartbeat_pub is not None:
-    #        heartbeat_pub.publish(String("grasp failed"))
-    #    return False
 
-    # 5. Lift from verify pose
-    # vx, vy, _ = VERIFY_POSE
-    # if not move_to(vx, vy, Z_APPROACH, 'lift'):
-
-
-    # 4.5. Back up slightly to avoid hitting the wall
-    rospy.loginfo('[pick_arm] Backing up to avoid wall (~1 wheel rotation)...')
-    chassis_cmd(velocity=60, direction=270, angular=0) # 270 = backward
-    rospy.sleep(2.0) # 3.0 seconds at 60mm/s = ~18cm backward (approx 1 wheel rotation)
-    chassis_stop()
-
-    # 5. Lift object VERY SLOWLY (4.0 seconds)
-    if not move_to(px, py, Z_APPROACH, 'lift', duration=2500):
+    # 5. Lift object
+    if not move_to(px, py, Z_APPROACH, 'lift'):
         rospy.logerr('Lift failed — gripper may still be holding object')
-    rospy.sleep(3)  # Wait longer because the movement is very slow
+    rospy.sleep(MOVE_SLEEP)
 
     # ── PLACE PHASE ───────────────────────────────────────────────────────
     # 6. Move to place pose via joint controllers and release object
     set_final_pose()
-
-    # 7. Return to HOME position slowly
-    rospy.loginfo('[pick_arm] Returning to lowered HOME position...')
-    move_to(*HOME, 'home_return', duration=3000)
-    rospy.sleep(3.5)
 
     rospy.loginfo('=== Pick & Place DONE ===')
     if heartbeat_pub is not None:
@@ -504,10 +310,7 @@ def control_loop(event):
             chassis_stop()
             state = IDLE
         if heartbeat_pub is not None and state == IDLE:
-            if target_item not in ["None", ""]:
-                heartbeat_pub.publish(String("could not detect"))
-            else:
-                heartbeat_pub.publish(String("idle"))
+            heartbeat_pub.publish(String("idle"))
         return
 
     # ── IDLE ──────────────────────────────────────────────────────────────
@@ -611,9 +414,8 @@ if __name__ == '__main__':
     rospy.sleep(1.5)
 
     # ── Subscribers ───────────────────────────────────────────────────────
-    rospy.Subscriber('/yolo/arm_point',              Point,      arm_point_cb)
-    rospy.Subscriber('/target_item',                 String,     target_item_cb)
-    rospy.Subscriber('/camera/color/camera_info',    CameraInfo, camera_info_cb)
+    rospy.Subscriber('/yolo/arm_point',           Point,           arm_point_cb)
+    rospy.Subscriber('/target_item',              String,          target_item_cb)
 
     # ── 10 Hz control loop ────────────────────────────────────────────────
     rospy.Timer(rospy.Duration(0.1), control_loop)

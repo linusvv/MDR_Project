@@ -79,6 +79,7 @@ class RobotWebServer:
         self.searching_tag = False
         self.search_thread = None
         self.navigating_to_tag = False
+        self.map_viewport = {}  # Stores current map crop/scale metadata for pixel→world conversion
         
         # Set default parameter: Local AI mode active on startup
         rospy.set_param("/use_local_ai", True)
@@ -1908,6 +1909,19 @@ class RobotWebServer:
                     target_w = 650
                 resized_map = cv2.resize(map_img, (target_w, target_h), interpolation=cv2.INTER_NEAREST)
                 
+                # Store viewport info for the /api/map_info endpoint
+                # so the JS click handler can do pixel→world coordinate conversion
+                with self.lock:
+                    self.map_viewport = {
+                        "res": resolution,
+                        "ox": origin.position.x,
+                        "oy": origin.position.y,
+                        "map_w": width,
+                        "map_h": height,
+                        "disp_w": target_w,
+                        "disp_h": target_h,
+                    }
+                
                 ret, buffer = cv2.imencode('.jpg', resized_map)
                 if ret:
                     yield (b'--frame\r\n'
@@ -2501,6 +2515,44 @@ def delivery_send():
         }
         
     return jsonify({"reply": reply, "tasks": tasks})
+
+@app.route('/api/map_info')
+def api_map_info():
+    """Returns current SLAM map viewport metadata so the JS click handler can
+    convert image pixel coordinates to real-world map coordinates."""
+    with server.lock:
+        vp = dict(server.map_viewport)
+    if not vp:
+        return jsonify({"status": "no_map"})
+    vp["status"] = "ok"
+    return jsonify(vp)
+
+@app.route('/api/taxi_to', methods=['POST'])
+def api_taxi_to():
+    """Navigate to an arbitrary (x, y) position in the map frame."""
+    data = request.json or {}
+    try:
+        gx = float(data['x'])
+        gy = float(data['y'])
+    except (KeyError, ValueError) as e:
+        return jsonify({"status": "error", "message": f"Invalid coordinates: {e}"}), 400
+
+    rospy.loginfo(f"[Taxi] Navigating to map position ({gx:.2f}, {gy:.2f})")
+
+    # Stop any ongoing task first
+    server.stop_robot()
+
+    def taxi_thread():
+        server.navigating_to_pose_active = True
+        arrived = server.navigate_to_pose(gx, gy, yaw=0.0, ignore_yaw=True, dist_tol=0.3)
+        if arrived:
+            rospy.loginfo(f"[Taxi] Arrived at ({gx:.2f}, {gy:.2f})")
+        else:
+            rospy.logwarn(f"[Taxi] Did not arrive at ({gx:.2f}, {gy:.2f}) (timeout or blocked).")
+
+    t = threading.Thread(target=taxi_thread, daemon=True)
+    t.start()
+    return jsonify({"status": "ok", "message": f"Navigating to ({gx:.2f}, {gy:.2f})"})
 
 @app.route('/api/reset', methods=['POST'])
 def api_reset():

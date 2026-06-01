@@ -33,8 +33,8 @@ public:
     float MAP_MIN_Y = -10; // map min y position
     float MAP_MAX_Y =  10; // map max y position
 
-    float MIN_OBSTACLE_HEIGHT = 0.04; // [m] ignore ground points
-    float MAX_OBSTACLE_HEIGHT = 0.10; // [m] Limit to 10cm to allow passing under floating signboards
+    float MIN_OBSTACLE_HEIGHT = 0.02; // [m] ignore near-zero floor reflections
+    float MAX_OBSTACLE_HEIGHT = 0.35; // [m] robot body clearance — ignore anything above this (floating signs, table tops)
 
     float INFLATION_RADIUS = 0.6; // [m] Increased to 1.5x (0.4m -> 0.6m) for a larger dangerous zone
     float INFLATION_RES    = RESOLUTION_; // [m] resolution of inflation

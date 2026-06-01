@@ -1072,6 +1072,211 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // ---------------------------------------------------------------
+    // TAXI MODE – Map-click + manual coordinate navigation
+    // ---------------------------------------------------------------
+    const taxiMapStream  = document.getElementById('taxi-map-stream');
+    const taxiCanvas     = document.getElementById('taxi-map-canvas');
+    const taxiStatusEl   = document.getElementById('taxi-status');
+    const taxiClickCoords = document.getElementById('taxi-click-coords');
+    const taxiXInput     = document.getElementById('taxi-x');
+    const taxiYInput     = document.getElementById('taxi-y');
+    const btnTaxiGo      = document.getElementById('btn-taxi-go');
+    const btnTaxiCancel  = document.getElementById('btn-taxi-cancel');
+
+    let taxiMapStreamActive = false;
+    let taxiPendingPoint = null;   // { wx, wy } – world coords of clicked point
+
+    // Start/stop the map stream when the Taxi tab is selected
+    tabBtns.forEach(btn => {
+        btn.addEventListener('click', () => {
+            if (btn.dataset.tab === 'taxi') {
+                if (taxiMapStream && !taxiMapStreamActive) {
+                    taxiMapStream.src = '/video_map';
+                    taxiMapStreamActive = true;
+                }
+            }
+        });
+    });
+
+    // Resize the canvas to match the displayed image size
+    function resizeTaxiCanvas() {
+        if (!taxiCanvas || !taxiMapStream) return;
+        taxiCanvas.width  = taxiMapStream.clientWidth  || taxiMapStream.naturalWidth  || 400;
+        taxiCanvas.height = taxiMapStream.clientHeight || taxiMapStream.naturalHeight || 350;
+    }
+    if (taxiMapStream) {
+        taxiMapStream.addEventListener('load', resizeTaxiCanvas);
+        window.addEventListener('resize', resizeTaxiCanvas);
+    }
+
+    // Convert a pixel click on the displayed <img> to world (map-frame) coordinates
+    async function pixelToWorld(imgEl, px, py) {
+        try {
+            const resp = await fetch('/api/map_info');
+            const vp = await resp.json();
+            if (vp.status !== 'ok') return null;
+
+            // px, py are in CSS pixels relative to the img element's bounding box.
+            // The image is rendered at (disp_w × disp_h) but may be CSS-scaled.
+            const rect = imgEl.getBoundingClientRect();
+            const scaleX = vp.disp_w / rect.width;
+            const scaleY = vp.disp_h / rect.height;
+
+            // Position in the rendered (disp_w × disp_h) image
+            const dispX = px * scaleX;
+            const dispY = py * scaleY;
+
+            // The rendered image is the full (map_w × map_h) grid scaled to
+            // (disp_w × disp_h) with aspect ratio maintained.
+            const scaleImg = vp.disp_h / vp.map_h;  // same scale for both axes
+
+            // Pixel in the full flipped map image
+            const mapCol = dispX / scaleImg;                 // column (x axis)
+            const mapRowFlipped = dispY / scaleImg;          // row in flipped image
+
+            // Undo vertical flip
+            const mapRow = vp.map_h - 1 - mapRowFlipped;
+
+            // Convert map-pixels to world metres
+            const wx = vp.ox + mapCol  * vp.res;
+            const wy = vp.oy + mapRow  * vp.res;
+            return { wx, wy };
+        } catch(e) {
+            console.error('[Taxi] pixelToWorld error:', e);
+            return null;
+        }
+    }
+
+    // Draw a crosshair on the canvas at (px, py)
+    function drawCrosshair(px, py, color = '#22d3ee', label = '') {
+        if (!taxiCanvas) return;
+        resizeTaxiCanvas();
+        const ctx = taxiCanvas.getContext('2d');
+        ctx.clearRect(0, 0, taxiCanvas.width, taxiCanvas.height);
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        const r = 12;
+        // Cross
+        ctx.beginPath();
+        ctx.moveTo(px - r, py); ctx.lineTo(px + r, py);
+        ctx.moveTo(px, py - r); ctx.lineTo(px, py + r);
+        ctx.stroke();
+        // Circle
+        ctx.beginPath();
+        ctx.arc(px, py, r * 0.6, 0, 2 * Math.PI);
+        ctx.stroke();
+        // Label
+        if (label) {
+            ctx.fillStyle = color;
+            ctx.font = 'bold 11px Inter, sans-serif';
+            ctx.fillText(label, px + r + 3, py - 3);
+        }
+    }
+
+    function setTaxiStatus(msg, type = 'info') {
+        if (!taxiStatusEl) return;
+        const colors = { info: '#94a3b8', ok: '#34d399', warn: '#fbbf24', error: '#f87171' };
+        taxiStatusEl.textContent = msg;
+        taxiStatusEl.style.color = colors[type] || colors.info;
+    }
+
+    // Send navigation command to backend
+    async function sendTaxiTo(wx, wy) {
+        setTaxiStatus(`🚀 Navigating to (${wx.toFixed(2)}, ${wy.toFixed(2)}) m …`, 'ok');
+        logConsole(`[Taxi] Sending robot to map (${wx.toFixed(2)}, ${wy.toFixed(2)})`);
+        try {
+            const res = await fetch('/api/taxi_to', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ x: wx, y: wy })
+            });
+            const data = await res.json();
+            if (res.ok) {
+                setTaxiStatus(`✅ ${data.message}`, 'ok');
+                logConsole(`[Taxi] ${data.message}`);
+            } else {
+                setTaxiStatus(`⚠️ ${data.message}`, 'error');
+                logConsole(`[Taxi] Error: ${data.message}`);
+            }
+        } catch(e) {
+            setTaxiStatus('❌ Connection error.', 'error');
+            logConsole('[Taxi] Failed to reach backend.');
+        }
+    }
+
+    // Single-click → preview crosshair + fill coordinate fields
+    if (taxiCanvas) {
+        taxiCanvas.addEventListener('click', async (e) => {
+            resizeTaxiCanvas();
+            const rect = taxiCanvas.getBoundingClientRect();
+            const px = e.clientX - rect.left;
+            const py = e.clientY - rect.top;
+
+            const pt = await pixelToWorld(taxiMapStream, px, py);
+            if (!pt) {
+                setTaxiStatus('Map not ready. Wait for SLAM map.', 'warn');
+                return;
+            }
+            taxiPendingPoint = pt;
+            if (taxiXInput) taxiXInput.value = pt.wx.toFixed(2);
+            if (taxiYInput) taxiYInput.value = pt.wy.toFixed(2);
+            if (taxiClickCoords) {
+                taxiClickCoords.textContent =
+                    `Preview: X = ${pt.wx.toFixed(2)} m, Y = ${pt.wy.toFixed(2)} m  (double-click to confirm)`;
+            }
+            drawCrosshair(px, py, '#22d3ee',
+                `(${pt.wx.toFixed(1)}, ${pt.wy.toFixed(1)})`);
+            setTaxiStatus(
+                `📍 Selected (${pt.wx.toFixed(2)}, ${pt.wy.toFixed(2)}) m — double-click to navigate.`,
+                'info');
+        });
+
+        // Double-click → confirm and navigate
+        taxiCanvas.addEventListener('dblclick', async (e) => {
+            if (!taxiPendingPoint) return;
+            const { wx, wy } = taxiPendingPoint;
+            // Change crosshair colour to green on confirm
+            const rect = taxiCanvas.getBoundingClientRect();
+            drawCrosshair(e.clientX - rect.left, e.clientY - rect.top, '#4ade80',
+                `GO (${wx.toFixed(1)}, ${wy.toFixed(1)})`);
+            await sendTaxiTo(wx, wy);
+        });
+    }
+
+    // Manual form Go button
+    if (btnTaxiGo) {
+        btnTaxiGo.addEventListener('click', async () => {
+            const wx = parseFloat(taxiXInput ? taxiXInput.value : NaN);
+            const wy = parseFloat(taxiYInput ? taxiYInput.value : NaN);
+            if (isNaN(wx) || isNaN(wy)) {
+                setTaxiStatus('⚠️ Please enter valid X and Y coordinates.', 'warn');
+                return;
+            }
+            await sendTaxiTo(wx, wy);
+        });
+    }
+
+    // Cancel navigation
+    if (btnTaxiCancel) {
+        btnTaxiCancel.addEventListener('click', async () => {
+            try {
+                await fetch('/api/stop', { method: 'POST',
+                    headers: { 'Content-Type': 'application/json' } });
+                setTaxiStatus('🛑 Navigation cancelled.', 'warn');
+                logConsole('[Taxi] Navigation cancelled by user.');
+                taxiPendingPoint = null;
+                if (taxiCanvas) {
+                    const ctx = taxiCanvas.getContext('2d');
+                    ctx.clearRect(0, 0, taxiCanvas.width, taxiCanvas.height);
+                }
+                if (taxiClickCoords) taxiClickCoords.textContent = 'No point selected.';
+            } catch(e) {
+                logConsole('[Taxi] Failed to cancel navigation.');
+            }
+        });
+    }
+
     // Trigger initial poll
     updateTelemetry();
 

@@ -22,6 +22,7 @@
                     <button class="tab-btn active" data-tab="remote">Remote Control</button>
                     <button class="tab-btn" data-tab="detect">Detect Mode</button>
                     <button class="tab-btn" data-tab="delivery">Delivery</button>
+                    <button class="tab-btn" data-tab="taxi">🚖 Taxi</button>
                 </div>
             </div>
 
@@ -291,6 +292,59 @@
                             <input type="text" id="chat-input" placeholder="e.g. Bring me coffee / Go to Pharmacy...">
                             <button class="btn-primary" id="btn-send-chat">Send</button>
                         </div>
+                    </div>
+                </div>
+
+                <!-- Panel 4: Taxi Mode Panel -->
+                <div class="card control-card tab-panel" id="panel-taxi" style="display: none;">
+                    <div class="card-header">
+                        <h2 style="font-size: 1rem; margin-bottom: 0.8rem; color: #94a3b8; display: flex; align-items: center;">
+                            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" style="margin-right: 0.5rem;"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+                            Taxi – Navigate to Point
+                        </h2>
+                    </div>
+
+                    <!-- Manual coordinate entry -->
+                    <div style="padding: 0 0.2rem;">
+                        <h3 style="margin-bottom: 0.6rem; font-size: 0.9rem; color: #38bdf8;">Manual Coordinates (map frame)</h3>
+                        <div style="display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.5rem;">
+                            <label style="font-size: 0.8rem; color: #94a3b8; width: 24px;">X:</label>
+                            <input type="number" id="taxi-x" step="0.1" placeholder="0.00"
+                                style="flex: 1; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; padding: 0.45rem 0.6rem; color: #e2e8f0; font-size: 0.9rem; outline: none;">
+                            <label style="font-size: 0.8rem; color: #94a3b8; width: 24px;">Y:</label>
+                            <input type="number" id="taxi-y" step="0.1" placeholder="0.00"
+                                style="flex: 1; background: rgba(0,0,0,0.25); border: 1px solid rgba(255,255,255,0.15); border-radius: 6px; padding: 0.45rem 0.6rem; color: #e2e8f0; font-size: 0.9rem; outline: none;">
+                        </div>
+                        <div style="display: flex; gap: 0.5rem;">
+                            <button class="detect-btn" id="btn-taxi-go"
+                                style="flex: 2; background: linear-gradient(135deg, #0ea5e9, #6366f1); font-size: 0.9rem; font-weight: 700;">
+                                <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" style="margin-right: 0.4rem; vertical-align: middle;"><circle cx="12" cy="12" r="10"/><polygon points="10 8 16 12 10 16 10 8"/></svg>
+                                Go to Coordinates
+                            </button>
+                            <button class="detect-btn" id="btn-taxi-cancel"
+                                style="flex: 1; background: #dc2626; font-size: 0.9rem; font-weight: 600;">
+                                Cancel
+                            </button>
+                        </div>
+
+                        <!-- Status bar -->
+                        <div id="taxi-status" style="margin-top: 0.6rem; padding: 0.45rem 0.7rem; border-radius: 6px; background: rgba(255,255,255,0.04); border: 1px solid rgba(255,255,255,0.06); font-size: 0.8rem; color: #64748b; min-height: 2rem; display: flex; align-items: center;">
+                            Idle – enter coordinates or click the map below.
+                        </div>
+                    </div>
+
+                    <!-- Clickable SLAM map -->
+                    <div style="margin-top: 1rem; border-top: 1px solid rgba(255,255,255,0.08); padding-top: 1rem;">
+                        <h3 style="margin-bottom: 0.5rem; font-size: 0.9rem; color: #38bdf8;">Click on Map to Set Goal</h3>
+                        <p style="font-size: 0.75rem; color: #475569; margin-bottom: 0.5rem;">
+                            Single-click to preview, double-click to confirm navigation.
+                        </p>
+                        <!-- Map image + canvas overlay stacked in a relative container -->
+                        <div style="position: relative; display: inline-block; border-radius: 8px; overflow: hidden; border: 1px solid rgba(255,255,255,0.08); width: 100%;">
+                            <img id="taxi-map-stream" src="" alt="SLAM Map" style="width: 100%; display: block; object-fit: contain; image-rendering: pixelated;">
+                            <canvas id="taxi-map-canvas" style="position: absolute; top: 0; left: 0; width: 100%; height: 100%; cursor: crosshair;"></canvas>
+                        </div>
+                        <div id="taxi-click-coords" style="margin-top: 0.4rem; font-size: 0.78rem; color: #64748b; text-align: center;">No point selected.</div>
                     </div>
                 </div>
 

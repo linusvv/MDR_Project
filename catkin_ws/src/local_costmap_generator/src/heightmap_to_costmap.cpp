@@ -58,6 +58,7 @@ private:
     bool bGetPoint = false;
     ros::Time last_process_time_;
     bool first_frame_ = true;
+    geometry_msgs::TransformStamped last_map_tf_;
 
     // Grid sizes
     int width_;
@@ -100,48 +101,60 @@ void HeightmapToCostMap::generate_costmap()
         std::string target_frame = cloud_xyz->header.frame_id;
         
         // --- 1. SPATIAL MEMORY SHIFT (Odometry compensation) ---
+        geometry_msgs::TransformStamped current_map_tf;
+        try {
+            // CRITICAL: Use 'map' frame instead of 'odom'. 
+            // If the robot is physically moved, 'odom' (wheel encoders) doesn't change, but 'map' (localization) does!
+            current_map_tf = tf_buffer_.lookupTransform("map", target_frame, ros::Time(0));
+        } catch (tf2::TransformException &ex) {
+            ROS_WARN_THROTTLE(1.0, "[Costmap Memory] TF Error, cannot shift memory: %s", ex.what());
+            bGetPoint = false;
+            return;
+        }
+
         if (!first_frame_) {
-            try {
-                // Find how the robot moved by looking up where the OLD frame is in the CURRENT frame.
-                // Inverse-mapping: target=OLD, source=CURRENT. 
-                // This lets us perfectly query where a physical world point in the CURRENT grid was previously mapped.
-                geometry_msgs::TransformStamped t_inv = tf_buffer_.lookupTransform(
-                    target_frame, last_process_time_, 
-                    target_frame, current_time, 
-                    "odom", ros::Duration(0.1));
-                
-                std::vector<int> new_ttl_grid(width_ * height_, 0);
-                std::vector<int> new_hit_grid(width_ * height_, 0);
+            // Calculate relative transform mathematically to avoid TF history timeout issues.
+            // T_inv = T_last_inv * T_current
+            tf2::Transform T_current;
+            tf2::fromMsg(current_map_tf.transform, T_current);
 
-                for (int y = 0; y < height_; ++y) {
-                    for (int x = 0; x < width_; ++x) {
-                        double px_new = MAP_MIN_X + (x + 0.5) * RESOLUTION_;
-                        double py_new = MAP_MIN_Y + (y + 0.5) * RESOLUTION_;
+            tf2::Transform T_last;
+            tf2::fromMsg(last_map_tf_.transform, T_last);
 
-                        geometry_msgs::Point pt_new;
-                        pt_new.x = px_new; pt_new.y = py_new; pt_new.z = 0.0;
-                        geometry_msgs::Point pt_old;
-                        tf2::doTransform(pt_new, pt_old, t_inv);
+            tf2::Transform T_inv = T_last.inverse() * T_current;
+            geometry_msgs::TransformStamped t_inv_msg;
+            t_inv_msg.transform = tf2::toMsg(T_inv);
 
-                        int x_old = int((pt_old.x - MAP_MIN_X) / RESOLUTION_);
-                        int y_old = int((pt_old.y - MAP_MIN_Y) / RESOLUTION_);
+            std::vector<int> new_ttl_grid(width_ * height_, 0);
+            std::vector<int> new_hit_grid(width_ * height_, 0);
 
-                        if (x_old >= 0 && x_old < width_ && y_old >= 0 && y_old < height_) {
-                            int idx_new = MAP_IDX(width_, x, y);
-                            int idx_old = MAP_IDX(width_, x_old, y_old);
-                            new_ttl_grid[idx_new] = ttl_grid_[idx_old];
-                            new_hit_grid[idx_new] = hit_count_grid_[idx_old];
-                        }
+            for (int y = 0; y < height_; ++y) {
+                for (int x = 0; x < width_; ++x) {
+                    double px_new = MAP_MIN_X + (x + 0.5) * RESOLUTION_;
+                    double py_new = MAP_MIN_Y + (y + 0.5) * RESOLUTION_;
+
+                    geometry_msgs::Point pt_new;
+                    pt_new.x = px_new; pt_new.y = py_new; pt_new.z = 0.0;
+                    geometry_msgs::Point pt_old;
+                    tf2::doTransform(pt_new, pt_old, t_inv_msg);
+
+                    int x_old = int((pt_old.x - MAP_MIN_X) / RESOLUTION_);
+                    int y_old = int((pt_old.y - MAP_MIN_Y) / RESOLUTION_);
+
+                    if (x_old >= 0 && x_old < width_ && y_old >= 0 && y_old < height_) {
+                        int idx_new = MAP_IDX(width_, x, y);
+                        int idx_old = MAP_IDX(width_, x_old, y_old);
+                        new_ttl_grid[idx_new] = ttl_grid_[idx_old];
+                        new_hit_grid[idx_new] = hit_count_grid_[idx_old];
                     }
                 }
-                ttl_grid_ = new_ttl_grid;
-                hit_count_grid_ = new_hit_grid;
-            } catch (tf2::TransformException &ex) {
-                // If TF fails, we just don't shift. Small penalty during stalls.
             }
+            ttl_grid_ = new_ttl_grid;
+            hit_count_grid_ = new_hit_grid;
         }
         first_frame_ = false;
         last_process_time_ = current_time;
+        last_map_tf_ = current_map_tf;
 
         // --- 2. POPULATE CURRENT HITS ---
         std::vector<bool> hits_this_frame(width_ * height_, false);
@@ -186,16 +199,15 @@ void HeightmapToCostMap::generate_costmap()
         for (int i = 0; i < width_ * height_; ++i) {
             if (hits_this_frame[i]) {
                 hit_count_grid_[i]++;
-                // Require 2 consecutive frames to reject false positives!
-                if (hit_count_grid_[i] >= 2) {
-                    ttl_grid_[i] = 5; // 0.5 seconds of memory at 10Hz
-                }
             } else {
-                hit_count_grid_[i] = 0;
+                // Decay hit counter quickly so stale detections don't linger
+                if (hit_count_grid_[i] > 0) hit_count_grid_[i]--;
             }
 
-            if (ttl_grid_[i] > 0) {
-                ttl_grid_[i]--;
+            // Require 2 consecutive frames before marking as obstacle (false-positive filter)
+            // TTL persistence disabled — RTAB static layer handles corners now
+            bool show = (hit_count_grid_[i] >= 2) || hits_this_frame[i];
+            if (show) {
                 oMap.data[i] = 100;
                 point_count++;
             }

@@ -28,14 +28,19 @@
                 height: 4.0
                 resolution: 0.1
                 plugins:
-                 - {name: custom_obstacle_layer, type: "costmap_2d::StaticLayer"}
-                 - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+                 - {name: rtabmap_layer,       type: "costmap_2d::StaticLayer"}  # Permanent SLAM walls — corners always visible!
+                 - {name: custom_obstacle_layer, type: "costmap_2d::StaticLayer"}  # Real-time dynamic obstacles
+                 - {name: inflation_layer,      type: "costmap_2d::InflationLayer"}
+                rtabmap_layer:
+                    map_topic: /rtabmap/grid_map
+                    subscribe_to_updates: true
+                    track_unknown_space: false
                 custom_obstacle_layer:
                     map_topic: /map/local_map/obstacle
                     subscribe_to_updates: true
                 inflation_layer:
-                    inflation_radius: 0.5
-                    cost_scaling_factor: 10.0
+                    inflation_radius: 0.25
+                    cost_scaling_factor: 5.0
             
             TebLocalPlannerROS:
                 odom_topic: /odom
@@ -53,20 +58,20 @@
                 allow_init_with_backwards_motion: True
                 enable_homotopy_class_planning: False
                 max_global_plan_lookahead_dist: 1.5 # Reduced lookahead for much faster planning
-                global_plan_viapoint_sep: 0.5 # Relaxed via-point spacing to avoid oscillation
+                global_plan_viapoint_sep: 0.15 # Dense via-points keep the robot glued to the straight global plan
                 weight_kinematics_nh: 1000.0 # Reverted: Ackermann forward driving only
                 weight_kinematics_forward_drive: 1000.0 # Strongly penalize backing up to force pivoting
                 weight_kinematics_turning_radius: 0.1 # Extemely low penalty so it gladly pivots in tight spaces
-                weight_optimaltime: 1.0 # Lowered so it doesn't aggressively rush to the goal
+                weight_optimaltime: 2.0 # Slightly higher so the path is driven efficiently without micro-oscillations
                 
                 # Robot Configuration
                 max_vel_x: 0.10 # Very safe, slow walking speed (20 cm/s)
                 max_vel_x_backwards: 0.05 # Smooth reverse speed
                 max_vel_y: 0.0     # Sideways movement disabled for front-sensor setup
-                max_vel_theta: 0.2 # Let it spin freely
+                max_vel_theta: 0.25 # Let it spin freely
                 acc_lim_x: 0.2 # SLOW acceleration so it doesn't jerk forward
                 acc_lim_y: 0.0      # Sideways movement disabled
-                acc_lim_theta: 0.2 # Smooth turning acceleration
+                acc_lim_theta: 0.4 # Smooth turning acceleration
                 min_turning_radius: 0.0
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  
@@ -95,8 +100,8 @@
                 no_inner_iterations: 3 # Reduced for 50Hz loop speed
                 no_outer_iterations: 2 # Reduced for 50Hz loop speed
                 penalty_epsilon: 0.01  # Must stay below min speed (0.02 m/s); was 0.1 causing negative bound warnings
-                weight_obstacle: 150.0 # Increased from 50 to strongly avoid walls
-                weight_viopoint: 50.0 # Increased significantly so it actively tracks the global route
+                weight_obstacle: 100.0 # Moderate: strong enough to avoid walls, not so strong it jitters away from the straight path
+                weight_viopoint: 500.0 # VERY HIGH: rigidly pins the robot to the global plan so it drives straight
                 weight_adapt_factor: 2.0
         </rosparam>
     </node>

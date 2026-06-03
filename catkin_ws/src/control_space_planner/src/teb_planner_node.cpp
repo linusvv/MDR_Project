@@ -84,13 +84,18 @@ public:
         std::string state = "IDLE";
         nh_.param<std::string>("/exploration_state", state, "IDLE");
         if (is_paused || state == "IDLE" || state == "STOP" || state == "RECOVERY") {
-            geometry_msgs::Twist cmd_vel;
-            cmd_vel.linear.x = 0.0;
-            cmd_vel.linear.y = 0.0;
-            cmd_vel.angular.z = 0.0;
-            pubCommand.publish(cmd_vel);
+            if (was_running_) {
+                geometry_msgs::Twist cmd_vel;
+                cmd_vel.linear.x = 0.0;
+                cmd_vel.linear.y = 0.0;
+                cmd_vel.angular.z = 0.0;
+                pubCommand.publish(cmd_vel);
+                was_running_ = false;
+            }
             return;
         }
+        
+        was_running_ = true;
 
         if (!teb_planner_ || !costmap_ros_ || !path_received_) return;
 
@@ -296,6 +301,7 @@ private:
 
     nav_msgs::Path global_path_;
     bool path_received_ = false;
+    bool was_running_ = false;
     int plan_publish_counter_ = 0;
     int last_closest_idx_ = 0;
 

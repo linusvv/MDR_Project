@@ -1,96 +1,143 @@
 #!/usr/bin/env python3
 """
-map_odom_publisher.py  –  TF heartbeat relay for the map → odom transform.
+map_odom_publisher.py  –  TF heartbeat relay for the map → odom transform,
+and dynamic alignment of RTAB-Map's origin to the AprilTag world frame.
 
 ROOT CAUSE OF Costmap2DROS TRANSFORM TIMEOUT:
-  RTAB-Map publishes map → odom only when it processes a new frame (can be
-  as slow as 1-2 Hz under load, or stops entirely if RTAB-Map freezes/crashes).
-  The TF2 buffer keeps transforms for ~10 seconds by default.  When RTAB-Map
-  stalls for > 10 s the transform expires → Costmap2DROS can no longer resolve
-  the robot pose in the 'map' frame → constant timeout warnings.
-
+  RTAB-Map publishes rtabmap_map → odom only when it processes a new frame.
+  When RTAB-Map stalls, the transform expires.
+  
 FIX:
-  Cache the last good map → odom transform and re-broadcast it at 20 Hz with
-  rospy.Time.now() as the stamp.  This keeps the transform permanently fresh
-  in every subscriber's TF buffer — even during a 30+ second RTAB-Map stall.
-  Once RTAB-Map recovers it publishes a newer transform that naturally
-  supersedes the relay's cached copy.
-
-Also publishes /map_odom (nav_msgs/Odometry) at 10 Hz for diagnostic display.
+  Cache the last good rtabmap_map → odom transform and re-broadcast it at 20 Hz.
+  
+ALIGNMENT FIX:
+  Subscribe to /camera_link (published by apriltag_localization in the 'map' frame).
+  Calculate the offset between the AprilTag 'map' and RTAB-Map's 'rtabmap_map'.
+  Publish map → rtabmap_map at 20 Hz so the entire RTAB-Map is correctly shifted.
 """
 
 import rospy
 import tf2_ros
-from geometry_msgs.msg import TransformStamped
+import tf.transformations as tf_trans
+import numpy as np
+from geometry_msgs.msg import TransformStamped, PoseStamped
 from nav_msgs.msg import Odometry
 
 
-def run():
-    rospy.init_node("map_odom_publisher")
+class MapOdomPublisher:
+    def __init__(self):
+        rospy.init_node("map_odom_publisher")
 
-    # ------------------------------------------------------------------ #
-    # TF infrastructure
-    # ------------------------------------------------------------------ #
-    # Large buffer so we keep a long history of RTAB-Map transforms
-    tf_buffer   = tf2_ros.Buffer(cache_time=rospy.Duration(30.0))
-    tf_listener = tf2_ros.TransformListener(tf_buffer)
-    tf_br       = tf2_ros.TransformBroadcaster()
+        self.tf_buffer = tf2_ros.Buffer(cache_time=rospy.Duration(30.0))
+        self.tf_listener = tf2_ros.TransformListener(self.tf_buffer)
+        self.tf_br = tf2_ros.TransformBroadcaster()
 
-    # Diagnostic odometry publisher
-    odom_pub = rospy.Publisher("/map_odom", Odometry, queue_size=10)
+        self.odom_pub = rospy.Publisher("/map_odom", Odometry, queue_size=10)
+        
+        # Subscribe to AprilTag localization
+        self.pose_sub = rospy.Subscriber("/camera_link", PoseStamped, self.pose_cb)
 
-    # ------------------------------------------------------------------ #
-    # State
-    # ------------------------------------------------------------------ #
-    last_good: TransformStamped = None   # last successfully looked-up transform
-    diag_divider = 0                     # throttle /map_odom to 10 Hz inside 20 Hz loop
+        self.last_good_rtabmap_to_odom = None
+        self.map_to_rtabmap_mat = np.eye(4)  # Default: no offset
+        self.diag_divider = 0
 
-    rate = rospy.Rate(20)   # 20 Hz heartbeat is enough to keep TF buffer fresh
-    rospy.loginfo("[map_odom_publisher] TF heartbeat relay started (map → odom @ 20 Hz).")
+    def pose_to_mat(self, pose):
+        q = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+        mat = tf_trans.quaternion_matrix(q)
+        mat[0, 3] = pose.position.x
+        mat[1, 3] = pose.position.y
+        mat[2, 3] = pose.position.z
+        return mat
 
-    while not rospy.is_shutdown():
-        # ---- 1. Try to get a fresher transform from RTAB-Map ---------- #
+    def transform_to_mat(self, transform):
+        q = [transform.rotation.x, transform.rotation.y, transform.rotation.z, transform.rotation.w]
+        mat = tf_trans.quaternion_matrix(q)
+        mat[0, 3] = transform.translation.x
+        mat[1, 3] = transform.translation.y
+        mat[2, 3] = transform.translation.z
+        return mat
+
+    def mat_to_transform(self, mat):
+        t = TransformStamped().transform
+        t.translation.x = mat[0, 3]
+        t.translation.y = mat[1, 3]
+        t.translation.z = mat[2, 3]
+        q = tf_trans.quaternion_from_matrix(mat)
+        t.rotation.x = q[0]
+        t.rotation.y = q[1]
+        t.rotation.z = q[2]
+        t.rotation.w = q[3]
+        return t
+
+    def pose_cb(self, msg: PoseStamped):
+        # msg is the pose of camera_link in the AprilTag 'map' frame
         try:
-            t = tf_buffer.lookup_transform("map", "odom", rospy.Time(0),
-                                           rospy.Duration(0.0))  # non-blocking
-            # Accept if newer than what we have cached
-            if last_good is None or t.header.stamp > last_good.header.stamp:
-                last_good = t
-        except Exception:
-            pass   # RTAB-Map not ready yet or temporarily frozen – use cache
+            # We need to find rtabmap_map -> camera_link
+            t_rtabmap_to_cam = self.tf_buffer.lookup_transform("rtabmap_map", "camera_link", rospy.Time(0), rospy.Duration(0.1))
+            
+            map_T_cam = self.pose_to_mat(msg.pose)
+            rtabmap_T_cam = self.transform_to_mat(t_rtabmap_to_cam.transform)
+            
+            # map -> rtabmap_map = (map -> cam) * (rtabmap_map -> cam)^-1
+            self.map_to_rtabmap_mat = np.dot(map_T_cam, np.linalg.inv(rtabmap_T_cam))
+            
+            rospy.loginfo_once("[map_odom_publisher] Successfully aligned RTAB-Map origin to AprilTag frame!")
+        except Exception as e:
+            # Normal if rtabmap_map -> camera_link is not yet available
+            pass
 
-        # ---- 2. Re-broadcast with current timestamp ------------------- #
-        if last_good is not None:
-            relay = TransformStamped()
-            relay.header.stamp     = rospy.Time.now()   # ← key: always fresh
-            relay.header.frame_id  = "map"
-            relay.child_frame_id   = "odom"
-            relay.transform        = last_good.transform
-            tf_br.sendTransform(relay)
+    def run(self):
+        rate = rospy.Rate(20)
+        rospy.loginfo("[map_odom_publisher] TF heartbeat relay and alignment started @ 20 Hz.")
 
-            # ---- 3. Publish /map_odom diagnostic topic at 10 Hz ------- #
-            diag_divider += 1
-            if diag_divider >= 2:
-                diag_divider = 0
-                odom = Odometry()
-                odom.header.stamp     = relay.header.stamp
-                odom.header.frame_id  = "map"
-                odom.child_frame_id   = "base_footprint"
-                try:
-                    # Full chain: map → base_footprint (for position display)
-                    full = tf_buffer.lookup_transform("map", "base_footprint",
-                                                      rospy.Time(0),
-                                                      rospy.Duration(0.0))
-                    odom.pose.pose.position.x    = full.transform.translation.x
-                    odom.pose.pose.position.y    = full.transform.translation.y
-                    odom.pose.pose.position.z    = full.transform.translation.z
-                    odom.pose.pose.orientation   = full.transform.rotation
-                except Exception:
-                    pass
-                odom_pub.publish(odom)
+        while not rospy.is_shutdown():
+            # 1. Update rtabmap_map -> odom from RTAB-Map
+            try:
+                t = self.tf_buffer.lookup_transform("rtabmap_map", "odom", rospy.Time(0), rospy.Duration(0.0))
+                if self.last_good_rtabmap_to_odom is None or t.header.stamp > self.last_good_rtabmap_to_odom.header.stamp:
+                    self.last_good_rtabmap_to_odom = t
+            except Exception:
+                pass
 
-        rate.sleep()
+            now = rospy.Time.now()
 
+            # 2. Broadcast map -> rtabmap_map
+            align_relay = TransformStamped()
+            align_relay.header.stamp = now
+            align_relay.header.frame_id = "map"
+            align_relay.child_frame_id = "rtabmap_map"
+            align_relay.transform = self.mat_to_transform(self.map_to_rtabmap_mat)
+            self.tf_br.sendTransform(align_relay)
+
+            # 3. Broadcast rtabmap_map -> odom
+            if self.last_good_rtabmap_to_odom is not None:
+                odom_relay = TransformStamped()
+                odom_relay.header.stamp = now
+                odom_relay.header.frame_id = "rtabmap_map"
+                odom_relay.child_frame_id = "odom"
+                odom_relay.transform = self.last_good_rtabmap_to_odom.transform
+                self.tf_br.sendTransform(odom_relay)
+
+                # 4. Diagnostic /map_odom
+                self.diag_divider += 1
+                if self.diag_divider >= 2:
+                    self.diag_divider = 0
+                    odom = Odometry()
+                    odom.header.stamp = now
+                    odom.header.frame_id = "map"
+                    odom.child_frame_id = "base_footprint"
+                    try:
+                        full = self.tf_buffer.lookup_transform("map", "base_footprint", rospy.Time(0), rospy.Duration(0.0))
+                        odom.pose.pose.position.x = full.transform.translation.x
+                        odom.pose.pose.position.y = full.transform.translation.y
+                        odom.pose.pose.position.z = full.transform.translation.z
+                        odom.pose.pose.orientation = full.transform.rotation
+                        self.odom_pub.publish(odom)
+                    except Exception:
+                        pass
+
+            rate.sleep()
 
 if __name__ == "__main__":
-    run()
+    node = MapOdomPublisher()
+    node.run()

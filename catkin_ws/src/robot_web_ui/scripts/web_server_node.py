@@ -1807,18 +1807,44 @@ class RobotWebServer:
                     # Flip vertically for image coordinates
                     color_map = cv2.flip(color_map, 0)
                     
-                    # Try to lookup robot's pose in map frame
+                    # Update API Telemetry (Absolute World Coordinates in 'map' frame)
                     if self.tf_listener.canTransform('map', 'base_footprint', rospy.Time(0)):
                         try:
-                            (trans, rot) = self.tf_listener.lookupTransform('map', 'base_footprint', rospy.Time(0))
+                            (trans_map, rot_map) = self.tf_listener.lookupTransform('map', 'base_footprint', rospy.Time(0))
+                            self.robot_x = trans_map[0]
+                            self.robot_y = trans_map[1]
+                            self.robot_yaw = tf.transformations.euler_from_quaternion(rot_map)[2]
+                        except Exception:
+                            pass
+
+                    # For map rendering, we MUST use the grid_map's native frame (e.g. rtabmap_map)
+                    map_frame = grid_map.header.frame_id
+                    
+                    # 1. Draw Robot Start Point (Origin of SLAM map_frame)
+                    start_col = int((0.0 - origin.position.x) / resolution)
+                    start_row = int((0.0 - origin.position.y) / resolution)
+                    start_row_flipped = height - 1 - start_row
+                    if 0 <= start_col < width and 0 <= start_row_flipped < height:
+                        cv2.drawMarker(color_map, (start_col, start_row_flipped), (255, 0, 255), markerType=cv2.MARKER_CROSS, markerSize=10, thickness=2)
+
+                    # 2. Draw AprilTag Absolute Origin (0,0 in 'map' frame)
+                    if self.tf_listener.canTransform(map_frame, 'map', rospy.Time(0)):
+                        try:
+                            (trans_tag, _) = self.tf_listener.lookupTransform(map_frame, 'map', rospy.Time(0))
+                            tag_col = int((trans_tag[0] - origin.position.x) / resolution)
+                            tag_row = int((trans_tag[1] - origin.position.y) / resolution)
+                            tag_row_flipped = height - 1 - tag_row
+                            if 0 <= tag_col < width and 0 <= tag_row_flipped < height:
+                                cv2.drawMarker(color_map, (tag_col, tag_row_flipped), (255, 255, 0), markerType=cv2.MARKER_SQUARE, markerSize=10, thickness=2)
+                        except Exception:
+                            pass
+
+                    # 3. Draw Robot Current Pose
+                    if self.tf_listener.canTransform(map_frame, 'base_footprint', rospy.Time(0)):
+                        try:
+                            (trans, rot) = self.tf_listener.lookupTransform(map_frame, 'base_footprint', rospy.Time(0))
                             rx, ry = trans[0], trans[1]
-                            euler = tf.transformations.euler_from_quaternion(rot)
-                            yaw = euler[2]
-                            
-                            # Save robot pose for stats API
-                            self.robot_x = rx
-                            self.robot_y = ry
-                            self.robot_yaw = yaw
+                            yaw = tf.transformations.euler_from_quaternion(rot)[2]
                             
                             # Translate to pixel coordinates
                             r_col = int((rx - origin.position.x) / resolution)
@@ -1850,10 +1876,10 @@ class RobotWebServer:
                         except Exception:
                             pass
                                             
-                    # Try to lookup transform map -> odom
-                    if self.tf_listener.canTransform('map', 'odom', rospy.Time(0)):
+                    # Try to lookup transform map_frame -> odom
+                    if self.tf_listener.canTransform(map_frame, 'odom', rospy.Time(0)):
                         try:
-                            (trans_mo, rot_mo) = self.tf_listener.lookupTransform('map', 'odom', rospy.Time(0))
+                            (trans_mo, rot_mo) = self.tf_listener.lookupTransform(map_frame, 'odom', rospy.Time(0))
                             T_map_odom = tf.transformations.quaternion_matrix(rot_mo)
                             T_map_odom[:3, 3] = trans_mo
                             self.T_map_odom = T_map_odom
@@ -1865,10 +1891,10 @@ class RobotWebServer:
                     for tag_id, tag_pose_odom in self.detected_tags.items():
                         tag_trans_odom, tag_rot_odom = tag_pose_odom
                         pt_odom = np.array([tag_trans_odom[0], tag_trans_odom[1], 0.0, 1.0])
-                        pt_map = np.dot(T_map_odom, pt_odom)
+                        pt_map_frame = np.dot(T_map_odom, pt_odom)
                         
-                        t_col = int((pt_map[0] - origin.position.x) / resolution)
-                        t_row = int((pt_map[1] - origin.position.y) / resolution)
+                        t_col = int((pt_map_frame[0] - origin.position.x) / resolution)
+                        t_row = int((pt_map_frame[1] - origin.position.y) / resolution)
                         t_row_flipped = height - 1 - t_row
                         
                         if 0 <= t_col < width and 0 <= t_row_flipped < height:
@@ -1878,13 +1904,24 @@ class RobotWebServer:
                             cv2.putText(color_map, f"T{tag_id}", (t_col + 8, t_row_flipped + 4), 
                                         cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 200, 255), 1)
 
+                    # Transform map -> map_frame for shops
+                    T_map_to_grid = np.eye(4)
+                    if self.tf_listener.canTransform(map_frame, 'map', rospy.Time(0)):
+                        try:
+                            (trans_m2g, rot_m2g) = self.tf_listener.lookupTransform(map_frame, 'map', rospy.Time(0))
+                            T_map_to_grid = tf.transformations.quaternion_matrix(rot_m2g)
+                            T_map_to_grid[:3, 3] = trans_m2g
+                        except Exception:
+                            pass
+
                     # Draw shops on the SLAM map
                     if hasattr(self, 'mapped_shops'):
                         for idx, store in enumerate(self.mapped_shops):
-                            # Store coords are directly in Map frame
-                            s_x, s_y = store['x'], store['y']
-                            s_col = int((s_x - origin.position.x) / resolution)
-                            s_row = int((s_y - origin.position.y) / resolution)
+                            # Store coords are in 'map' frame, transform to grid_map frame
+                            pt_map = np.array([store['x'], store['y'], 0.0, 1.0])
+                            pt_grid = np.dot(T_map_to_grid, pt_map)
+                            s_col = int((pt_grid[0] - origin.position.x) / resolution)
+                            s_row = int((pt_grid[1] - origin.position.y) / resolution)
                             s_row_flipped = height - 1 - s_row
                             
                             if 0 <= s_col < width and 0 <= s_row_flipped < height:

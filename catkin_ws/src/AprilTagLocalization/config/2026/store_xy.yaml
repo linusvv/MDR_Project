@@ -1,0 +1,21 @@
+##### STORE XY COORDINATES IN MAP FRAME #####
+#
+# Note:
+#   These store coordinates are from real room coordinates.
+#
+# Coordinate convention:
+#   X: forward in ROS map frame
+#   Y: left in ROS map frame
+#
+# [NAME, CATEGORY, X(m), Y(m)]
+STORE_XY:
+  FRAME_ID: "map"
+  STORES:
+    - ["store_burger_A",      "burger",            -1.25, -1.15]
+    - ["store_burger_B",      "burger",             1.25, -0.85]
+    - ["store_cafe_A",        "cafe",              -0.75, -0.85]
+    - ["store_cafe_B",        "cafe",               1.00, -1.65]
+    - ["store_phar_A",        "pharmacy",           1.00,  1.50]
+    - ["store_phar_B",        "pharmacy",           0.75, -1.20]
+    - ["store_store_A",       "convenience_store", -1.00,  1.50]
+    - ["store_store_B",       "convenience_store", -1.00, -1.65]

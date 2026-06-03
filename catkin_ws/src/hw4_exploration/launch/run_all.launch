@@ -2,8 +2,7 @@
     <arg name="use_rviz" default="false"/>
     <arg name="sim" default="false"/>
 
-    <!-- 0. Start the Tag Pose Injector to continuously correct RTAB-Map global pose -->
-    <node name="tag_pose_injector" pkg="hw4_exploration" type="tag_pose_injector.py" output="screen" />
+    <!-- 0. Tag Pose Injector logic has been moved into map_odom_publisher.py for smooth TF alignment -->
 
     <!-- ==================== SIMULATION SPECIFIC SETUP ==================== -->
     <group if="$(arg sim)">
@@ -40,6 +39,7 @@
             <arg name="approx_sync" value="true"/>
             <arg name="rviz" value="false"/>
             <arg name="rtabmap_viz" value="false"/>
+            <arg name="map_frame_id" value="rtabmap_map"/>
         </include>
     </group>
 
@@ -94,6 +94,7 @@
             <arg name="rviz" value="false"/>
             <arg name="rtabmap_viz" value="false"/>
             <arg name="odom_args" value="--Odom/ResetCountdown 2 --Vis/MaxFeatures 2000 --Vis/MinInliers 10 --OdomF2M/MaxSize 3000 --Odom/KeyFrameThr 0.6"/>
+            <arg name="map_frame_id" value="rtabmap_map"/>
         </include>
     </group>
 

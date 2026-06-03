@@ -1604,7 +1604,7 @@ class RobotWebServer:
             self.local_costmap = msg
 
     def load_tag_true_poses(self):
-        tag_config = rospy.get_param('/apriltag_localization_node/tag_config_name', '2025/re540_simulation')
+        tag_config = rospy.get_param('/apriltag_localization_node/tag_config_name', '2026/ee478_n1_room113')
         if not tag_config.endswith('.yaml'):
             tag_config += '.yaml'
         

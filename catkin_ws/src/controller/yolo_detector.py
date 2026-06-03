@@ -34,7 +34,7 @@ import cv2
 import message_filters
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Point, PointStamped
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
@@ -45,6 +45,17 @@ DEPTH_SCALE  = 0.001      # RealSense: mm -> meters
 DEPTH_RADIUS = 3          # NxN sampling radius around bbox center (for noise reduction)
 MAX_DEPTH    = 1.5        # Ignore detections beyond this distance (meters)
 MIN_DEPTH    = 0.05       # Ignore detections closer than this distance (meters)
+
+# ── Activation Gate ──────────────────────────────────────────────────────
+# Controlled via /yolo_grab/activate (Bool). Starts INACTIVE.
+_active      = False
+_active_lock = threading.Lock()
+
+def activate_cb(msg):
+    global _active
+    with _active_lock:
+        _active = msg.data
+    rospy.loginfo(f"[yolo_detector] {'ACTIVATED' if msg.data else 'DEACTIVATED'}")
 
 # ── Target Class (동적 설정 — /yolo/class 토픽으로 런타임 변경 가능) ────
 # 빈 문자열이면 모든 클래스 허용, 값이 있으면 해당 클래스만 타겟
@@ -148,6 +159,11 @@ def get_robust_depth(depth_img, u, v, radius=DEPTH_RADIUS):
 # ════════════════════════════════════════════════════════════════════════════
 
 def sync_callback(color_msg, depth_msg):
+    # ── Activation gate: skip inference when deactivated ──────────────
+    with _active_lock:
+        if not _active:
+            return
+
     if not intrinsic_ready:
         rospy.logwarn_throttle(5, "Camera intrinsics not yet received")
         return
@@ -292,6 +308,9 @@ if __name__ == '__main__':
     # for yolo testing:
     #rospy.Subscriber('/yolo/class', String, class_cb)
     rospy.Subscriber('/target_item', String, class_cb)
+
+    # Activation gate (controlled by orchestrator)
+    rospy.Subscriber('/yolo_grab/activate', Bool, activate_cb)
 
     # RGB + Depth 동기화 구독
     color_sub = message_filters.Subscriber('/camera/color/image_raw', Image)

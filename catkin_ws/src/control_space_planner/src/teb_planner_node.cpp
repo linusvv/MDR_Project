@@ -79,6 +79,7 @@ public:
             if (p.header.frame_id.empty()) {
                 p.header.frame_id = global_path_.header.frame_id.empty() ? "odom" : global_path_.header.frame_id;
             }
+            p.header.stamp = ros::Time(0); // Reset stamp to use the latest transform in TEB setPlan
             transformed_plan.push_back(p);
         }
 

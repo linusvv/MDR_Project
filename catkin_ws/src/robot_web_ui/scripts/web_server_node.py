@@ -111,16 +111,20 @@ class RobotWebServer:
         self.last_yolo_viz_results = []
         self.last_yolo_viz_time = 0
 
-        # YOLO initialization
+        # YOLO initialization — prefer TensorRT .engine over PyTorch .pt
         try:
             pkg_path = rospack.get_path('robot_web_ui')
-            model_path = os.path.join(pkg_path, 'yolo_models', 'navigation.pt')
+            model_dir = os.path.join(pkg_path, 'yolo_models')
         except Exception:
-            model_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'yolo_models', 'navigation.pt')
+            model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'yolo_models')
+
+        engine_path = os.path.join(model_dir, 'navigation.engine')
+        pt_path     = os.path.join(model_dir, 'navigation.pt')
+        model_path  = engine_path if os.path.exists(engine_path) else pt_path
 
         self.yolo_model = None
         if YOLO and os.path.exists(model_path):
-            self.yolo_model = YOLO(model_path)
+            self.yolo_model = YOLO(model_path, task="detect")
             rospy.loginfo(f"YOLO model loaded from {model_path}")
         else:
             rospy.logwarn(f"YOLO model not found at {model_path} or ultralytics not installed.")
@@ -1632,7 +1636,7 @@ class RobotWebServer:
     def load_tag_true_poses(self):
         tag_config = rospy.get_param('/hw4/apriltag_localization_node/tag_config_name', None)
         if tag_config is None:
-            tag_config = rospy.get_param('/apriltag_localization_node/tag_config_name', '2025/re540_simulation')
+            tag_config = rospy.get_param('/apriltag_localization_node/tag_config_name', '2026/ee478_n1_room113')
         if not tag_config.endswith('.yaml'):
             tag_config += '.yaml'
         

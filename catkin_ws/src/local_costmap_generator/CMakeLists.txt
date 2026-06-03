@@ -6,7 +6,10 @@ set(${PROJECT_NAME}_CATKIN_DEPS
     roscpp
     pcl_ros
     sensor_msgs
-    tf)
+    tf
+    tf2
+    tf2_ros
+    tf2_geometry_msgs)
 set(CMAKE_CXX_STANDARD 17)
 find_package(catkin REQUIRED COMPONENTS
              ${${PROJECT_NAME}_CATKIN_DEPS}

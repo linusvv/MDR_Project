@@ -107,8 +107,8 @@ public:
         geometry_msgs::PoseStamped robot_pose_map;
         geometry_msgs::PoseStamped robot_pose_odom;
         try {
-            auto t_map = tf_buffer_.lookupTransform("map", "base_footprint", ros::Time(0), ros::Duration(0.2));
-            auto t_odom = tf_buffer_.lookupTransform("odom", "base_footprint", ros::Time(0), ros::Duration(0.2));
+            auto t_map = tf_buffer_.lookupTransform("map", "base_footprint", ros::Time(0), ros::Duration(0.0));
+            auto t_odom = tf_buffer_.lookupTransform("odom", "base_footprint", ros::Time(0), ros::Duration(0.0));
             
             double pose_age = (ros::Time::now() - t_map.header.stamp).toSec();
             if (pose_age > 1.5) {

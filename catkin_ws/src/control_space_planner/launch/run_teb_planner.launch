@@ -28,11 +28,11 @@
                 height: 4.0
                 resolution: 0.1
                 plugins:
-                 - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
+                 - {name: custom_obstacle_layer, type: "costmap_2d::StaticLayer"}
                  - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
-                obstacle_layer:
-                    observation_sources: point_cloud_sensor
-                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: 0.02, max_obstacle_height: 0.15, queue_size: 1, observation_persistence: 0.0}
+                custom_obstacle_layer:
+                    map_topic: /map/local_map/obstacle
+                    subscribe_to_updates: true
                 inflation_layer:
                     inflation_radius: 0.5
                     cost_scaling_factor: 10.0
@@ -55,18 +55,18 @@
                 max_global_plan_lookahead_dist: 1.5 # Reduced lookahead for much faster planning
                 global_plan_viapoint_sep: 0.5 # Relaxed via-point spacing to avoid oscillation
                 weight_kinematics_nh: 1000.0 # Reverted: Ackermann forward driving only
-                weight_kinematics_forward_drive: 50.0 # Penalize backing up, but don't forbid it
-                weight_kinematics_turning_radius: 1.0 # MUST BE LOW to allow turning in place
+                weight_kinematics_forward_drive: 1000.0 # Strongly penalize backing up to force pivoting
+                weight_kinematics_turning_radius: 0.1 # Extemely low penalty so it gladly pivots in tight spaces
                 weight_optimaltime: 1.0 # Lowered so it doesn't aggressively rush to the goal
                 
                 # Robot Configuration
-                max_vel_x: 0.20 # Increased back to 20 cm/s
-                max_vel_x_backwards: 0.10 
+                max_vel_x: 0.10 # Very safe, slow walking speed (20 cm/s)
+                max_vel_x_backwards: 0.05 # Smooth reverse speed
                 max_vel_y: 0.0     # Sideways movement disabled for front-sensor setup
-                max_vel_theta: 0.6 # Increased slightly so it can actually turn corners reasonably
-                acc_lim_x: 0.3 
+                max_vel_theta: 0.2 # Let it spin freely
+                acc_lim_x: 0.2 # SLOW acceleration so it doesn't jerk forward
                 acc_lim_y: 0.0      # Sideways movement disabled
-                acc_lim_theta: 0.4 
+                acc_lim_theta: 0.2 # Smooth turning acceleration
                 min_turning_radius: 0.0
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  

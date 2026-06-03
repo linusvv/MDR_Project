@@ -47,6 +47,13 @@ class AgentNode:
         self.recovery_stage = 0
         self.recovery_end_time = rospy.Time(0)
         self.recovery_spin_speed = 0.0
+
+        # Path publish rate-limiting: avoid resetting TEB's closest-index every 100ms.
+        # TEB treats a changed start-pose as a 'new path' and resets planning from scratch.
+        # Publishing at most every 1.5s keeps the plan stable between updates.
+        self._last_path_publish_time = rospy.Time(0)
+        self._path_publish_interval = rospy.Duration(1.5)
+        self._last_published_state = None
         
         self.rate = rospy.Rate(10)
         
@@ -142,7 +149,14 @@ class AgentNode:
                     rospy.loginfo("Pausing exploration to check for shopfront...")
                     self.set_state("CHECK_SHOP")
                 else:
-                    self.publish_local_path(1.5, 0.0, 0.0) # publish point 1.5m straight ahead
+                    # Rate-limit: only re-publish every 1.5s to prevent TEB from
+                    # constantly resetting its closest-waypoint index.
+                    now = rospy.Time.now()
+                    if (self._last_published_state != "EXPLORE" or
+                            (now - self._last_path_publish_time) > self._path_publish_interval):
+                        self.publish_local_path(1.5, 0.0, 0.0)  # 1.5m straight ahead
+                        self._last_path_publish_time = now
+                        self._last_published_state = "EXPLORE"
                     
             elif self.state == "READ_SIGN":
                 self.stop_robot()
@@ -178,7 +192,13 @@ class AgentNode:
                     self.set_state("EXPLORE")
                     self.last_shop_check_time = rospy.Time.now()
                 else:
-                    self.publish_local_path(self.turn_dx, self.turn_dy, self.turn_dyaw)
+                    # Rate-limit turn path publishes the same way as EXPLORE.
+                    now = rospy.Time.now()
+                    if (self._last_published_state != "TURN" or
+                            (now - self._last_path_publish_time) > self._path_publish_interval):
+                        self.publish_local_path(self.turn_dx, self.turn_dy, self.turn_dyaw)
+                        self._last_path_publish_time = now
+                        self._last_published_state = "TURN"
                     
             elif self.state == "CHECK_SHOP":
                 rospy.sleep(1.0)

@@ -38,6 +38,7 @@ class MapOdomPublisher:
         self.pose_sub = rospy.Subscriber("/camera_link", PoseStamped, self.pose_cb)
 
         self.last_good_rtabmap_to_odom = None
+        self.last_good_odom_to_bf = None      # keepalive for odom -> base_footprint
         self.map_to_rtabmap_mat = np.eye(4)  # Default: no offset
         self.diag_divider = 0
 
@@ -79,7 +80,23 @@ class MapOdomPublisher:
             rtabmap_T_cam = self.transform_to_mat(t_rtabmap_to_cam.transform)
             
             # map -> rtabmap_map = (map -> cam) * (rtabmap_map -> cam)^-1
-            self.map_to_rtabmap_mat = np.dot(map_T_cam, np.linalg.inv(rtabmap_T_cam))
+            new_mat = np.dot(map_T_cam, np.linalg.inv(rtabmap_T_cam))
+
+            # Dead-zone: ignore tiny corrections (< 5 cm) caused by tag detection
+            # noise. Without this, every fleeting tag sighting jumps the entire
+            # TF chain and the robot's map-frame position shifts discontinuously.
+            delta_x = new_mat[0, 3] - self.map_to_rtabmap_mat[0, 3]
+            delta_y = new_mat[1, 3] - self.map_to_rtabmap_mat[1, 3]
+            shift = np.hypot(delta_x, delta_y)
+            if shift < 0.05:
+                return  # Too small — probably tag noise, skip
+
+            # Low-pass filter: blend only 15% of the new correction per callback.
+            # This prevents a single bad tag reading from instantly teleporting
+            # the robot's perceived position; large real corrections converge
+            # smoothly over several detections (~7 callbacks to 65% adoption).
+            alpha = 0.15
+            self.map_to_rtabmap_mat = (1.0 - alpha) * self.map_to_rtabmap_mat + alpha * new_mat
             
             rospy.loginfo_once("[map_odom_publisher] Successfully aligned RTAB-Map origin to AprilTag frame!")
         except Exception as e:
@@ -87,10 +104,13 @@ class MapOdomPublisher:
             pass
 
     def run(self):
-        rate = rospy.Rate(20)
-        rospy.loginfo("[map_odom_publisher] TF heartbeat relay and alignment started @ 20 Hz.")
+        rate = rospy.Rate(10)
+        rospy.loginfo("[map_odom_publisher] TF heartbeat relay and alignment started @ 10 Hz.")
 
         while not rospy.is_shutdown():
+            # Define 'now' first so all downstream code can safely reference it.
+            now = rospy.Time.now()
+
             # 1. Update rtabmap_map -> odom from RTAB-Map
             try:
                 t = self.tf_buffer.lookup_transform("rtabmap_map", "odom", rospy.Time(0), rospy.Duration(0.0))
@@ -99,7 +119,29 @@ class MapOdomPublisher:
             except Exception:
                 pass
 
-            now = rospy.Time.now()
+            # 1b. Cache odom -> base_footprint (published by RTAB-Map VO).
+            # When VO stalls during recovery (e.g. spin causes feature loss), this
+            # transform stops updating. Costmap2DROS then gets a frozen timestamp
+            # and falls into an extrapolation error loop. We re-broadcast the last
+            # known pose with a fresh 'now' stamp only when the source is stale
+            # (> 2s), so the costmap remains functional while VO recovers.
+            try:
+                t_bf = self.tf_buffer.lookup_transform("odom", "base_footprint", rospy.Time(0), rospy.Duration(0.0))
+                if self.last_good_odom_to_bf is None or t_bf.header.stamp > self.last_good_odom_to_bf.header.stamp:
+                    self.last_good_odom_to_bf = t_bf
+            except Exception:
+                pass
+
+            if self.last_good_odom_to_bf is not None:
+                age = (now - self.last_good_odom_to_bf.header.stamp).to_sec()
+                if age > 2.0:  # VO has stalled — keep the chain alive
+                    bf_relay = TransformStamped()
+                    bf_relay.header.stamp = now
+                    bf_relay.header.frame_id = "odom"
+                    bf_relay.child_frame_id = "base_footprint"
+                    bf_relay.transform = self.last_good_odom_to_bf.transform
+                    self.tf_br.sendTransform(bf_relay)
+                    rospy.logwarn_throttle(3.0, "[map_odom_publisher] VO stalled (%.1fs). Re-broadcasting last known odom->base_footprint.", age)
 
             # 2. Broadcast map -> rtabmap_map
             align_relay = TransformStamped()

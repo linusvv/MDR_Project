@@ -1,28 +1,54 @@
 <launch>
     <!-- Standalone node to run the TEB Local Planner wrapper parallel to/instead of control_space_planner_node -->
-    <node pkg="control_space_planner" type="teb_planner_node" name="teb_planner_node" output="screen">
+
+    <!-- CRITICAL: This global param gates ALL planners in this stack.
+         - teb_planner_node:          runs only when value == "teb"  (checked in Plan())
+         - control_space_planner_node: skips PublishCommand/StopRobot when != "control_space"
+         - custom_vector_planner:     skips entirely                  when != "custom_vector"
+         Setting it here ensures TEB is active and the other two nodes stay silent on /cmd_vel. -->
+    <param name="/local_planner_type" value="teb" />
+
+    <node pkg="control_space_planner" type="teb_planner_node" name="teb_planner_node" respawn="true" output="screen">
+        <param name="planner_frequency" value="10.0" />
         
         <!-- local_costmap configurations needed by TEB -->
         <rosparam>
             local_costmap:
-                global_frame: odom
+                global_frame: map
                 robot_base_frame: base_footprint
-                transform_tolerance: 2.5  # Accommodate visual odometry latency
-                update_frequency: 5.0
-                publish_frequency: 5.0
+                robot_radius: 0.30
+                footprint_padding: 0.00
+                # 8s: gives the odom->base_footprint keepalive in map_odom_publisher
+                # enough headroom to activate (at 2s stale) before Costmap2DROS panics.
+                transform_tolerance: 8.0
+                update_frequency: 10.0
+                publish_frequency: 10.0
                 rolling_window: true
-                width: 10.0
-                height: 10.0
+                width: 4.0
+                height: 4.0
                 resolution: 0.1
                 plugins:
                  - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
                 obstacle_layer:
                     observation_sources: point_cloud_sensor
-                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: 0.02, max_obstacle_height: 0.35}
+                    # observation_persistence: how long (seconds) to keep a sensor reading.
+                    # Without this, the last received point cloud is kept FOREVER with its
+                    # original timestamp. When VO stalls and the camera stops publishing,
+                    # updateMap() repeatedly tries to TF-transform this stale cloud at its
+                    # old timestamp, which evicts from the TF buffer → extrapolation cascade.
+                    # 2.0s matches the VO keepalive threshold in map_odom_publisher.
+                    # min_obstacle_height: 0.02 — keep at original value. Raising this
+                    # to filter "floating obstacles" blinds the robot to walls: the camera
+                    # sees wall bases at 0.02-0.05m and they get filtered out entirely.
+                    # max_obstacle_height: 0.15 — matches local_costmap_generator's output.
+                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: 0.02, max_obstacle_height: 0.15, queue_size: 1, observation_persistence: 2.0, expected_update_rate: 0.0}
             
             TebLocalPlannerROS:
                 odom_topic: /odom
-                map_frame: odom
+                map_frame: map
+                
+                # Costmap Converter Configuration
+                costmap_converter_plugin: ""
                 
                 # Trajectory Configuration
                 teb_autosize: True
@@ -31,7 +57,8 @@
                 max_samples: 50
                 global_plan_overwrite_orientation: True
                 allow_init_with_backwards_motion: False
-                max_global_plan_lookahead_dist: 2.5 # Increased lookahead for smoother trajectories
+                enable_homotopy_class_planning: False
+                max_global_plan_lookahead_dist: 1.5 # Reduced lookahead for much faster planning
                 global_plan_viapoint_sep: 0.5 # Relaxed via-point spacing to avoid oscillation
                 weight_kinematics_nh: 1000.0 # Reverted: Ackermann forward driving only
                 weight_kinematics_forward_drive: 1000.0 # Reverted: Ackermann constraints
@@ -39,27 +66,33 @@
                 weight_optimaltime: 1.5
                 
                 # Robot Configuration
-                max_vel_x: 0.16
+                max_vel_x: 0.18
+                max_vel_x_backwards: 0.03
                 max_vel_y: 0.0     # Sideways movement disabled for front-sensor setup
-                max_vel_theta: 0.7
-                acc_lim_x: 1.0
+                max_vel_theta: 0.4
+                acc_lim_x: 0.5
                 acc_lim_y: 0.0      # Sideways movement disabled
-                acc_lim_theta: 1.5
+                acc_lim_theta: 0.8
                 min_turning_radius: 0.0
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  
                 footprint_model:
                     type: "circular"
-                    radius: 0.30    # Increased radius because corners of square robot stick out
-
+                    radius: 0.30    # Reverted to physical robot radius to fit inside corridors/hallways
+ 
                 # Goal Tolerance
                 xy_goal_tolerance: 0.15
                 yaw_goal_tolerance: 0.15
                 free_goal_vel: False
-
+ 
                 # Obstacles
-                min_obstacle_dist: 0.25 
-                inflation_dist: 0.15 # Reduced to make costmap inflation smaller
+                # Hard clearance = min_obstacle_dist + footprint_radius.
+                # 0.05 + 0.30 = 0.35m total. At 0.1m costmap resolution the nearest
+                # occupied cell to a 0.52m-away obstacle appears at 0.50m, which
+                # exceeded the previous 0.50m limit by 0cm → borderline infeasible.
+                # 0.05m gives a comfortable 0.17m margin above the 0.35m hard limit.
+                min_obstacle_dist: 0.05
+                inflation_dist: 0.10  # soft cost zone beyond the hard limit
                 include_costmap_obstacles: True
                 costmap_obstacles_behind_robot_dist: 1.0
                 obstacle_poses_affected: 20 # Reduced from 30 to speed up 50Hz planning
@@ -68,7 +101,7 @@
                 no_inner_iterations: 3 # Reduced for 50Hz loop speed
                 no_outer_iterations: 2 # Reduced for 50Hz loop speed
                 penalty_epsilon: 0.01  # Must stay below min speed (0.02 m/s); was 0.1 causing negative bound warnings
-                weight_obstacle: 50 # Strongly prioritize obstacle avoidance
+                weight_obstacle: 150.0 # Increased from 50 to strongly avoid walls
                 weight_viopoint: 50.0 # Increased significantly so it actively tracks the global route
                 weight_adapt_factor: 2.0
         </rosparam>

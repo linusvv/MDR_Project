@@ -39,9 +39,35 @@ void MotionPlanner::CallbackGoalPoint(const nav_msgs::Path& msg)
       this->StopRobot();
       return;
   }
+  
+  bool is_new_path = true;
+  if (this->bGetGoal && !this->globalPath.poses.empty() && this->globalPath.poses.size() == msg.poses.size()) {
+      double dx = this->globalPath.poses.back().pose.position.x - msg.poses.back().pose.position.x;
+      double dy = this->globalPath.poses.back().pose.position.y - msg.poses.back().pose.position.y;
+      if (std::sqrt(dx*dx + dy*dy) < 0.1) {
+          is_new_path = false;
+      }
+  }
+
   this->globalPath = msg;
-  this->last_closest_idx = 0; // reset on new path
   this->bGetGoal = true;
+
+  if (is_new_path) {
+      int start_idx = 0;
+      if (this->bGetEgoOdom) {
+          double min_dist = 999999.0;
+          for (size_t i = 0; i < this->globalPath.poses.size(); ++i) {
+              double dx = this->globalPath.poses[i].pose.position.x - this->ego_x;
+              double dy = this->globalPath.poses[i].pose.position.y - this->ego_y;
+              double dist = std::sqrt(dx*dx + dy*dy);
+              if (dist < min_dist) {
+                  min_dist = dist;
+                  start_idx = i;
+              }
+          }
+      }
+      this->last_closest_idx = start_idx;
+  }
 }
 
 void MotionPlanner::CallbackEgoOdom(const nav_msgs::Odometry& msg)
@@ -220,6 +246,13 @@ void MotionPlanner::StopRobot()
 
 void MotionPlanner::Plan()
 {
+  // Guard: skip all planning work when another planner is active.
+  // PublishCommand/StopRobot also gate /cmd_vel, but this avoids burning
+  // CPU on motion rollouts and costmap scans at 50 Hz while TEB is running.
+  std::string planner_type;
+  this->nh_.param<std::string>("/local_planner_type", planner_type, "control_space");
+  if (planner_type != "control_space") return;
+
           // Path tracking: dynamically pick lookahead goal
           if (this->bGetEgoOdom && this->bGetGoal && !this->globalPath.poses.empty()) {
               // Find closest point index on path

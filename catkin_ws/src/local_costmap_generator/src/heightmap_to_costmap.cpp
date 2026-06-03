@@ -34,7 +34,7 @@ public:
     float MAP_MAX_Y =  10; // map max y position
 
     float MIN_OBSTACLE_HEIGHT = 0.02; // [m] ignore near-zero floor reflections
-    float MAX_OBSTACLE_HEIGHT = 0.35; // [m] robot body clearance — ignore anything above this (floating signs, table tops)
+    float MAX_OBSTACLE_HEIGHT = 0.15; // [m] robot body clearance — ignore anything above this (floating signs, table tops)
 
     float INFLATION_RADIUS = 0.6; // [m] Increased to 1.5x (0.4m -> 0.6m) for a larger dangerous zone
     float INFLATION_RES    = RESOLUTION_; // [m] resolution of inflation
@@ -165,7 +165,7 @@ int main(int argc, char **argv)
     ros::init(argc, argv, "heightmap_to_costmap");
 
     HeightmapToCostMap hcm; //this loads up the node
-    ros::Rate rate(50);
+    ros::Rate rate(10);
     while (ros::ok())
     {
         ros::spinOnce(); //where she stops nobody knows

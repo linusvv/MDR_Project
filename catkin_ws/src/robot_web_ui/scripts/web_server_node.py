@@ -119,8 +119,8 @@ class RobotWebServer:
         except Exception:
             model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'yolo_models')
 
-        engine_path = os.path.join(model_dir, 'navigation.engine')
-        pt_path     = os.path.join(model_dir, 'navigation.pt')
+        engine_path = os.path.join(model_dir, 'shops.engine')
+        pt_path     = os.path.join(model_dir, 'shops.pt')
         model_path  = engine_path if os.path.exists(engine_path) else pt_path
 
         self.yolo_model = None
@@ -133,6 +133,20 @@ class RobotWebServer:
         # YOLO Activation Gate — controlled via /yolo_nav/activate (Bool)
         # Starts ACTIVE (navigation is the default mode)
         self._yolo_active = True
+
+        # YOLO control & state tracking
+        self.pub_nav = rospy.Publisher('/yolo_nav/activate', Bool, queue_size=1, latch=True)
+        self.pub_grab = rospy.Publisher('/yolo_grab/activate', Bool, queue_size=1, latch=True)
+
+        self.yolo_nav_state = True # starts active
+        self.yolo_grab_state = False # starts inactive
+        self.yolo_nav_enabled = True # starts enabled
+        self.yolo_grab_enabled = True # starts enabled
+
+        # Publish initial latch states
+        self.pub_nav.publish(Bool(True))
+        self.pub_grab.publish(Bool(False))
+
 
         # Complex Action State
         self.active_delivery_task = None
@@ -190,13 +204,38 @@ class RobotWebServer:
             rospy.Subscriber('/tag_detections', AprilTagDetectionArray, self.tags_cb)
 
         # YOLO activation gate
-        rospy.Subscriber('/yolo_nav/activate', Bool, self._yolo_activate_cb)
+        rospy.Subscriber('/yolo_nav/activate', Bool, self._yolo_nav_state_cb)
+        rospy.Subscriber('/yolo_grab/activate', Bool, self._yolo_grab_state_cb)
 
         rospy.loginfo("Web Server Node initialized.")
 
-    def _yolo_activate_cb(self, msg):
+    def _yolo_nav_state_cb(self, msg):
+        self.yolo_nav_state = msg.data
         self._yolo_active = msg.data
-        rospy.loginfo(f"[web_server] Navigation YOLO {'ACTIVATED' if msg.data else 'DEACTIVATED'}")
+        rospy.loginfo(f"[web_server] Navigation YOLO activation changed to {msg.data}")
+
+    def _yolo_grab_state_cb(self, msg):
+        self.yolo_grab_state = msg.data
+        rospy.loginfo(f"[web_server] Grabbing YOLO activation changed to {msg.data}")
+
+    def toggle_yolo_light_switch(self):
+        if not (self.yolo_nav_enabled and self.yolo_grab_enabled):
+            rospy.logwarn("[web_server] Cannot toggle light switch: one or both YOLO models are disabled.")
+            return False
+        
+        # Determine new states
+        if self.yolo_nav_state:
+            # Swap: Nav ON -> Grab ON
+            self.pub_nav.publish(Bool(False))
+            rospy.sleep(0.2)
+            self.pub_grab.publish(Bool(True))
+        else:
+            # Swap: Grab ON -> Nav ON
+            self.pub_grab.publish(Bool(False))
+            rospy.sleep(0.2)
+            self.pub_nav.publish(Bool(True))
+        return True
+
 
     def append_bot_chat_message(self, text):
         with self.lock:
@@ -350,7 +389,7 @@ class RobotWebServer:
             pts.append((p.x, p.y, p.z))
         with self.lock:
             self.local_plan_pts = pts
-            self.local_plan_frame = msg.header.frame_id
+            self.local_plan_frame = msg.header.frame_id if msg.header.frame_id else "map"
             if len(pts) > 0:
                 self.trunc_target = (pts[-1][0], pts[-1][1])
             else:
@@ -718,7 +757,7 @@ class RobotWebServer:
             depth_raw = getattr(self, 'depth_raw', None)
             
         if img is not None:
-            results = self.yolo_model.predict(img, conf=0.8, verbose=False)
+            results = self.yolo_model.predict(img, conf=0.8, verbose=False, device='cuda')
             for res in results:
                 for box in res.boxes:
                     label = res.names[int(box.cls[0])].upper()
@@ -1343,27 +1382,10 @@ class RobotWebServer:
         psi_deg = pose_info[2]
         psi_rad = math.radians(psi_deg)
         
-        if "STORE_" in tag_name:
-            # Store coordinates are already in Map frame
-            gx = tag_pt[0]
-            gy = tag_pt[1]
-            gyaw = psi_rad
-        else:
-            # AprilTag signboards are in World frame, transformed via R, T
-            with self.lock:
-                R = self.R
-                T = self.T
-            
-            tag_map = np.dot(R, tag_pt) + T
-            tag_x, tag_y = tag_map[0], tag_map[1]
-            
-            # Transform heading (psi) to map coordinates
-            rot_angle = math.atan2(R[1, 0], R[0, 0])
-            psi_rad_map = psi_rad + rot_angle
-            
-            gx = tag_x
-            gy = tag_y
-            gyaw = psi_rad_map
+        # All signboard and landmark coordinates are defined directly in the 'map' frame
+        gx = tag_pt[0]
+        gy = tag_pt[1]
+        gyaw = psi_rad
         
         rospy.loginfo(f"[Tag Nav] Target Pose in Map: ({gx:.2f}, {gy:.2f}, heading: {math.degrees(gyaw):.1f}°)")
         
@@ -1538,7 +1560,7 @@ class RobotWebServer:
         if self.yolo_model is not None and self.viz_yolo and self._yolo_active:
             if now - self.last_yolo_viz_time > 0.5: # 2 FPS
                 # Lower confidence for visualization helps see distant/partial shops
-                self.last_yolo_viz_results = self.yolo_model.predict(img, conf=0.25, verbose=False)
+                self.last_yolo_viz_results = self.yolo_model.predict(img, conf=0.25, verbose=False, device='cuda')
                 self.last_yolo_viz_time = now
                 
             for res in self.last_yolo_viz_results:
@@ -2007,6 +2029,59 @@ class RobotWebServer:
                 height = grid.info.height
                 res = grid.info.resolution
                 origin = grid.info.origin
+                costmap_frame = grid.header.frame_id
+                
+                # Get current robot pose in the costmap frame
+                rx, ry = 0.0, 0.0
+                if self.tf_listener.canTransform(costmap_frame, 'base_footprint', rospy.Time(0)):
+                    try:
+                        (trans, rot) = self.tf_listener.lookupTransform(costmap_frame, 'base_footprint', rospy.Time(0))
+                        rx, ry = trans[0], trans[1]
+                    except Exception:
+                        rx = getattr(self, 'robot_x', 0.0)
+                        ry = getattr(self, 'robot_y', 0.0)
+                else:
+                    rx = getattr(self, 'robot_x', 0.0)
+                    ry = getattr(self, 'robot_y', 0.0)
+                
+                # Transform local plan points (selected) from self.local_plan_frame to costmap_frame
+                transformed_selected = []
+                for p in selected:
+                    px, py, pz = p[0], p[1], p[2]
+                    if self.local_plan_frame != costmap_frame:
+                        ps = PointStamped()
+                        ps.header.frame_id = self.local_plan_frame
+                        ps.header.stamp = rospy.Time(0)
+                        ps.point.x = px
+                        ps.point.y = py
+                        ps.point.z = pz
+                        try:
+                            ps_trans = self.tf_listener.transformPoint(costmap_frame, ps)
+                            transformed_selected.append((ps_trans.point.x, ps_trans.point.y))
+                        except Exception:
+                            transformed_selected.append((px, py))
+                    else:
+                        transformed_selected.append((px, py))
+                
+                # Transform local target (trunc_target) from self.local_plan_frame to costmap_frame
+                with self.lock:
+                    target = self.trunc_target
+                tx, ty = None, None
+                if target:
+                    if self.local_plan_frame != costmap_frame:
+                        ps = PointStamped()
+                        ps.header.frame_id = self.local_plan_frame
+                        ps.header.stamp = rospy.Time(0)
+                        ps.point.x = target[0]
+                        ps.point.y = target[1]
+                        ps.point.z = 0.0
+                        try:
+                            ps_trans = self.tf_listener.transformPoint(costmap_frame, ps)
+                            tx, ty = ps_trans.point.x, ps_trans.point.y
+                        except Exception:
+                            tx, ty = target[0], target[1]
+                    else:
+                        tx, ty = target[0], target[1]
                 
                 # Render local costmap data with continuous gradient
                 try:
@@ -2020,74 +2095,79 @@ class RobotWebServer:
                     viz[raw_data == -1] = [5, 5, 5]
                     
                     # 2. Gradient space (0 < data < 100)
-                    # We use a orange/red tint for the repulsion field
                     mask_gradient = (raw_data > 0) & (raw_data < 100)
                     if np.any(mask_gradient):
                         occ_vals = raw_data[mask_gradient].astype(np.float32)
                         viz[mask_gradient, 2] = np.clip(occ_vals * 2.5, 0, 255).astype(np.uint8) # Red
-                        viz[mask_gradient, 1] = np.clip(occ_vals * 1.5, 0, 255).astype(np.uint8) # Green (Orange tint)
+                        viz[mask_gradient, 1] = np.clip(occ_vals * 1.5, 0, 255).astype(np.uint8) # Green
                     
                     # 3. Solid walls (data >= 100) -> White
                     viz[raw_data >= 100] = [220, 220, 220]
                     
-                    viz = cv2.flip(viz, 0) # Flip to match robot orientation (Up is forward)
+                    # Draw motion primitives (all candidates in dim green)
+                    for primitive in candidates:
+                        for i in range(1, len(primitive)):
+                            p1 = primitive[i-1]
+                            p2 = primitive[i]
+                            pt1 = (int((p1[0] - origin.position.x) / res), int((p1[1] - origin.position.y) / res))
+                            pt2 = (int((p2[0] - origin.position.x) / res), int((p2[1] - origin.position.y) / res))
+                            cv2.line(viz, pt1, pt2, (0, 100, 0), 1)
+                    
+                    # Draw selected path (thick cyan)
+                    for i in range(1, len(transformed_selected)):
+                        p1 = transformed_selected[i-1]
+                        p2 = transformed_selected[i]
+                        pt1 = (int((p1[0] - origin.position.x) / res), int((p1[1] - origin.position.y) / res))
+                        pt2 = (int((p2[0] - origin.position.x) / res), int((p2[1] - origin.position.y) / res))
+                        cv2.line(viz, pt1, pt2, (255, 255, 0), 2)
+                    
+                    # Draw local target (Large Yellow Cross) on unflipped canvas
+                    if tx is not None and ty is not None:
+                        t_col = int((tx - origin.position.x) / res)
+                        t_row = int((ty - origin.position.y) / res)
+                        if 0 <= t_col < width and 0 <= t_row < height:
+                            cv2.drawMarker(viz, (t_col, t_row), (0, 255, 255), cv2.MARKER_CROSS, 8, 2)
+
+                    # Draw robot at its actual pose (rx, ry) on unflipped canvas
+                    r_col = int((rx - origin.position.x) / res)
+                    r_row = int((ry - origin.position.y) / res)
+                    cv2.circle(viz, (r_col, r_row), 4, (0, 0, 255), -1)
+                    cv2.circle(viz, (r_col, r_row), 4, (255, 255, 255), 1)
+                    
+                    # Flip the entire visualization to match robot orientation (Up is forward)
+                    viz = cv2.flip(viz, 0)
+                    
+                    # Draw text AFTER flipping so it is not upside down
+                    if tx is not None and ty is not None:
+                        t_col = int((tx - origin.position.x) / res)
+                        t_row_flipped = height - 1 - int((ty - origin.position.y) / res)
+                        if 0 <= t_col < width and 0 <= t_row_flipped < height:
+                            cv2.putText(viz, "GOAL", (t_col + 5, t_row_flipped - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
+                    
+                    canvas = viz
                 except Exception as e:
                     rospy.logerr(f"Local Planner Rendering Error: {e}")
-                    viz = np.zeros((height, width, 3), dtype=np.uint8)
-                
-                # Draw motion primitives (all candidates in dim green)
-                for primitive in candidates:
-                    for i in range(1, len(primitive)):
-                        p1 = primitive[i-1]
-                        p2 = primitive[i]
-                        # Convert local meters to pixel coordinates (centered on robot at origin)
-                        # Local origin in heightmap is usually bottom-left
-                        pt1 = (int((p1[0] - origin.position.x) / res), height - 1 - int((p1[1] - origin.position.y) / res))
-                        pt2 = (int((p2[0] - origin.position.x) / res), height - 1 - int((p2[1] - origin.position.y) / res))
-                        cv2.line(viz, pt1, pt2, (0, 100, 0), 1)
-                
-                # Draw selected path (thick cyan)
-                for i in range(1, len(selected)):
-                    p1 = selected[i-1]
-                    p2 = selected[i]
-                    pt1 = (int((p1[0] - origin.position.x) / res), height - 1 - int((p1[1] - origin.position.y) / res))
-                    pt2 = (int((p2[0] - origin.position.x) / res), height - 1 - int((p2[1] - origin.position.y) / res))
-                    cv2.line(viz, pt1, pt2, (255, 255, 0), 2)
-                
-                # Draw local target (Large Yellow Cross)
-                with self.lock:
-                    target = self.trunc_target
-                if target:
-                    tx, ty = target
-                    t_col = int((tx - origin.position.x) / res)
-                    t_row = height - 1 - int((ty - origin.position.y) / res)
-                    if 0 <= t_col < width and 0 <= t_row < height:
-                        cv2.drawMarker(viz, (t_col, t_row), (0, 255, 255), cv2.MARKER_CROSS, 8, 2)
-                        cv2.putText(viz, "GOAL", (t_col + 5, t_row - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 255, 255), 1)
-
-                # Draw robot at frame center (0,0 local)
-                r_col = int((0 - origin.position.x) / res)
-                r_row = height - 1 - int((0 - origin.position.y) / res)
-                cv2.circle(viz, (r_col, r_row), 4, (0, 0, 255), -1)
-                cv2.circle(viz, (r_col, r_row), 4, (255, 255, 255), 1)
-                
-                canvas = viz
+                    canvas = np.zeros((height, width, 3), dtype=np.uint8)
             
             if canvas is not None:
                 # Resize and Zoom: Original is usually 200x200 (20m @ 0.1m res). 
                 h, w = canvas.shape[:2]
                 ch, cw = h // 4, w // 4 
                 
-                r_col = int((0 - origin.position.x) / res)
-                r_row = h - 1 - int((0 - origin.position.y) / res)
+                r_col = int((rx - origin.position.x) / res)
+                # Since canvas is flipped vertically, the robot's row is now flipped
+                r_row_flipped = int((ry - origin.position.y) / res)
                 
-                y1 = max(0, r_row - ch)
-                y2 = min(h, r_row + ch)
+                y1 = max(0, r_row_flipped - ch)
+                y2 = min(h, r_row_flipped + ch)
                 x1 = max(0, r_col - cw)
                 x2 = min(w, r_col + cw)
                 
                 canvas_zoomed = canvas[y1:y2, x1:x2]
-                disp = cv2.resize(canvas_zoomed, (400, 400), interpolation=cv2.INTER_NEAREST)
+                if canvas_zoomed.size > 0:
+                    disp = cv2.resize(canvas_zoomed, (400, 400), interpolation=cv2.INTER_NEAREST)
+                else:
+                    disp = np.zeros((400, 400, 3), dtype=np.uint8)
                 
                 # Add status text overlay
                 cv2.putText(disp, f"Planner: {rospy.get_param('/local_planner_type', 'control_space')}", (10, 20), 
@@ -2202,7 +2282,11 @@ def api_status():
         "mapped_shops": server.mapped_shops if hasattr(server, "mapped_shops") else [],
         "overshoot_cm": (server.overshoot_m * 100.0) if hasattr(server, 'overshoot_m') else 0.0,
         "chat_messages": server.delivery_chat_history if hasattr(server, 'delivery_chat_history') else [],
-        "todo_list": server.active_todo_list if hasattr(server, 'active_todo_list') else None
+        "todo_list": server.active_todo_list if hasattr(server, 'active_todo_list') else None,
+        "yolo_nav_state": server.yolo_nav_state if hasattr(server, 'yolo_nav_state') else True,
+        "yolo_grab_state": server.yolo_grab_state if hasattr(server, 'yolo_grab_state') else False,
+        "yolo_nav_enabled": server.yolo_nav_enabled if hasattr(server, 'yolo_nav_enabled') else True,
+        "yolo_grab_enabled": server.yolo_grab_enabled if hasattr(server, 'yolo_grab_enabled') else True
     }
     return jsonify(status)
 
@@ -2289,6 +2373,50 @@ def set_planner():
     rospy.set_param("/local_planner_type", planner)
     rospy.loginfo(f"Set /local_planner_type parameter to {planner}")
     return jsonify({"status": "success", "planner": planner})
+
+@app.route('/api/yolo/toggle_nav', methods=['POST'])
+def api_yolo_toggle_nav():
+    with server.lock:
+        server.yolo_nav_enabled = not server.yolo_nav_enabled
+        if not server.yolo_nav_enabled:
+            server.pub_nav.publish(Bool(False))
+        else:
+            # If enabled, also make sure it runs if it's the currently active one (or just turn it back on)
+            server.pub_nav.publish(Bool(True))
+    return jsonify({
+        "status": "ok", 
+        "yolo_nav_enabled": server.yolo_nav_enabled, 
+        "yolo_nav_state": server.yolo_nav_state
+    })
+
+@app.route('/api/yolo/toggle_grab', methods=['POST'])
+def api_yolo_toggle_grab():
+    with server.lock:
+        server.yolo_grab_enabled = not server.yolo_grab_enabled
+        if not server.yolo_grab_enabled:
+            server.pub_grab.publish(Bool(False))
+        else:
+            server.pub_grab.publish(Bool(True))
+    return jsonify({
+        "status": "ok", 
+        "yolo_grab_enabled": server.yolo_grab_enabled, 
+        "yolo_grab_state": server.yolo_grab_state
+    })
+
+@app.route('/api/yolo/toggle_light_switch', methods=['POST'])
+def api_yolo_toggle_light_switch():
+    success = False
+    with server.lock:
+        if server.yolo_nav_enabled and server.yolo_grab_enabled:
+            success = server.toggle_yolo_light_switch()
+    if success:
+        return jsonify({"status": "ok"})
+    else:
+        return jsonify({
+            "status": "error", 
+            "message": "Both YOLOs must be active (enabled) to use the light switch."
+        }), 400
+
 
 @app.route('/api/detect', methods=['POST'])
 def api_detect():
@@ -2581,6 +2709,66 @@ def api_map_info():
         return jsonify({"status": "no_map"})
     vp["status"] = "ok"
     return jsonify(vp)
+
+@app.route('/api/map_click_to_world', methods=['POST'])
+def api_map_click_to_world():
+    """Convert displayed map client pixel coordinates to world coordinates in the 'map' frame."""
+    data = request.json or {}
+    try:
+        px = float(data['x'])
+        py = float(data['y'])
+        disp_w = float(data['disp_w'])
+        disp_h = float(data['disp_h'])
+    except (KeyError, ValueError) as e:
+        return jsonify({"status": "error", "message": f"Invalid inputs: {e}"}), 400
+
+    with server.lock:
+        grid_map = server.grid_map
+        map_viewport = dict(server.map_viewport) if server.map_viewport else None
+
+    if grid_map is None or map_viewport is None:
+        return jsonify({"status": "error", "message": "Map not loaded yet"}), 400
+
+    res = map_viewport['res']
+    ox = map_viewport['ox']
+    oy = map_viewport['oy']
+    width = map_viewport['map_w']
+    height = map_viewport['map_h']
+    v_disp_w = map_viewport['disp_w']
+    v_disp_h = map_viewport['disp_h']
+
+    # Scale from client display size to backend display size
+    scale_x = v_disp_w / disp_w
+    scale_y = v_disp_h / disp_h
+    disp_x = px * scale_x
+    disp_y = py * scale_y
+
+    scale_img = v_disp_h / height
+    map_col = disp_x / scale_img
+    map_row_flipped = disp_y / scale_img
+    map_row = height - 1 - map_row_flipped
+
+    # Coordinates in SLAM map frame (rtabmap_map)
+    wx_slam = ox + map_col * res
+    wy_slam = oy + map_row * res
+
+    # Transform from SLAM map frame to 'map' frame
+    map_frame = grid_map.header.frame_id
+    wx_map, wy_map = wx_slam, wy_slam
+    if server.tf_listener.canTransform('map', map_frame, rospy.Time(0)):
+        try:
+            ps = PointStamped()
+            ps.header.frame_id = map_frame
+            ps.header.stamp = rospy.Time(0)
+            ps.point.x = wx_slam
+            ps.point.y = wy_slam
+            ps_trans = server.tf_listener.transformPoint('map', ps)
+            wx_map = ps_trans.point.x
+            wy_map = ps_trans.point.y
+        except Exception as e:
+            rospy.logwarn(f"Failed to transform clicked point to map frame: {e}")
+
+    return jsonify({"status": "ok", "x": wx_map, "y": wy_map})
 
 @app.route('/api/taxi_to', methods=['POST'])
 def api_taxi_to():

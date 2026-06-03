@@ -24,7 +24,7 @@
 
         <!-- 3. Start RTAB-Map SLAM (Configured to use stable Wheel Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.11 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.35 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2500 --Kp/MaxFeatures 2500 --Rtabmap/LoopThr 0.11 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
             <arg name="rgb_topic" value="/camera/color/image_raw"/>
             <arg name="depth_topic" value="/camera/depth/image_raw"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
@@ -78,7 +78,7 @@
 
         <!-- 3. Start RTAB-Map SLAM (Configured for Visual Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 4 --Grid/MaxObstacleHeight 0.35 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 4 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
             <arg name="rgb_topic" value="/camera/color/image_raw_throttle"/>
             <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw_throttle"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
@@ -93,7 +93,7 @@
             <arg name="approx_sync" value="true"/>
             <arg name="rviz" value="false"/>
             <arg name="rtabmap_viz" value="false"/>
-            <arg name="odom_args" value="--Odom/ResetCountdown 2 --Vis/MaxFeatures 2000 --Vis/MinInliers 10 --OdomF2M/MaxSize 3000 --Odom/KeyFrameThr 0.6"/>
+            <arg name="odom_args" value="--Odom/ResetCountdown 2 --Vis/MaxFeatures 600 --Vis/MinInliers 10 --OdomF2M/MaxSize 1000 --Odom/KeyFrameThr 0.6"/>
             <arg name="map_frame_id" value="rtabmap_map"/>
         </include>
     </group>
@@ -122,7 +122,7 @@
     <node name="tag_visualizer" pkg="hw4_exploration" type="tag_visualizer.py" output="screen" />
 
     <!-- 10. Start the Robot Web UI Server -->
-    <node name="robot_web_ui_server" pkg="robot_web_ui" type="web_server_node.py" output="screen">
+    <node name="robot_web_ui_server" pkg="robot_web_ui" type="web_server_node.py" output="screen" respawn="true">
         <param name="depth_topic" value="/camera/depth/image_raw" if="$(arg sim)" />
         <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
         <param name="enable_camera_viz" value="false" />

@@ -40,12 +40,13 @@ namespace local_costmap_generator {
 
 HeightMap::HeightMap(ros::NodeHandle node, ros::NodeHandle priv_nh)
 {
+  last_processed_time_ = ros::Time(0);
   // get parameters using private node handle
   priv_nh.param("cell_size", m_per_cell_, 0.1); // [m / cell]
   priv_nh.param("full_clouds", full_clouds_, false);
   priv_nh.param("grid_dimensions", grid_dim_, 200); // [cell] size of map; 200 cell = 20 [m] / 0.1 [m/cell]; 20 is calculated from MAP_MAX_X - MAP_MIN_X at 'heightmap_to_costmap.cpp'
   priv_nh.param("height_threshold", height_diff_threshold_, 0.05); // Reduced from 0.25m to catch lower parts of walls
-  priv_nh.param("max_obstacle_height", max_obstacle_height_,  0.35); // Ignore points above robot clearance (~35cm body height)
+  priv_nh.param("max_obstacle_height", max_obstacle_height_,  0.15); // Ignore points above robot clearance (~15cm body height)
   priv_nh.param("min_obstacle_height", min_obstacle_height_, -0.10); // Ignore points below robot base (floor noise, camera tilt)
   
   ROS_INFO_STREAM("height map parameters: "
@@ -78,7 +79,7 @@ void HeightMap::constructFullClouds(const VPointCloud::ConstPtr &scan,
   memset(&init, 0, grid_dim_*grid_dim_);
   
   // build height map
-  for (unsigned i = 0; i < npoints; ++i) {
+  for (unsigned i = 0; i < npoints; i += 4) {
     double local_x = scan->points[i].x;
     double local_y = scan->points[i].y;
     double local_z = scan->points[i].z;
@@ -100,7 +101,7 @@ void HeightMap::constructFullClouds(const VPointCloud::ConstPtr &scan,
   }
 
   // display points where map has height-difference > threshold
-  for (unsigned i = 0; i < npoints; ++i) {
+  for (unsigned i = 0; i < npoints; i += 4) {
     double local_x = scan->points[i].x;
     double local_y = scan->points[i].y;
     double local_z = scan->points[i].z;
@@ -144,7 +145,7 @@ void HeightMap::constructGridClouds(const VPointCloud::ConstPtr &scan,
   }
 
   // build height map
-  for (unsigned i = 0; i < npoints; ++i) {
+  for (unsigned i = 0; i < npoints; i += 4) {
     double local_x = scan->points[i].x;
     double local_y = scan->points[i].y;
     double local_z = scan->points[i].z;
@@ -168,7 +169,7 @@ void HeightMap::constructGridClouds(const VPointCloud::ConstPtr &scan,
   }
 
   // calculate height (max_z - min_z) of each grid in each cell
-  for (unsigned i = 0; i < npoints; ++i) {
+  for (unsigned i = 0; i < npoints; i += 4) {
     double local_x = scan->points[i].x;
     double local_y = scan->points[i].y;
     double local_z = scan->points[i].z;
@@ -213,6 +214,15 @@ void HeightMap::processData(const VPointCloud::ConstPtr &scan)
   if ((obstacle_publisher_.getNumSubscribers() == 0)
       && (clear_publisher_.getNumSubscribers() == 0))
     return;
+
+  // Throttle processing to approx 8 Hz to reduce CPU load
+  ros::Time now = ros::Time::now();
+  if (last_processed_time_.isZero()) {
+    last_processed_time_ = now;
+  } else if ((now - last_processed_time_).toSec() < 0.12) { // ~8 Hz
+    return;
+  }
+  last_processed_time_ = now;
 
   // Transform the point cloud to base_footprint frame
   VPointCloud::Ptr scan_transformed(new VPointCloud());

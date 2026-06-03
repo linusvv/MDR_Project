@@ -467,6 +467,81 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // YOLO Controller Handlers
+    const btnYoloLightSwitch = document.getElementById('btn-yolo-light-switch');
+    const btnToggleYoloNav = document.getElementById('btn-toggle-yolo-nav');
+    const btnToggleYoloGrab = document.getElementById('btn-toggle-yolo-grab');
+
+    if (btnYoloLightSwitch) {
+        btnYoloLightSwitch.addEventListener('click', async () => {
+            try {
+                btnYoloLightSwitch.disabled = true;
+                const response = await fetch('/api/yolo/toggle_light_switch', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const resData = await response.json();
+                if (response.ok) {
+                    logConsole("System: YOLO Light Switch toggled (swapped models).");
+                } else {
+                    logConsole(`Error: ${resData.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to toggle YOLO light switch", error);
+                logConsole("Error: Failed to connect to server.");
+            } finally {
+                btnYoloLightSwitch.disabled = false;
+            }
+        });
+    }
+
+    if (btnToggleYoloNav) {
+        btnToggleYoloNav.addEventListener('click', async () => {
+            try {
+                btnToggleYoloNav.disabled = true;
+                const response = await fetch('/api/yolo/toggle_nav', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const resData = await response.json();
+                if (response.ok) {
+                    logConsole(`System: YOLO Nav model ${resData.yolo_nav_enabled ? 'enabled' : 'shut off'}.`);
+                } else {
+                    logConsole(`Error: ${resData.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to toggle YOLO Nav", error);
+                logConsole("Error: Failed to connect to server.");
+            } finally {
+                btnToggleYoloNav.disabled = false;
+            }
+        });
+    }
+
+    if (btnToggleYoloGrab) {
+        btnToggleYoloGrab.addEventListener('click', async () => {
+            try {
+                btnToggleYoloGrab.disabled = true;
+                const response = await fetch('/api/yolo/toggle_grab', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' }
+                });
+                const resData = await response.json();
+                if (response.ok) {
+                    logConsole(`System: YOLO Grab model ${resData.yolo_grab_enabled ? 'enabled' : 'shut off'}.`);
+                } else {
+                    logConsole(`Error: ${resData.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to toggle YOLO Grab", error);
+                logConsole("Error: Failed to connect to server.");
+            } finally {
+                btnToggleYoloGrab.disabled = false;
+            }
+        });
+    }
+
+
     // Delivery Agent Chatbot Logic
     const chatInput = document.getElementById('chat-input');
     const chatSend = document.getElementById('btn-send-chat');
@@ -1017,7 +1092,106 @@ document.addEventListener('DOMContentLoaded', () => {
             } else {
                 updateTodoList(null);
             }
+
+            // YOLO Status UI updates
+            const yoloStatusBadge = document.getElementById('yolo-status-badge');
+            const currentActiveYoloLabel = document.getElementById('current-active-yolo-label');
+            const yoloNavStateIndicator = document.getElementById('yolo-nav-state-indicator');
+            const yoloGrabStateIndicator = document.getElementById('yolo-grab-state-indicator');
+            const btnToggleYoloNav = document.getElementById('btn-toggle-yolo-nav');
+            const btnToggleYoloGrab = document.getElementById('btn-toggle-yolo-grab');
+            const btnYoloLightSwitch = document.getElementById('btn-yolo-light-switch');
+
+            if (yoloStatusBadge) {
+                const anyEnabled = data.yolo_nav_enabled || data.yolo_grab_enabled;
+                if (anyEnabled) {
+                    yoloStatusBadge.textContent = "ACTIVE";
+                    yoloStatusBadge.style.background = "rgba(16, 185, 129, 0.2)";
+                    yoloStatusBadge.style.color = "#10b981";
+                } else {
+                    yoloStatusBadge.textContent = "SHUT DOWN";
+                    yoloStatusBadge.style.background = "rgba(239, 68, 68, 0.2)";
+                    yoloStatusBadge.style.color = "#ef4444";
+                }
+            }
+
+            if (currentActiveYoloLabel) {
+                if (data.yolo_nav_state && data.yolo_nav_enabled) {
+                    currentActiveYoloLabel.textContent = "YOLO Nav Running";
+                    currentActiveYoloLabel.style.color = "#10b981";
+                } else if (data.yolo_grab_state && data.yolo_grab_enabled) {
+                    currentActiveYoloLabel.textContent = "YOLO Grab Running";
+                    currentActiveYoloLabel.style.color = "#f59e0b";
+                } else {
+                    currentActiveYoloLabel.textContent = "All Idle";
+                    currentActiveYoloLabel.style.color = "#64748b";
+                }
+            }
+
+            if (yoloNavStateIndicator) {
+                if (data.yolo_nav_enabled) {
+                    if (data.yolo_nav_state) {
+                        yoloNavStateIndicator.textContent = "RUNNING";
+                        yoloNavStateIndicator.style.color = "#10b981";
+                    } else {
+                        yoloNavStateIndicator.textContent = "STANDBY";
+                        yoloNavStateIndicator.style.color = "#38bdf8";
+                    }
+                } else {
+                    yoloNavStateIndicator.textContent = "DISABLED";
+                    yoloNavStateIndicator.style.color = "#ef4444";
+                }
+            }
+
+            if (yoloGrabStateIndicator) {
+                if (data.yolo_grab_enabled) {
+                    if (data.yolo_grab_state) {
+                        yoloGrabStateIndicator.textContent = "RUNNING";
+                        yoloGrabStateIndicator.style.color = "#10b981";
+                    } else {
+                        yoloGrabStateIndicator.textContent = "STANDBY";
+                        yoloGrabStateIndicator.style.color = "#38bdf8";
+                    }
+                } else {
+                    yoloGrabStateIndicator.textContent = "DISABLED";
+                    yoloGrabStateIndicator.style.color = "#ef4444";
+                }
+            }
+
+            if (btnToggleYoloNav) {
+                if (data.yolo_nav_enabled) {
+                    btnToggleYoloNav.textContent = "Shut Off";
+                    btnToggleYoloNav.style.background = "#dc2626";
+                } else {
+                    btnToggleYoloNav.textContent = "Enable";
+                    btnToggleYoloNav.style.background = "#10b981";
+                }
+            }
+
+            if (btnToggleYoloGrab) {
+                if (data.yolo_grab_enabled) {
+                    btnToggleYoloGrab.textContent = "Shut Off";
+                    btnToggleYoloGrab.style.background = "#dc2626";
+                } else {
+                    btnToggleYoloGrab.textContent = "Enable";
+                    btnToggleYoloGrab.style.background = "#10b981";
+                }
+            }
+
+            if (btnYoloLightSwitch) {
+                const bothActive = data.yolo_nav_enabled && data.yolo_grab_enabled;
+                if (bothActive) {
+                    btnYoloLightSwitch.disabled = false;
+                    btnYoloLightSwitch.style.opacity = "1";
+                    btnYoloLightSwitch.style.cursor = "pointer";
+                } else {
+                    btnYoloLightSwitch.disabled = true;
+                    btnYoloLightSwitch.style.opacity = "0.4";
+                    btnYoloLightSwitch.style.cursor = "not-allowed";
+                }
+            }
         } catch (error) {
+
             console.error("Failed to fetch telemetry status", error);
         }
     };
@@ -1113,35 +1287,20 @@ document.addEventListener('DOMContentLoaded', () => {
     // Convert a pixel click on the displayed <img> to world (map-frame) coordinates
     async function pixelToWorld(imgEl, px, py) {
         try {
-            const resp = await fetch('/api/map_info');
-            const vp = await resp.json();
-            if (vp.status !== 'ok') return null;
-
-            // px, py are in CSS pixels relative to the img element's bounding box.
-            // The image is rendered at (disp_w × disp_h) but may be CSS-scaled.
             const rect = imgEl.getBoundingClientRect();
-            const scaleX = vp.disp_w / rect.width;
-            const scaleY = vp.disp_h / rect.height;
-
-            // Position in the rendered (disp_w × disp_h) image
-            const dispX = px * scaleX;
-            const dispY = py * scaleY;
-
-            // The rendered image is the full (map_w × map_h) grid scaled to
-            // (disp_w × disp_h) with aspect ratio maintained.
-            const scaleImg = vp.disp_h / vp.map_h;  // same scale for both axes
-
-            // Pixel in the full flipped map image
-            const mapCol = dispX / scaleImg;                 // column (x axis)
-            const mapRowFlipped = dispY / scaleImg;          // row in flipped image
-
-            // Undo vertical flip
-            const mapRow = vp.map_h - 1 - mapRowFlipped;
-
-            // Convert map-pixels to world metres
-            const wx = vp.ox + mapCol  * vp.res;
-            const wy = vp.oy + mapRow  * vp.res;
-            return { wx, wy };
+            const resp = await fetch('/api/map_click_to_world', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    x: px,
+                    y: py,
+                    disp_w: rect.width,
+                    disp_h: rect.height
+                })
+            });
+            const data = await resp.json();
+            if (data.status !== 'ok') return null;
+            return { wx: data.x, wy: data.y };
         } catch(e) {
             console.error('[Taxi] pixelToWorld error:', e);
             return null;

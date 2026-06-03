@@ -67,6 +67,7 @@ private:
   ros::Publisher clear_publisher_;
 
   tf::TransformListener tf_listener_;
+  ros::Time last_processed_time_;
 };
 
 } // namespace local_costmap_generator

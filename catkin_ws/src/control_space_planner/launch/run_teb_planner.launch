@@ -14,7 +14,7 @@
         <!-- local_costmap configurations needed by TEB -->
         <rosparam>
             local_costmap:
-                global_frame: map
+                global_frame: odom
                 robot_base_frame: base_footprint
                 robot_radius: 0.30
                 footprint_padding: 0.00
@@ -29,23 +29,17 @@
                 resolution: 0.1
                 plugins:
                  - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
+                 - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
                 obstacle_layer:
                     observation_sources: point_cloud_sensor
-                    # observation_persistence: how long (seconds) to keep a sensor reading.
-                    # Without this, the last received point cloud is kept FOREVER with its
-                    # original timestamp. When VO stalls and the camera stops publishing,
-                    # updateMap() repeatedly tries to TF-transform this stale cloud at its
-                    # old timestamp, which evicts from the TF buffer → extrapolation cascade.
-                    # 2.0s matches the VO keepalive threshold in map_odom_publisher.
-                    # min_obstacle_height: 0.02 — keep at original value. Raising this
-                    # to filter "floating obstacles" blinds the robot to walls: the camera
-                    # sees wall bases at 0.02-0.05m and they get filtered out entirely.
-                    # max_obstacle_height: 0.15 — matches local_costmap_generator's output.
-                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: 0.02, max_obstacle_height: 0.15, queue_size: 1, observation_persistence: 2.0, expected_update_rate: 0.0}
+                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: 0.02, max_obstacle_height: 0.15, queue_size: 1, observation_persistence: 0.0, expected_update_rate: 0.0}
+                inflation_layer:
+                    inflation_radius: 0.5
+                    cost_scaling_factor: 10.0
             
             TebLocalPlannerROS:
                 odom_topic: /odom
-                map_frame: map
+                map_frame: odom
                 
                 # Costmap Converter Configuration
                 costmap_converter_plugin: ""
@@ -66,7 +60,7 @@
                 weight_optimaltime: 1.5
                 
                 # Robot Configuration
-                max_vel_x: 0.13
+                max_vel_x: 0.12
                 max_vel_x_backwards: 0.03
                 max_vel_y: 0.0     # Sideways movement disabled for front-sensor setup
                 max_vel_theta: 0.4

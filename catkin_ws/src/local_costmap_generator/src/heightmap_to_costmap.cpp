@@ -26,7 +26,7 @@ public:
     void cloud_cb(const sensor_msgs::PointCloud2ConstPtr &cloud_msg);
     void generate_costmap();
 
-    bool DO_INFLATION = true; // true
+    bool DO_INFLATION = false; // Turned off to drastically reduce CPU usage; Costmap2DROS will handle inflation.
     float RESOLUTION_ = 0.1; // [m / cell]
     float MAP_MIN_X =  -5; // map min x position
     float MAP_MAX_X =  15; // map max x position

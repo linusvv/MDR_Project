@@ -61,3 +61,10 @@ add_dependencies(teb_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_E
 target_link_libraries(teb_planner_node
   ${catkin_LIBRARIES}
 )
+
+
+add_executable(astar_planner_node src/astar_planner_node.cpp)
+add_dependencies(astar_planner_node ${${PROJECT_NAME}_EXPORTED_TARGETS} ${catkin_EXPORTED_TARGETS})
+target_link_libraries(astar_planner_node
+  ${catkin_LIBRARIES}
+)

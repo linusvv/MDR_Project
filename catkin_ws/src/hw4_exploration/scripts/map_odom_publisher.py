@@ -40,6 +40,11 @@ class MapOdomPublisher:
         self.last_good_rtabmap_to_odom = None
         self.last_good_odom_to_bf = None      # keepalive for odom -> base_footprint
         self.map_to_rtabmap_mat = np.eye(4)  # Default: no offset
+        
+        # Rolling average history (e.g., last 20 frames = ~4 seconds of tags)
+        self.history_size = 20
+        self.trans_history = []
+        self.quat_history = []
         self.diag_divider = 0
 
     def pose_to_mat(self, pose):
@@ -91,12 +96,37 @@ class MapOdomPublisher:
             if shift < 0.05:
                 return  # Too small — probably tag noise, skip
 
-            # Low-pass filter: blend only 15% of the new correction per callback.
+            # Rolling average filter: compute average over the last N detections.
             # This prevents a single bad tag reading from instantly teleporting
-            # the robot's perceived position; large real corrections converge
-            # smoothly over several detections (~7 callbacks to 65% adoption).
-            alpha = 0.15
-            self.map_to_rtabmap_mat = (1.0 - alpha) * self.map_to_rtabmap_mat + alpha * new_mat
+            # the robot's perceived position, and smooths out small variations.
+            
+            # Extract components from new detection
+            new_trans = new_mat[:3, 3]
+            new_quat = tf_trans.quaternion_from_matrix(new_mat)
+            
+            # Ensure new_quat is in the same hemisphere as the previous one 
+            # to prevent quaternions from canceling out when averaging
+            if len(self.quat_history) > 0:
+                if np.dot(new_quat, self.quat_history[-1]) < 0:
+                    new_quat = -new_quat
+                    
+            # Add to rolling history
+            self.trans_history.append(new_trans)
+            self.quat_history.append(new_quat)
+            
+            # Maintain window size
+            if len(self.trans_history) > self.history_size:
+                self.trans_history.pop(0)
+                self.quat_history.pop(0)
+                
+            # Compute rolling average
+            avg_trans = np.mean(self.trans_history, axis=0)
+            avg_quat = np.mean(self.quat_history, axis=0)
+            avg_quat /= np.linalg.norm(avg_quat)
+            
+            # Reconstruct the matrix to ensure it remains a valid rigid transform
+            self.map_to_rtabmap_mat = tf_trans.quaternion_matrix(avg_quat)
+            self.map_to_rtabmap_mat[:3, 3] = avg_trans
             
             rospy.loginfo_once("[map_odom_publisher] Successfully aligned RTAB-Map origin to AprilTag frame!")
         except Exception as e:

@@ -1,4 +1,10 @@
 <launch>
+    <!-- ============================================================
+         A* 전용 통합 launch. 기존 run_all.launch(teb)는 그대로 두고
+         이 파일로 실행하면 local planner가 A* 하나만 뜬다.
+         (run.launch / run_teb_planner.launch 는 include 하지 않으므로
+          teb costmap 은 생성되지 않음 => costmap 1개만 동작)
+         ============================================================ -->
     <arg name="use_rviz" default="false"/>
     <arg name="sim" default="false"/>
 
@@ -13,7 +19,7 @@
         <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
             <arg name="tag_file_name" value="2025/re540_simulation" />
             <arg name="camera_name" value="/camera/color" />
-            <arg name="image_topic" value="image_raw_throttle" />
+            <arg name="image_topic" value="image_raw" />
             <arg name="world_frame_name" value="map" />
             <arg name="camera_frame_name" value="camera_link" />
             <arg name="image_frame_name" value="camera_color_optical_frame" />
@@ -45,9 +51,6 @@
 
     <!-- ==================== REAL ROBOT SPECIFIC SETUP ==================== -->
     <group unless="$(arg sim)">
-        <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" />
-        <remap from="/camera/aligned_depth_to_color/image_raw_throttle" to="/camera/aligned_depth_to_color/image_raw" />
-
         <!-- 1. Check if 3D camera is running, start it if not -->
         <node name="camera_checker" pkg="hw4_exploration" type="camera_checker.py" output="screen" />
 
@@ -55,7 +58,7 @@
         <node pkg="nodelet" type="nodelet" name="depth_image_proc_manager" args="manager" output="screen" />
         <node pkg="nodelet" type="nodelet" name="depth_to_pointcloud" args="load depth_image_proc/point_cloud_xyz depth_image_proc_manager" output="screen">
             <remap from="camera_info" to="/camera/color/camera_info" />
-            <remap from="image_rect" to="/camera/aligned_depth_to_color/image_raw_throttle" />
+            <remap from="image_rect" to="/camera/aligned_depth_to_color/image_raw" />
             <remap from="points" to="/camera/depth/points" />
         </node>
 
@@ -70,7 +73,7 @@
         <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
             <arg name="tag_file_name" value="2026/ee478_n1_room113" />
             <arg name="camera_name" value="/camera/color" />
-            <arg name="image_topic" value="image_raw_throttle" />
+            <arg name="image_topic" value="image_raw" />
             <arg name="world_frame_name" value="map" />
             <arg name="camera_frame_name" value="camera_link" />
             <arg name="image_frame_name" value="camera_color_optical_frame" />
@@ -81,9 +84,9 @@
 
         <!-- 3. Start RTAB-Map SLAM (Configured for Visual Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
-            <arg name="rgb_topic" value="/camera/color/image_raw_throttle"/>
-            <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw_throttle"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 4 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
+            <arg name="rgb_topic" value="/camera/color/image_raw"/>
+            <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
             <arg name="depth_camera_info_topic" value="/camera/color/camera_info"/>
             <arg name="frame_id" value="base_footprint"/>
@@ -103,26 +106,27 @@
 
     <!-- ==================== COMMON SETUP ==================== -->
 
-    <!-- 2. Start local costmap generator -->
-    <include file="$(find local_costmap_generator)/launch/run.launch" />
-
     <!-- 3.7 Start the Map Odom Publisher -->
     <node name="map_odom_publisher" pkg="hw4_exploration" type="map_odom_publisher.py" output="screen" />
 
-    <!-- 5. Start the existing Python Motion Primitives Planner -->
-    <include file="$(find control_space_planner)/launch/run.launch" />
+    <!-- 5. Local planner = A* ONLY.
+         run_astar_planner.launch 가 /local_planner_type=astar 를 set하고,
+         A* 노드 + (inflation_layer 포함) local_costmap 을 띄운다. teb 미포함. -->
+    <include file="$(find control_space_planner)/launch/run_astar_planner.launch" />
+
+    <!-- run.launch 안에 함께 있던 나머지 planner 노드들 (param 게이트로 /cmd_vel 엔 조용) -->
+    <node name="control_space_planner_node" pkg="control_space_planner" type="control_space_planner_node" output="screen"/>
+    <node name="custom_vector_planner" pkg="control_space_planner" type="custom_vector_planner.py" output="screen"/>
 
     <!-- 6. Start LLM Client Node (Crash-free Startup) -->
     <node name="simple_llm_client" pkg="gpt_llm_client" type="simple_llm_client.py" output="screen" />
-    
+
     <!-- 7. Start Vision Perception Services -->
-    <node name="vision_perception_node" pkg="hw4_exploration" type="vision_perception_node.py" output="screen">
-        <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" unless="$(arg sim)" />
-    </node>
-    
+    <node name="vision_perception_node" pkg="hw4_exploration" type="vision_perception_node.py" output="screen" />
+
     <!-- 8. Start Store Coordinator (Map Anchor Points) -->
     <node name="store_coordinator_node" pkg="hw4_exploration" type="store_coordinator_node.py" output="screen" />
-    
+
     <!-- 9. Start AprilTag Visualizer -->
     <node name="tag_visualizer" pkg="hw4_exploration" type="tag_visualizer.py" output="screen" />
 
@@ -131,17 +135,16 @@
         <param name="depth_topic" value="/camera/depth/image_raw" if="$(arg sim)" />
         <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
         <param name="enable_camera_viz" value="false" />
-        <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" unless="$(arg sim)" />
-        <remap from="/camera/aligned_depth_to_color/image_raw_throttle" to="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
     </node>
 
     <!-- 11. Start Web Video Server and Throttles for much faster UI streaming -->
     <node name="web_video_server" pkg="web_video_server" type="web_video_server" output="screen">
         <param name="port" value="8080" />
     </node>
-    <!-- Throttle the camera streams to 5 Hz to save bandwidth (Simulation only, real robot camera runs at 6 Hz directly) -->
-    <node name="throttle_color" pkg="topic_tools" type="throttle" args="messages /camera/color/image_raw 5.0 /camera/color/image_raw_throttle" if="$(arg sim)" />
-    <node name="throttle_depth_sim" pkg="topic_tools" type="throttle" args="messages /camera/depth/image_raw 5.0 /camera/depth/image_raw_throttle" if="$(arg sim)" />
+    <!-- Throttle the camera streams to 5 Hz to save bandwidth -->
+    <node name="throttle_color" pkg="topic_tools" type="throttle" args="messages /camera/color/image_raw 10.0 /camera/color/image_raw_throttle" />
+    <node name="throttle_depth" pkg="topic_tools" type="throttle" args="messages /camera/aligned_depth_to_color/image_raw 10.0 /camera/aligned_depth_to_color/image_raw_throttle" unless="$(arg sim)" />
+    <node name="throttle_depth_sim" pkg="topic_tools" type="throttle" args="messages /camera/depth/image_raw 10.0 /camera/depth/image_raw_throttle" if="$(arg sim)" />
 
     <group if="$(arg use_rviz)">
         <node pkg="rviz" type="rviz" name="rviz_display" args="-d $(find hw4_exploration)/rviz/ee478_rtabmap.rviz" output="screen" />

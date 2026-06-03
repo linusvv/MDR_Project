@@ -53,19 +53,21 @@ public:
         path_received_ = true;
         
         if (is_new_path) {
-            geometry_msgs::PoseStamped robot_pose;
             int start_idx = 0;
-            if (costmap_ros_ && costmap_ros_->getRobotPose(robot_pose)) {
+            try {
+                auto t_map = tf_buffer_.lookupTransform("map", "base_footprint", ros::Time(0), ros::Duration(0.1));
                 double min_dist = 999999.0;
                 for (size_t i = 0; i < global_path_.poses.size(); ++i) {
-                    double dx = global_path_.poses[i].pose.position.x - robot_pose.pose.position.x;
-                    double dy = global_path_.poses[i].pose.position.y - robot_pose.pose.position.y;
+                    double dx = global_path_.poses[i].pose.position.x - t_map.transform.translation.x;
+                    double dy = global_path_.poses[i].pose.position.y - t_map.transform.translation.y;
                     double dist = std::sqrt(dx*dx + dy*dy);
                     if (dist < min_dist) {
                         min_dist = dist;
                         start_idx = i;
                     }
                 }
+            } catch (tf2::TransformException& ex) {
+                // Ignore and start from 0 if transform fails
             }
             last_closest_idx_ = start_idx;
         }
@@ -100,12 +102,14 @@ public:
         // and uses it for subsequent sensor-data TF lookups. Once that timestamp
         // gets stale (e.g. VO stall during recovery), getRobotPose() returns false
         // forever. A direct Time(0) lookup always gets the freshest available data.
-        geometry_msgs::PoseStamped robot_pose;
+        geometry_msgs::PoseStamped robot_pose_map;
+        geometry_msgs::PoseStamped robot_pose_odom;
         try {
-            auto t = tf_buffer_.lookupTransform("map", "base_footprint", ros::Time(0), ros::Duration(0.2));
+            auto t_map = tf_buffer_.lookupTransform("map", "base_footprint", ros::Time(0), ros::Duration(0.2));
+            auto t_odom = tf_buffer_.lookupTransform("odom", "base_footprint", ros::Time(0), ros::Duration(0.2));
             
-            double pose_age = (ros::Time::now() - t.header.stamp).toSec();
-            if (pose_age > 2.0) {
+            double pose_age = (ros::Time::now() - t_map.header.stamp).toSec();
+            if (pose_age > 1.5) {
                 if (recovery_state_ == 0) {
                     geometry_msgs::Twist stop;
                     pubCommand.publish(stop);
@@ -116,11 +120,17 @@ public:
                 }
             }
 
-            robot_pose.header = t.header;
-            robot_pose.pose.position.x    = t.transform.translation.x;
-            robot_pose.pose.position.y    = t.transform.translation.y;
-            robot_pose.pose.position.z    = t.transform.translation.z;
-            robot_pose.pose.orientation   = t.transform.rotation;
+            robot_pose_map.header = t_map.header;
+            robot_pose_map.pose.position.x    = t_map.transform.translation.x;
+            robot_pose_map.pose.position.y    = t_map.transform.translation.y;
+            robot_pose_map.pose.position.z    = t_map.transform.translation.z;
+            robot_pose_map.pose.orientation   = t_map.transform.rotation;
+            
+            robot_pose_odom.header = t_odom.header;
+            robot_pose_odom.pose.position.x    = t_odom.transform.translation.x;
+            robot_pose_odom.pose.position.y    = t_odom.transform.translation.y;
+            robot_pose_odom.pose.position.z    = t_odom.transform.translation.z;
+            robot_pose_odom.pose.orientation   = t_odom.transform.rotation;
         } catch (tf2::TransformException& ex) {
             geometry_msgs::Twist stop;
             pubCommand.publish(stop);
@@ -128,9 +138,9 @@ public:
             return;
         }
 
-        double rx = robot_pose.pose.position.x;
-        double ry = robot_pose.pose.position.y;
-        double min_obstacle_dist = getMinObstacleDistance(rx, ry);
+        double rx_odom = robot_pose_odom.pose.position.x;
+        double ry_odom = robot_pose_odom.pose.position.y;
+        double min_obstacle_dist = getMinObstacleDistance(rx_odom, ry_odom);
 
         geometry_msgs::Twist cmd_vel;
 
@@ -190,8 +200,8 @@ public:
         int search_start = std::max(0, last_closest_idx_);
         int search_end = std::min((int)global_path_.poses.size(), last_closest_idx_ + 100); // local forward window
         for (int i = search_start; i < search_end; ++i) {
-            double dx = global_path_.poses[i].pose.position.x - robot_pose.pose.position.x;
-            double dy = global_path_.poses[i].pose.position.y - robot_pose.pose.position.y;
+            double dx = global_path_.poses[i].pose.position.x - robot_pose_map.pose.position.x;
+            double dy = global_path_.poses[i].pose.position.y - robot_pose_map.pose.position.y;
             double dist = sqrt(dx*dx + dy*dy);
             if (dist < min_dist) {
                 min_dist = dist;
@@ -328,8 +338,10 @@ private:
                 }
                 
                 unsigned char cost = costmap->getCost(mx, my);
-                // Cost > 50 is generally considered an obstacle (varies by costmap config)
-                if (cost > 50) {
+                // Cost 254 is LETHAL_OBSTACLE (actual physical object).
+                // Cost 253 is INSCRIBED_INFLATED_OBSTACLE.
+                // We must ignore costs < 254 to avoid detecting the inscribed inflation gradient as a solid wall!
+                if (cost == 254) {
                     double world_x, world_y;
                     costmap->mapToWorld(mx, my, world_x, world_y);
                     double dist = std::sqrt((world_x - robot_x) * (world_x - robot_x) + 

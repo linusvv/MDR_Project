@@ -1,0 +1,62 @@
+<launch>
+    <!-- Standalone launch for the A* local planner, mirroring run_teb_planner.launch -->
+
+    <!-- CRITICAL: global param that gates ALL planners in this stack.
+         - astar_planner_node:         runs only when value == "astar" (checked in Plan())
+         - teb_planner_node:           runs only when value == "teb"
+         - control_space_planner_node: silent on /cmd_vel when != "control_space"
+         - custom_vector_planner:      skips entirely when != "custom_vector" -->
+    <param name="/local_planner_type" value="astar" />
+
+    <node pkg="control_space_planner" type="astar_planner_node" name="astar_planner_node" respawn="true" output="screen">
+        <param name="planner_frequency" value="20.0" />
+
+        <!-- Goal: leave empty to fall back to /graph_planner/path/global_path.
+             Set to a store name (e.g. store_cafe_A) or category (e.g. cafe). -->
+        <param name="target_store"      value="" />
+
+        <!-- Velocity limits. Front-sensor-only setup => no blind sideways strafe. -->
+        <param name="max_vel_x"         value="0.13" />
+        <param name="max_vel_y"         value="0.0"  />
+        <param name="max_vel_theta"     value="0.4"  />
+
+        <param name="lookahead_dist"    value="0.35" />
+        <param name="goal_tolerance"    value="0.15" />
+        <param name="carrot_max_dist"   value="2.0"  />
+        <param name="crash_dist"        value="0.32" />
+        <!-- A* soft-cost gain: higher => hugs the centre of free space more -->
+        <param name="inflation_weight"  value="3.0"  />
+        <!-- Cells with cost >= this are hard-blocked. 253 = INSCRIBED_INFLATED_OBSTACLE,
+             so the robot centre is kept >= robot_radius from every obstacle. -->
+        <param name="lethal_cost"       value="253"  />
+
+        <!-- local_costmap config. Uses SAME /map/local_map/obstacle topic as TEB.
+             Added inflation_layer for grid A* (TEB does inflation internally). -->
+        <rosparam>
+            local_costmap:
+                global_frame: map
+                robot_base_frame: base_footprint
+                robot_radius: 0.30
+                footprint_padding: 0.00
+                transform_tolerance: 8.0
+                update_frequency: 10.0
+                publish_frequency: 10.0
+                rolling_window: true
+                width: 4.0
+                height: 4.0
+                resolution: 0.1
+                plugins:
+                 - {name: custom_obstacle_layer, type: "costmap_2d::StaticLayer"}
+                 - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
+                custom_obstacle_layer:
+                    map_topic: /map/local_map/obstacle
+                    subscribe_to_updates: true
+                inflation_layer:
+                    # inflation_radius >= robot_radius so the 0.30 m footprint is encoded
+                    # as cost in the grid. Bump higher to keep more clearance from other robots.
+                    inflation_radius: 0.45
+                    # higher => cost decays faster beyond the inscribed radius
+                    cost_scaling_factor: 5.0
+        </rosparam>
+    </node>
+</launch>

@@ -186,13 +186,11 @@ class RobotWebServer:
         self.local_planner_pub = rospy.Publisher('/local_planner/image', Image, queue_size=2)
 
         # ROS Subscribers
-        if self.enable_camera_viz:
-            rospy.Subscriber('/camera/color/image_raw_throttle', Image, self.color_cb)
-            depth_topic = rospy.get_param('~depth_topic', '/camera/aligned_depth_to_color/image_raw') + '_throttle'
-            rospy.Subscriber(depth_topic, Image, self.depth_cb)
-            rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.cam_info_cb)
-        else:
-            rospy.loginfo("Web UI camera subscribers disabled.")
+        # We always subscribe to camera topics for YOLO and visual servoing
+        rospy.Subscriber('/camera/color/image_raw_throttle', Image, self.color_cb)
+        depth_topic = rospy.get_param('~depth_topic', '/camera/aligned_depth_to_color/image_raw') + '_throttle'
+        rospy.Subscriber(depth_topic, Image, self.depth_cb)
+        rospy.Subscriber('/camera/color/camera_info', CameraInfo, self.cam_info_cb)
 
         rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.map_cb)
         rospy.Subscriber('/map/local_map/obstacle', OccupancyGrid, self.local_map_cb)
@@ -275,33 +273,30 @@ class RobotWebServer:
         rospy.logwarn("[EMERGENCY STOP] Robot and planners stopped.")
 
     def color_cb(self, msg):
-        if not self.enable_camera_viz:
-            return
-
         try:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             
-            # Draw AprilTags and YOLO overlays if we have camera info
+            if self.enable_camera_viz:
+                # Draw AprilTags and YOLO overlays if we have camera info
+                with self.lock:
+                    if self.camera_info is not None:
+                        cv_image = self.draw_tags(cv_image)
+                        
+                    is_paused = rospy.get_param("/exploration_paused", False)
+                    explore_state = rospy.get_param("/exploration_state", "IDLE")
+                    if not is_paused and explore_state == "EXPLORE" and hasattr(self, 'local_plan_pts') and self.camera_info is not None:
+                        cv_image = self.draw_path(cv_image)
+                        
+                if self.annotated_color_pub is not None:
+                    msg_out = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
+                    self.annotated_color_pub.publish(msg_out)
+
             with self.lock:
-                if self.camera_info is not None:
-                    cv_image = self.draw_tags(cv_image)
-                    
-                is_paused = rospy.get_param("/exploration_paused", False)
-                explore_state = rospy.get_param("/exploration_state", "IDLE")
-                if not is_paused and explore_state == "EXPLORE" and hasattr(self, 'local_plan_pts') and self.camera_info is not None:
-                    cv_image = self.draw_path(cv_image)
-                    
-            self.color_image = cv_image
-            if self.annotated_color_pub is not None:
-                msg_out = self.bridge.cv2_to_imgmsg(cv_image, "bgr8")
-                self.annotated_color_pub.publish(msg_out)
+                self.color_image = cv_image
         except Exception as e:
             rospy.logerr(f"Color Image Error: {e}")
 
     def depth_cb(self, msg):
-        if not self.enable_camera_viz:
-            return
-
         try:
             # Depth images are typically 16UC1 or 32FC1.
             cv_image = self.bridge.imgmsg_to_cv2(msg, "32FC1")
@@ -311,20 +306,21 @@ class RobotWebServer:
             with self.lock:
                 self.depth_raw = cv_image
             
-            # Normalize to 0-255 for visualization
-            max_val = np.max(cv_image)
-            if max_val > 0:
-                vis_image = (cv_image / max_val * 255.0).astype(np.uint8)
-            else:
-                vis_image = cv_image.astype(np.uint8)
+            if self.enable_camera_viz:
+                # Normalize to 0-255 for visualization
+                max_val = np.max(cv_image)
+                if max_val > 0:
+                    vis_image = (cv_image / max_val * 255.0).astype(np.uint8)
+                else:
+                    vis_image = cv_image.astype(np.uint8)
+                    
+                # Apply colormap for better visualization
+                cv_image_color = cv2.applyColorMap(vis_image, cv2.COLORMAP_JET)
+                self.depth_image = cv_image_color
                 
-            # Apply colormap for better visualization
-            cv_image_color = cv2.applyColorMap(vis_image, cv2.COLORMAP_JET)
-            self.depth_image = cv_image_color
-            
-            if self.depth_color_pub is not None:
-                msg_out = self.bridge.cv2_to_imgmsg(cv_image_color, "bgr8")
-                self.depth_color_pub.publish(msg_out)
+                if self.depth_color_pub is not None:
+                    msg_out = self.bridge.cv2_to_imgmsg(cv_image_color, "bgr8")
+                    self.depth_color_pub.publish(msg_out)
         except Exception as e:
             rospy.logerr(f"Depth Image Error: {e}")
 

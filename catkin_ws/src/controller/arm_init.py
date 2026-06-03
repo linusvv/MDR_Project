@@ -56,8 +56,8 @@ PITCH    = -90           # End-effector pitch angle (degrees), fixed
 
 # Initial Arm Configuration (meters) – ArmPi Pro default forward posture
 ARM_X_INIT = 0.00        # Left/Right (Positive = Robot's Left)
-ARM_Y_INIT = 0.15        # Forward/Backward (Positive = Robot's Front)
-ARM_Z_INIT = 0.08        # Height (meters)
+ARM_Y_INIT = 0.21        # Forward/Backward (Positive = Robot's Front)
+ARM_Z_INIT = 0.14        # Height (meters)
 
 # Servo Actuation Values
 SERVO_DURATION = 500     # Servo travel time (milliseconds)
@@ -220,51 +220,51 @@ class ArmPiTeleop:
             self.move_arm(self.ax, self.ay, self.az)
         else:
             print('  IK: OFF  (check armpi_pro_kinematics build/source)')
+        return
+        # fd  = sys.stdin.fileno()
+        # old = termios.tcgetattr(fd)
+        # try:
+        #     tty.setraw(fd)
+        #     while not rospy.is_shutdown():
+        #         key = sys.stdin.read(1)
 
-        fd  = sys.stdin.fileno()
-        old = termios.tcgetattr(fd)
-        try:
-            tty.setraw(fd)
-            while not rospy.is_shutdown():
-                key = sys.stdin.read(1)
+        #         # Chassis
+        #         if   key == 'w':  self.chassis(CHASSIS_SPEED,  90, 0)
+        #         elif key == 's':  self.chassis(CHASSIS_SPEED, 270, 0)
+        #         elif key == 'a':  self.chassis(CHASSIS_SPEED, 180, 0)
+        #         elif key == 'd':  self.chassis(CHASSIS_SPEED,   0, 0)
+        #         elif key == 'q':  self.chassis(0, 90,  CHASSIS_ANGULAR)
+        #         elif key == 'e':  self.chassis(0, 90, -CHASSIS_ANGULAR)
+        #         elif key == ' ':  self.chassis(0, 90, 0)
 
-                # Chassis
-                if   key == 'w':  self.chassis(CHASSIS_SPEED,  90, 0)
-                elif key == 's':  self.chassis(CHASSIS_SPEED, 270, 0)
-                elif key == 'a':  self.chassis(CHASSIS_SPEED, 180, 0)
-                elif key == 'd':  self.chassis(CHASSIS_SPEED,   0, 0)
-                elif key == 'q':  self.chassis(0, 90,  CHASSIS_ANGULAR)
-                elif key == 'e':  self.chassis(0, 90, -CHASSIS_ANGULAR)
-                elif key == ' ':  self.chassis(0, 90, 0)
+        #         # Arm IK
+        #         elif key == 'i':  self.move_arm(self.ax, self.ay + STEP_XY, self.az)
+        #         elif key == 'k':  self.move_arm(self.ax, self.ay - STEP_XY, self.az)
+        #         elif key == 'j':  self.move_arm(self.ax - STEP_XY, self.ay, self.az)
+        #         elif key == 'l':  self.move_arm(self.ax + STEP_XY, self.ay, self.az)
+        #         elif key == 'u':  self.move_arm(self.ax, self.ay, self.az + STEP_XY)
+        #         elif key == 'o':  self.move_arm(self.ax, self.ay, self.az - STEP_XY)
 
-                # Arm IK
-                elif key == 'i':  self.move_arm(self.ax, self.ay + STEP_XY, self.az)
-                elif key == 'k':  self.move_arm(self.ax, self.ay - STEP_XY, self.az)
-                elif key == 'j':  self.move_arm(self.ax - STEP_XY, self.ay, self.az)
-                elif key == 'l':  self.move_arm(self.ax + STEP_XY, self.ay, self.az)
-                elif key == 'u':  self.move_arm(self.ax, self.ay, self.az + STEP_XY)
-                elif key == 'o':  self.move_arm(self.ax, self.ay, self.az - STEP_XY)
+        #         # Gripper
+        #         elif key == 'g':
+        #             self.set_gripper(GRIPPER_OPEN)
+        #             print('\r  Gripper: OPEN            ', flush=True)
+        #         elif key == 'h':
+        #             self.set_gripper(GRIPPER_CLOSE)
+        #             print('\r  Gripper: CLOSE           ', flush=True)
 
-                # Gripper
-                elif key == 'g':
-                    self.set_gripper(GRIPPER_OPEN)
-                    print('\r  Gripper: OPEN            ', flush=True)
-                elif key == 'h':
-                    self.set_gripper(GRIPPER_CLOSE)
-                    print('\r  Gripper: CLOSE           ', flush=True)
+        #         # Grasp verification
+        #         elif key == 'v':
+        #             self.verify_grasp()
 
-                # Grasp verification
-                elif key == 'v':
-                    self.verify_grasp()
+        #         # Quit
+        #         elif key == '\x03':
+        #             break
 
-                # Quit
-                elif key == '\x03':
-                    break
-
-        finally:
-            termios.tcsetattr(fd, termios.TCSADRAIN, old)
-            self.chassis(0, 90, 0)
-            print('\n  halt. Teleop shutdown.')
+        # finally:
+        #     termios.tcsetattr(fd, termios.TCSADRAIN, old)
+        #     self.chassis(0, 90, 0)
+        #     print('\n  halt. Teleop shutdown.')
 
 
 if __name__ == '__main__':

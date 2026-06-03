@@ -9,42 +9,76 @@
 
 #include <memory>
 #include <cmath>
+#include <string>
 #include <vector>
 #include <queue>
 #include <unordered_map>
 #include <algorithm>
 
 // =============================================================================
-//  A* local planner for ArmPi Pro (mecanum / holonomic)
+//  A* local planner for ArmPi Pro (mecanum / holonomic) — self-contained
 //
-//  Idea (replaces TEB):
-//    - The graph planner publishes a global route on
-//      /graph_planner/path/global_path. The map is fully known.
-//    - Every control cycle we look at the LOCAL costmap (which contains the
-//      inflated footprints of dynamic obstacles == other robots), pick the
-//      furthest point of the global route that still lies inside the costmap
-//      ("carrot"), and run an inflation-aware A* from the robot cell to that
-//      carrot cell.
-//    - A pure-pursuit follower turns the A* path into a holonomic cmd_vel.
-//    - Because A* runs every cycle on the freshest costmap, the robot
-//      continuously re-routes around moving robots.
+//  System logic (confirmed):
+//    (1) AprilTag (+ RTAB-Map) localization  -> publishes map->base_footprint TF
+//    (2) local_costmap fed by RTAB-Map/sensors -> WALLS + OTHER ROBOTS
+//    (3) this node: A* on the local costmap every cycle -> drive to goal
+//
+//  What is hardcoded here (fixed reference data from store_xy.yaml / tags.yaml):
+//    - STORE goal coordinates  (used as the navigation goal)
+//    - SIGNBOARD/AprilTag map poses (reference only; localization is a
+//      separate node that produces the TF this planner consumes)
+//
+//  What is NOT hardcoded (on purpose):
+//    - Walls and dynamic robots. Those come from the local costmap that
+//      RTAB-Map SLAM populates. Hardcoding a second wall source would fight
+//      the SLAM map and cause exactly the "mess up" we want to avoid.
+//
+//  Goal source priority:
+//    1. rosparam /target_store (store name OR category) -> hardcoded table  [MAIN]
+//    2. /graph_planner/path/global_path                  -> last pose       [FALLBACK]
 // =============================================================================
+
+// ---- Hardcoded map reference data ------------------------------------------
+struct Store { const char* name; const char* category; double x; double y; };
+static const std::vector<Store> STORES = {
+    {"store_burger_A", "burger",            -1.25, -1.15},
+    {"store_burger_B", "burger",             1.25, -0.85},
+    {"store_cafe_A",   "cafe",              -0.75, -0.85},
+    {"store_cafe_B",   "cafe",               1.00, -1.65},
+    {"store_phar_A",   "pharmacy",           1.00,  1.50},
+    {"store_phar_B",   "pharmacy",           0.75, -1.20},
+    {"store_store_A",  "convenience_store", -1.00,  1.50},
+    {"store_store_B",  "convenience_store", -1.00, -1.65},
+};
+
+// SIGNBOARD AprilTag poses [name, x(m), y(m), psi(deg)] from tags.yaml.
+// Reference only: the AprilTag localization node uses these to correct the
+// robot's map pose. The A* planner just consumes the resulting TF.
+struct Tag { const char* name; double x; double y; double psi_deg; };
+static const std::vector<Tag> TAGS = {
+    {"SIGNBOARD01", -2.00, -2.135, 270.0}, {"SIGNBOARD04", -1.88, -2.250, 180.0},
+    {"SIGNBOARD02", -2.00,  0.635,  90.0}, {"SIGNBOARD03", -2.00,  0.865, 270.0},
+    {"SIGNBOARD05", -1.88,  0.750, 180.0}, {"SIGNBOARD06", -0.12, -2.250,   0.0},
+    {"SIGNBOARD08",  0.00, -2.135, 270.0}, {"SIGNBOARD10",  0.12, -2.250, 180.0},
+    {"SIGNBOARD07", -0.12,  0.750,   0.0}, {"SIGNBOARD09",  0.00,  0.635,  90.0},
+    {"SIGNBOARD11",  0.12,  0.750, 180.0}, {"SIGNBOARD12",  1.88, -2.250,   0.0},
+    {"SIGNBOARD14",  2.00, -2.135, 270.0}, {"SIGNBOARD13",  1.88,  0.750,   0.0},
+    {"SIGNBOARD15",  2.00,  0.635,  90.0}, {"SIGNBOARD16",  2.00,  0.865, 270.0},
+};
 
 class AStarPlannerNode {
 public:
     AStarPlannerNode(ros::NodeHandle& nh) : nh_(nh), tf_listener_(tf_buffer_) {
-        // ---- tunables (override via params) -------------------------------
         ros::NodeHandle pnh("~");
-        pnh.param("max_vel_x",        max_vel_x_,        0.20);   // m/s
-        pnh.param("max_vel_y",        max_vel_y_,        0.15);   // m/s (mecanum strafe)
-        pnh.param("max_vel_theta",    max_vel_theta_,    0.60);   // rad/s
-        pnh.param("lookahead_dist",   lookahead_dist_,   0.35);   // m, pure-pursuit carrot
-        pnh.param("goal_tolerance",   goal_tolerance_,   0.12);   // m
-        pnh.param("inflation_weight", inflation_weight_, 3.0);    // A* soft-cost gain
-        pnh.param("lethal_cost",      lethal_cost_,      253);    // >= inscribed -> blocked
-        pnh.param("footprint_radius", footprint_radius_, 0.30);   // m
-        pnh.param("crash_dist",       crash_dist_,       0.32);   // m, back-up override
-        pnh.param("carrot_max_dist",  carrot_max_dist_,  2.0);    // m, cap on local goal range
+        pnh.param("max_vel_x",        max_vel_x_,        0.20);
+        pnh.param("max_vel_y",        max_vel_y_,        0.15);
+        pnh.param("max_vel_theta",    max_vel_theta_,    0.60);
+        pnh.param("lookahead_dist",   lookahead_dist_,   0.35);
+        pnh.param("goal_tolerance",   goal_tolerance_,   0.12);
+        pnh.param("inflation_weight", inflation_weight_, 3.0);
+        pnh.param("lethal_cost",      lethal_cost_,      253);
+        pnh.param("crash_dist",       crash_dist_,       0.32);
+        pnh.param("carrot_max_dist",  carrot_max_dist_,  2.0);
 
         try {
             costmap_ros_.reset(new costmap_2d::Costmap2DROS("local_costmap", tf_buffer_));
@@ -62,7 +96,7 @@ public:
 
     void CallbackGoalPoint(const nav_msgs::Path& msg) {
         if (msg.poses.empty()) return;
-        global_path_  = msg;
+        global_path_   = msg;
         path_received_ = true;
     }
 
@@ -72,44 +106,41 @@ public:
         nh_.param<std::string>("/local_planner_type", planner_type, "astar");
         if (planner_type != "astar") return;
 
-        // ---- pause / state gate (same contract as the old TEB node) --------
+        // pause / state gate (same contract as the old TEB node)
         bool is_paused = false;
         nh_.param<bool>("/exploration_paused", is_paused, false);
         std::string state = "IDLE";
         nh_.param<std::string>("/exploration_state", state, "IDLE");
         if (is_paused || state == "IDLE" || state == "STOP" || state == "RECOVERY") {
-            if (path_received_) { publishStop(); path_received_ = false; }
-            return;
-        }
-
-        if (!costmap_ros_ || !path_received_) return;
-
-        // ---- robot pose: direct TF lookup (robust to costmap pose staling) -
-        geometry_msgs::PoseStamped robot_pose;
-        double yaw = 0.0;
-        try {
-            auto t = tf_buffer_.lookupTransform("map", "base_footprint",
-                                                ros::Time(0), ros::Duration(0.2));
-            robot_pose.pose.position.x = t.transform.translation.x;
-            robot_pose.pose.position.y = t.transform.translation.y;
-            robot_pose.pose.orientation = t.transform.rotation;
-            yaw = tf2::getYaw(t.transform.rotation);
-        } catch (tf2::TransformException& ex) {
-            ROS_WARN_THROTTLE(1.0, "Could not get robot pose: %s", ex.what());
-            return;
-        }
-        const double rx = robot_pose.pose.position.x;
-        const double ry = robot_pose.pose.position.y;
-
-        // ---- final-goal arrival check --------------------------------------
-        const auto& goal = global_path_.poses.back().pose.position;
-        if (std::hypot(goal.x - rx, goal.y - ry) < goal_tolerance_) {
             publishStop();
-            ROS_INFO_THROTTLE(1.0, "Goal reached.");
             return;
         }
 
-        double min_obs = getMinObstacleDistance(rx, ry);
+        if (!costmap_ros_) return;
+
+        // ---- resolve goal: hardcoded store [MAIN], else graph_planner [FALLBACK]
+        double gx, gy;
+        bool   from_path = false;
+        if (!resolveGoal(gx, gy, from_path)) {
+            ROS_WARN_THROTTLE(2.0,
+                "No goal: set rosparam /target_store (name or category) "
+                "or publish /graph_planner/path/global_path.");
+            return;
+        }
+
+        // ---- robot pose via TF ---------------------------------------------
+        double rx, ry, yaw;
+        if (!getRobotPose(rx, ry, yaw)) return;
+
+        // ---- final-goal arrival --------------------------------------------
+        if (std::hypot(gx - rx, gy - ry) < goal_tolerance_) {
+            publishStop();
+            ROS_INFO_THROTTLE(1.0, "Goal reached (%.2f, %.2f).", gx, gy);
+            return;
+        }
+
+        costmap_2d::Costmap2D* cm = costmap_ros_->getCostmap();
+        double min_obs = getMinObstacleDistance(cm, rx, ry);
 
         // ---- 1) crash-avoidance override -----------------------------------
         if (min_obs < crash_dist_) {
@@ -133,10 +164,11 @@ public:
             ROS_INFO("Recovery complete. Retrying A* planner.");
         }
 
-        // ---- 3) pick the carrot on the global path inside the costmap ------
-        costmap_2d::Costmap2D* cm = costmap_ros_->getCostmap();
+        // ---- 3) choose carrot inside the local costmap ---------------------
         geometry_msgs::Point carrot;
-        if (!selectCarrot(cm, rx, ry, carrot)) {
+        bool ok = from_path ? selectCarrotOnPath(cm, rx, ry, carrot)
+                            : selectCarrotToGoal(cm, rx, ry, gx, gy, carrot);
+        if (!ok) {
             ROS_WARN_THROTTLE(1.0, "No valid carrot inside local costmap.");
             handlePlanFailure();
             return;
@@ -145,8 +177,7 @@ public:
         // ---- 4) A* on the local costmap ------------------------------------
         std::vector<geometry_msgs::Point> path;
         if (!planAStar(cm, rx, ry, carrot.x, carrot.y, path) || path.size() < 2) {
-            ROS_WARN_THROTTLE(1.0, "A* failed to find a path (consec %d/10).",
-                              consecutive_failures_);
+            ROS_WARN_THROTTLE(1.0, "A* failed (consec %d/10).", consecutive_failures_);
             handlePlanFailure();
             return;
         }
@@ -154,7 +185,6 @@ public:
 
         // ---- 5) pure-pursuit -> holonomic cmd_vel --------------------------
         geometry_msgs::Twist cmd = followPath(path, rx, ry, yaw);
-        // slow the turn near obstacles, same spirit as the TEB node
         double angular_factor = 0.4 + (std::min(min_obs, 1.2) / 1.2) * 0.6;
         cmd.angular.z *= angular_factor;
         pubCommand.publish(cmd);
@@ -176,44 +206,94 @@ public:
         }
 
         ROS_INFO_THROTTLE(1.0,
-            "A* OK: cmd[vx %.2f vy %.2f w %.2f] obs %.2fm pathlen %zu",
+            "A* OK: goal(%.2f,%.2f)%s cmd[vx %.2f vy %.2f w %.2f] obs %.2fm len %zu",
+            gx, gy, from_path ? "[path]" : "[store]",
             cmd.linear.x, cmd.linear.y, cmd.angular.z, min_obs, path.size());
     }
 
 private:
-    // ---- carrot selection ----------------------------------------------------
-    // Walk the global path forward; keep the furthest pose that is still inside
-    // the costmap bounds, in free space, and within carrot_max_dist of the robot.
-    bool selectCarrot(costmap_2d::Costmap2D* cm, double rx, double ry,
-                      geometry_msgs::Point& carrot) {
-        // advance the pruning index to the closest global pose ahead of us
+    // ---- goal resolution -----------------------------------------------------
+    bool resolveGoal(double& gx, double& gy, bool& from_path) {
+        std::string target;
+        nh_.param<std::string>("/target_store", target, "");
+        if (!target.empty()) {
+            // exact store name first, then category (first match)
+            for (const auto& s : STORES)
+                if (target == s.name) { gx = s.x; gy = s.y; from_path = false; return true; }
+            for (const auto& s : STORES)
+                if (target == s.category) { gx = s.x; gy = s.y; from_path = false; return true; }
+            ROS_WARN_THROTTLE(2.0, "/target_store '%s' not in store table.", target.c_str());
+            // fall through to graph_planner fallback
+        }
+        if (path_received_ && !global_path_.poses.empty()) {
+            gx = global_path_.poses.back().pose.position.x;
+            gy = global_path_.poses.back().pose.position.y;
+            from_path = true;
+            return true;
+        }
+        return false;
+    }
+
+    bool getRobotPose(double& rx, double& ry, double& yaw) {
+        try {
+            auto t = tf_buffer_.lookupTransform("map", "base_footprint",
+                                                ros::Time(0), ros::Duration(0.2));
+            rx  = t.transform.translation.x;
+            ry  = t.transform.translation.y;
+            yaw = tf2::getYaw(t.transform.rotation);
+            return true;
+        } catch (tf2::TransformException& ex) {
+            ROS_WARN_THROTTLE(1.0, "Could not get robot pose: %s", ex.what());
+            return false;
+        }
+    }
+
+    // ---- carrot from a single goal point (hardcoded-store mode) -------------
+    // March along the straight line robot->goal, keeping the last free, in-bounds
+    // point within carrot_max_dist. A* then routes to it around obstacles.
+    bool selectCarrotToGoal(costmap_2d::Costmap2D* cm, double rx, double ry,
+                            double gx, double gy, geometry_msgs::Point& carrot) {
+        double d = std::hypot(gx - rx, gy - ry);
+        unsigned int mx, my;
+        if (d <= carrot_max_dist_ && cm->worldToMap(gx, gy, mx, my)
+            && cm->getCost(mx, my) < lethal_cost_) {
+            carrot.x = gx; carrot.y = gy; return true;       // goal directly visible
+        }
+        double step = std::max(0.01, cm->getResolution());
+        bool found = false;
+        double tmax = std::min(d, carrot_max_dist_);
+        for (double t = step; t <= tmax; t += step) {
+            double px = rx + (gx - rx) * t / d;
+            double py = ry + (gy - ry) * t / d;
+            if (!cm->worldToMap(px, py, mx, my)) break;       // left the costmap window
+            if (cm->getCost(mx, my) >= lethal_cost_) break;   // blocked ahead on the ray
+            carrot.x = px; carrot.y = py; found = true;
+        }
+        return found;
+    }
+
+    // ---- carrot along the global path (graph_planner fallback mode) ---------
+    bool selectCarrotOnPath(costmap_2d::Costmap2D* cm, double rx, double ry,
+                            geometry_msgs::Point& carrot) {
         double best = 1e9; int closest = last_closest_idx_;
         int end = (int)global_path_.poses.size();
         for (int i = std::max(0, last_closest_idx_);
              i < std::min(end, last_closest_idx_ + 100); ++i) {
             auto& p = global_path_.poses[i].pose.position;
-            double d = std::hypot(p.x - rx, p.y - ry);
-            if (d < best) { best = d; closest = i; }
+            double dd = std::hypot(p.x - rx, p.y - ry);
+            if (dd < best) { best = dd; closest = i; }
         }
         last_closest_idx_ = closest;
 
         bool found = false;
         for (int i = closest; i < end; ++i) {
             auto& p = global_path_.poses[i].pose.position;
-            double d = std::hypot(p.x - rx, p.y - ry);
-            if (d > carrot_max_dist_) break;            // beyond local horizon
+            if (std::hypot(p.x - rx, p.y - ry) > carrot_max_dist_) break;
             unsigned int mx, my;
-            if (!cm->worldToMap(p.x, p.y, mx, my)) {
-                if (found) break;                       // left the costmap window
-                else continue;
-            }
-            if (cm->getCost(mx, my) >= lethal_cost_) {
-                if (found) break;                       // route blocked ahead
-                else continue;
-            }
+            if (!cm->worldToMap(p.x, p.y, mx, my)) { if (found) break; else continue; }
+            if (cm->getCost(mx, my) >= lethal_cost_) { if (found) break; else continue; }
             carrot.x = p.x; carrot.y = p.y; found = true;
         }
-        // fall back to the final goal if it is reachable inside the window
         if (!found) {
             auto& g = global_path_.poses.back().pose.position;
             unsigned int mx, my;
@@ -224,34 +304,29 @@ private:
         return found;
     }
 
-    // ---- A* over the costmap grid (8-connected, inflation-aware) -------------
+    // ---- A* over the costmap grid (8-connected, inflation-aware) ------------
     struct Node { int idx; double f; };
     struct Cmp { bool operator()(const Node& a, const Node& b) const { return a.f > b.f; } };
 
-    bool planAStar(costmap_2d::Costmap2D* cm,
-                   double sx, double sy, double gx, double gy,
-                   std::vector<geometry_msgs::Point>& out) {
+    bool planAStar(costmap_2d::Costmap2D* cm, double sx, double sy,
+                   double gx, double gy, std::vector<geometry_msgs::Point>& out) {
         unsigned int smx, smy, gmx, gmy;
         if (!cm->worldToMap(sx, sy, smx, smy)) return false;
         if (!cm->worldToMap(gx, gy, gmx, gmy)) return false;
 
         const int W = cm->getSizeInCellsX();
         const int H = cm->getSizeInCellsY();
-        auto id  = [&](int x, int y) { return y * W + x; };
+        auto id = [&](int x, int y) { return y * W + x; };
         const int start = id(smx, smy);
         const int goal  = id(gmx, gmy);
 
-        // If the robot cell itself reads lethal (sensor noise / just-inflated),
-        // do not abort — A* may still escape, so we only block neighbors.
         std::priority_queue<Node, std::vector<Node>, Cmp> open;
         std::unordered_map<int, double> g_cost;
         std::unordered_map<int, int> came_from;
-
         auto heur = [&](int x, int y) {
             double dx = x - (int)gmx, dy = y - (int)gmy;
             return std::sqrt(dx * dx + dy * dy);
         };
-
         g_cost[start] = 0.0;
         open.push({start, heur(smx, smy)});
 
@@ -265,16 +340,13 @@ private:
             if (cur.idx == goal) { reached = true; break; }
             int cx = cur.idx % W, cy = cur.idx / W;
             double cg = g_cost[cur.idx];
-
             for (int k = 0; k < 8; ++k) {
                 int nx = cx + dx8[k], ny = cy + dy8[k];
                 if (nx < 0 || ny < 0 || nx >= W || ny >= H) continue;
                 unsigned char c = cm->getCost(nx, ny);
-                if (c >= lethal_cost_) continue;                  // hard block
+                if (c >= lethal_cost_) continue;                       // hard block
                 int nidx = id(nx, ny);
                 double step = (dx8[k] != 0 && dy8[k] != 0) ? 1.41421356 : 1.0;
-                // soft penalty: prefer cells with low inflation cost so the path
-                // hugs the centre of free space and keeps clearance from robots.
                 double soft = 1.0 + inflation_weight_ * (double)c / 252.0;
                 double ng = cg + step * soft;
                 auto it = g_cost.find(nidx);
@@ -287,7 +359,6 @@ private:
         }
         if (!reached) return false;
 
-        // reconstruct
         std::vector<int> rev; int n = goal;
         while (n != start) { rev.push_back(n); n = came_from[n]; }
         rev.push_back(start);
@@ -302,19 +373,15 @@ private:
     // ---- pure-pursuit follower (holonomic) ----------------------------------
     geometry_msgs::Twist followPath(const std::vector<geometry_msgs::Point>& path,
                                     double rx, double ry, double yaw) {
-        // find lookahead point: first path point >= lookahead_dist away
         geometry_msgs::Point target = path.back();
-        for (const auto& p : path) {
+        for (const auto& p : path)
             if (std::hypot(p.x - rx, p.y - ry) >= lookahead_dist_) { target = p; break; }
-        }
-        double dx = target.x - rx, dy = target.y - ry;
 
-        // desired heading = direction of travel
+        double dx = target.x - rx, dy = target.y - ry;
         double desired_yaw = std::atan2(dy, dx);
         double yaw_err = std::atan2(std::sin(desired_yaw - yaw),
                                     std::cos(desired_yaw - yaw));
 
-        // world -> robot frame (mecanum can command vx & vy)
         double vx_r =  std::cos(yaw) * dx + std::sin(yaw) * dy;
         double vy_r = -std::sin(yaw) * dx + std::cos(yaw) * dy;
         double norm = std::hypot(vx_r, vy_r);
@@ -323,8 +390,7 @@ private:
         geometry_msgs::Twist cmd;
         cmd.linear.x  = vx_r * max_vel_x_;
         cmd.linear.y  = vy_r * max_vel_y_;
-        cmd.angular.z = std::max(-max_vel_theta_,
-                          std::min(max_vel_theta_, 1.5 * yaw_err));
+        cmd.angular.z = std::max(-max_vel_theta_, std::min(max_vel_theta_, 1.5 * yaw_err));
         return cmd;
     }
 
@@ -338,13 +404,9 @@ private:
         }
     }
 
-    void publishStop() {
-        geometry_msgs::Twist c; pubCommand.publish(c);
-    }
+    void publishStop() { geometry_msgs::Twist c; pubCommand.publish(c); }
 
-    double getMinObstacleDistance(double rx, double ry) {
-        if (!costmap_ros_) return 1.5;
-        costmap_2d::Costmap2D* cm = costmap_ros_->getCostmap();
+    double getMinObstacleDistance(costmap_2d::Costmap2D* cm, double rx, double ry) {
         unsigned int mx, my;
         if (!cm->worldToMap(rx, ry, mx, my)) return 1.5;
         double res = cm->getResolution();
@@ -383,10 +445,9 @@ private:
     int recovery_state_ = 0;        // 0 none, 1 backup, 2 spin
     ros::Time recovery_start_time_;
 
-    // params
     double max_vel_x_, max_vel_y_, max_vel_theta_;
     double lookahead_dist_, goal_tolerance_, inflation_weight_;
-    double footprint_radius_, crash_dist_, carrot_max_dist_;
+    double crash_dist_, carrot_max_dist_;
     int    lethal_cost_;
 };
 

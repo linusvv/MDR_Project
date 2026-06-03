@@ -66,7 +66,7 @@
                 weight_optimaltime: 1.5
                 
                 # Robot Configuration
-                max_vel_x: 0.18
+                max_vel_x: 0.13
                 max_vel_x_backwards: 0.03
                 max_vel_y: 0.0     # Sideways movement disabled for front-sensor setup
                 max_vel_theta: 0.4

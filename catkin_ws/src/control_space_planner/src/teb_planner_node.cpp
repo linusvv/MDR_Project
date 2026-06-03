@@ -23,7 +23,7 @@ public:
 
         // Subscribers & Publishers initialized at the very end to prevent callbacks firing on uninitialized members
         subGoalPoint = nh_.subscribe("/graph_planner/path/global_path", 1, &TebPlannerNode::CallbackGoalPoint, this);
-        pubCommand = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1, true); // Latched publisher
+        pubCommand = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1, false); // DO NOT LATCH cmd_vel
         pubLocalPlan = nh_.advertise<nav_msgs::Path>("/teb_local_plan", 1);
     }
 
@@ -103,13 +103,28 @@ public:
         geometry_msgs::PoseStamped robot_pose;
         try {
             auto t = tf_buffer_.lookupTransform("map", "base_footprint", ros::Time(0), ros::Duration(0.2));
+            
+            double pose_age = (ros::Time::now() - t.header.stamp).toSec();
+            if (pose_age > 2.0) {
+                if (recovery_state_ == 0) {
+                    geometry_msgs::Twist stop;
+                    pubCommand.publish(stop);
+                    ROS_WARN_THROTTLE(1.0, "TF stale (%.2fs old) — stopping robot to prevent blind driving.", pose_age);
+                    return;
+                } else {
+                    ROS_WARN_THROTTLE(1.0, "TF stale (%.2fs old) during recovery — continuing blind recovery spin.", pose_age);
+                }
+            }
+
             robot_pose.header = t.header;
             robot_pose.pose.position.x    = t.transform.translation.x;
             robot_pose.pose.position.y    = t.transform.translation.y;
             robot_pose.pose.position.z    = t.transform.translation.z;
             robot_pose.pose.orientation   = t.transform.rotation;
         } catch (tf2::TransformException& ex) {
-            ROS_WARN_THROTTLE(1.0, "Could not get robot pose: %s", ex.what());
+            geometry_msgs::Twist stop;
+            pubCommand.publish(stop);
+            ROS_WARN_THROTTLE(1.0, "TF stale — stopping robot. (%s)", ex.what());
             return;
         }
 

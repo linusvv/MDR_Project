@@ -119,29 +119,8 @@ class MapOdomPublisher:
             except Exception:
                 pass
 
-            # 1b. Cache odom -> base_footprint (published by RTAB-Map VO).
-            # When VO stalls during recovery (e.g. spin causes feature loss), this
-            # transform stops updating. Costmap2DROS then gets a frozen timestamp
-            # and falls into an extrapolation error loop. We re-broadcast the last
-            # known pose with a fresh 'now' stamp only when the source is stale
-            # (> 2s), so the costmap remains functional while VO recovers.
-            try:
-                t_bf = self.tf_buffer.lookup_transform("odom", "base_footprint", rospy.Time(0), rospy.Duration(0.0))
-                if self.last_good_odom_to_bf is None or t_bf.header.stamp > self.last_good_odom_to_bf.header.stamp:
-                    self.last_good_odom_to_bf = t_bf
-            except Exception:
-                pass
-
-            if self.last_good_odom_to_bf is not None:
-                age = (now - self.last_good_odom_to_bf.header.stamp).to_sec()
-                if age > 2.0:  # VO has stalled — keep the chain alive
-                    bf_relay = TransformStamped()
-                    bf_relay.header.stamp = now
-                    bf_relay.header.frame_id = "odom"
-                    bf_relay.child_frame_id = "base_footprint"
-                    bf_relay.transform = self.last_good_odom_to_bf.transform
-                    self.tf_br.sendTransform(bf_relay)
-                    rospy.logwarn_throttle(3.0, "[map_odom_publisher] VO stalled (%.1fs). Re-broadcasting last known odom->base_footprint.", age)
+            # (VO keepalive removed: Faking 'now' timestamps during VO stalls tricked TEB
+            # into thinking the robot was stationary while driving, causing wall crashes.)
 
             # 2. Broadcast map -> rtabmap_map
             align_relay = TransformStamped()

@@ -23,6 +23,7 @@ import tf.transformations
 import json
 from gpt_llm_client.srv import LLMQuery, LLMQueryRequest
 from std_srvs.srv import Empty as EmptySrv
+from std_msgs.msg import Bool
 
 
 try:
@@ -129,6 +130,10 @@ class RobotWebServer:
         else:
             rospy.logwarn(f"YOLO model not found at {model_path} or ultralytics not installed.")
 
+        # YOLO Activation Gate — controlled via /yolo_nav/activate (Bool)
+        # Starts ACTIVE (navigation is the default mode)
+        self._yolo_active = True
+
         # Complex Action State
         self.active_delivery_task = None
         self.task_thread = None
@@ -184,7 +189,14 @@ class RobotWebServer:
         if AprilTagDetectionArray is not None:
             rospy.Subscriber('/tag_detections', AprilTagDetectionArray, self.tags_cb)
 
+        # YOLO activation gate
+        rospy.Subscriber('/yolo_nav/activate', Bool, self._yolo_activate_cb)
+
         rospy.loginfo("Web Server Node initialized.")
+
+    def _yolo_activate_cb(self, msg):
+        self._yolo_active = msg.data
+        rospy.loginfo(f"[web_server] Navigation YOLO {'ACTIVATED' if msg.data else 'DEACTIVATED'}")
 
     def append_bot_chat_message(self, text):
         with self.lock:
@@ -698,6 +710,8 @@ class RobotWebServer:
 
     def check_for_shop(self, target_category):
         """Single-frame check for the target shop. Returns detections if found."""
+        if not self._yolo_active:
+            return None
         target_norm = self.normalize_category(target_category)
         with self.lock:
             img = self.color_image.copy() if self.color_image is not None else None
@@ -1521,7 +1535,7 @@ class RobotWebServer:
         # --- Optimized YOLO Detections for Visualization ---
         # Only run at ~2Hz to prevent web UI lag during intense robot tasks
         now = time.time()
-        if self.yolo_model is not None and self.viz_yolo:
+        if self.yolo_model is not None and self.viz_yolo and self._yolo_active:
             if now - self.last_yolo_viz_time > 0.5: # 2 FPS
                 # Lower confidence for visualization helps see distant/partial shops
                 self.last_yolo_viz_results = self.yolo_model.predict(img, conf=0.25, verbose=False)

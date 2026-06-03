@@ -110,12 +110,72 @@ CAL_Ay = 0.015;  CAL_By = -0.316;  CAL_Cy = 0.299
 
 
 # ════════════════════════════════════════════════════════════════════════════
+# ── Object Position Kalman Filter ────────────────────────────────────────
+# ════════════════════════════════════════════════════════════════════════════
+class ObjectKalmanFilter:
+    """
+    2-D constant-position Kalman filter for arm-frame object coordinates.
+
+    State  : x = [arm_x, arm_y]
+    Process: constant-position model  (F = I)
+    Measure: direct observation       (H = I)
+
+    R  -- measurement noise covariance
+          Inflated ~1000x from measured sensor noise (~1e-7) to absorb
+          calibration residual error and YOLO bounding-box jitter.
+          Corresponds to sigma ~= 10 mm per axis.
+
+    Q  -- process noise covariance
+          Allows the filter to track arm_point as the chassis approaches
+          (arm_y decreases ~10-15 mm per YOLO frame at approach speed).
+          Set equal to R -> steady-state Kalman gain K ~= 0.5,
+          averaging 50 % new measurement and 50 % previous estimate.
+    """
+
+    R = np.diag([1e-4, 1e-4])   # measurement noise covariance  (sigma ~= 10 mm)
+    Q = np.diag([1e-4, 1e-4])   # process noise covariance      (sigma ~= 10 mm)
+
+    def __init__(self):
+        self.reset()
+
+    def reset(self):
+        """Reset filter state. Call when locking onto a new object (IDLE -> APPROACHING)."""
+        self.x           = None                   # state vector [arm_x, arm_y]
+        self.P           = np.diag([1.0, 1.0])   # large initial covariance -> trust first measurement fully
+        self.initialized = False
+
+    def update(self, arm_x, arm_y):
+        """
+        Ingest one YOLO measurement and return the filtered estimate.
+        Returns (filtered_arm_x, filtered_arm_y).
+        """
+        z = np.array([arm_x, arm_y])
+
+        if not self.initialized:
+            self.x           = z.copy()
+            self.initialized = True
+            return arm_x, arm_y
+
+        # Predict step (constant-position: state unchanged, covariance grows by Q)
+        P_pred = self.P + self.Q
+
+        # Update step
+        S      = P_pred + self.R                  # innovation covariance
+        K      = P_pred @ np.linalg.inv(S)        # Kalman gain (~0.5 at steady state)
+        self.x = self.x + K @ (z - self.x)
+        self.P = (np.eye(2) - K) @ P_pred
+
+        return float(self.x[0]), float(self.x[1])
+
+
+# ════════════════════════════════════════════════════════════════════════════
 # ── Global State ─────────────────────────────────────────────────────────
 # ════════════════════════════════════════════════════════════════════════════
 state         = IDLE
 last_detect_t = None
 creep_start_t = None
-last_arm_pt   = None        # Latest /yolo/arm_point message
+last_arm_pt   = None        # Latest /yolo/arm_point message (Kalman-filtered)
+_kf           = ObjectKalmanFilter()
 
 # ── Publisher handles ─────────────────────────────────────────────────────
 _servo_pub     = None
@@ -459,12 +519,21 @@ def chassis_stop():
 
 def arm_point_cb(msg):
     """
-    Receive /yolo/arm_point, filter by valid range, update global state.
+    Receive /yolo/arm_point, apply range filter, run through Kalman filter,
+    and store the filtered estimate as last_arm_pt.
     """
     global last_detect_t, last_arm_pt
     if not (VALID_Y_MIN < msg.y < VALID_Y_MAX):
         return
-    last_arm_pt   = msg
+
+    fx, fy = _kf.update(msg.x, msg.y)
+
+    filtered   = Point()
+    filtered.x = fx
+    filtered.y = fy
+    filtered.z = msg.z      # z is a fixed grasp height — pass through unchanged
+
+    last_arm_pt   = filtered
     last_detect_t = rospy.Time.now()
 
 def target_item_cb(msg):
@@ -513,6 +582,7 @@ def control_loop(event):
     # ── IDLE ──────────────────────────────────────────────────────────────
     if state == IDLE:
         rospy.loginfo('[pick_arm] Object detected -> APPROACHING')
+        _kf.reset()   # reset Kalman filter for new object lock-in
         state = APPROACHING
         if heartbeat_pub is not None:
             heartbeat_pub.publish(String("detecting object"))
@@ -535,7 +605,8 @@ def control_loop(event):
 
         rospy.loginfo_throttle(0.5,
             f'[pick_arm] APPROACHING  '
-            f'arm=({pt.x:.3f},{pt.y:.3f})  '
+            f'arm(kf)=({pt.x:.3f},{pt.y:.3f})  '
+            f'P=({_kf.P[0,0]:.2e},{_kf.P[1,1]:.2e})  '
             f'err=({err_x:+.3f},{err_y:+.3f})  '
             f'aligned=({aligned_x},{aligned_y})')
 

@@ -108,6 +108,9 @@ void HeightmapToCostMap::generate_costmap()
                     (it->y >= MAP_MIN_Y && it->y < MAP_MAX_Y) &&
                     (it->z >= MIN_OBSTACLE_HEIGHT && it->z < MAX_OBSTACLE_HEIGHT))
                 {
+                    // CRITICAL: Filter out the robot footprint (0.32m radius) to prevent self-collision detections!
+                    if (sqrt(it->x * it->x + it->y * it->y) <= 0.32) continue;
+
                     int x = int((it->x - MAP_MIN_X) / RESOLUTION_);
                     int y = int((it->y - MAP_MIN_Y) / RESOLUTION_);
                     

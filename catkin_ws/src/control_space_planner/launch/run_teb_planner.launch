@@ -28,11 +28,11 @@
                 height: 4.0
                 resolution: 0.1
                 plugins:
-                 - {name: obstacle_layer, type: "costmap_2d::ObstacleLayer"}
+                 - {name: custom_obstacle_layer, type: "costmap_2d::StaticLayer"}
                  - {name: inflation_layer, type: "costmap_2d::InflationLayer"}
-                obstacle_layer:
-                    observation_sources: point_cloud_sensor
-                    point_cloud_sensor: {data_type: PointCloud2, topic: /points/velodyne_obstacles, marking: true, clearing: true, min_obstacle_height: 0.02, max_obstacle_height: 0.15, queue_size: 1, observation_persistence: 0.0, expected_update_rate: 0.0}
+                custom_obstacle_layer:
+                    map_topic: /map/local_map/obstacle
+                    subscribe_to_updates: true
                 inflation_layer:
                     inflation_radius: 0.5
                     cost_scaling_factor: 10.0
@@ -50,12 +50,12 @@
                 dt_hysteresis: 0.05
                 max_samples: 50
                 global_plan_overwrite_orientation: True
-                allow_init_with_backwards_motion: False
+                allow_init_with_backwards_motion: True
                 enable_homotopy_class_planning: False
                 max_global_plan_lookahead_dist: 1.5 # Reduced lookahead for much faster planning
                 global_plan_viapoint_sep: 0.5 # Relaxed via-point spacing to avoid oscillation
                 weight_kinematics_nh: 1000.0 # Reverted: Ackermann forward driving only
-                weight_kinematics_forward_drive: 1000.0 # Reverted: Ackermann constraints
+                weight_kinematics_forward_drive: 1.0 # Relaxed: Allow backing up to escape corners
                 weight_kinematics_turning_radius: 15.0
                 weight_optimaltime: 1.5
                 

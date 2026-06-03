@@ -84,14 +84,11 @@ public:
         std::string state = "IDLE";
         nh_.param<std::string>("/exploration_state", state, "IDLE");
         if (is_paused || state == "IDLE" || state == "STOP" || state == "RECOVERY") {
-            if (path_received_) {
-                geometry_msgs::Twist cmd_vel;
-                cmd_vel.linear.x = 0.0;
-                cmd_vel.linear.y = 0.0;
-                cmd_vel.angular.z = 0.0;
-                pubCommand.publish(cmd_vel);
-                path_received_ = false;
-            }
+            geometry_msgs::Twist cmd_vel;
+            cmd_vel.linear.x = 0.0;
+            cmd_vel.linear.y = 0.0;
+            cmd_vel.angular.z = 0.0;
+            pubCommand.publish(cmd_vel);
             return;
         }
 

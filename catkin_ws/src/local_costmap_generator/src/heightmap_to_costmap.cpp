@@ -7,6 +7,7 @@
 #include <iostream>
 #include <algorithm>
 #include <vector>
+#include <cmath>
 #include <ros/ros.h>
 #include <pcl_ros/point_cloud.h>
 #include <pcl/conversions.h>
@@ -19,6 +20,10 @@
 #include <tf2_ros/transform_listener.h>
 #include <tf2_geometry_msgs/tf2_geometry_msgs.h>
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
 #define MAP_IDX(sx, i, j) ((sx) * (j) + (i))
 
 class HeightmapToCostMap
@@ -26,6 +31,7 @@ class HeightmapToCostMap
 public:
     HeightmapToCostMap();
     void cloud_cb(const sensor_msgs::PointCloud2ConstPtr &cloud_msg);
+    void rtabmap_cb(const nav_msgs::OccupancyGridConstPtr &msg);
     void generate_costmap();
 
     bool DO_INFLATION = false; // Turned off to drastically reduce CPU usage; Costmap2DROS will handle inflation.
@@ -42,11 +48,15 @@ public:
     float INFLATION_RES    = RESOLUTION_; // [m] resolution of inflation
     int INFLATION_BINS     = (INFLATION_RADIUS * 2) / INFLATION_RES + 1;
 
+    float RTABMAP_OVERLAY_RADIUS = 4.0; // [m]
+    float CAMERA_FOV_ANGLE = 45.0; // [deg]
+
 private:
     ros::NodeHandle nh_;
     std::string cloud_topic_; //default input
     std::string map_topic_;
     ros::Subscriber sub_;
+    ros::Subscriber rtabmap_sub_;
     ros::Publisher cost_map_pub_;
 
     tf2_ros::Buffer tf_buffer_;
@@ -54,6 +64,7 @@ private:
 
     // Variables
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_xyz;
+    nav_msgs::OccupancyGridConstPtr rtabmap_msg_;
 
     bool bGetPoint = false;
     ros::Time last_process_time_;
@@ -65,13 +76,13 @@ private:
     int height_;
 
     // Persistent memory
-    std::vector<int> ttl_grid_;
     std::vector<int> hit_count_grid_;
 };
 
 HeightmapToCostMap::HeightmapToCostMap() : cloud_topic_("/points/velodyne_obstacles"), map_topic_("/map/local_map/obstacle"), tf_listener_(tf_buffer_)
 {
     sub_ = nh_.subscribe(cloud_topic_, 1, &HeightmapToCostMap::cloud_cb, this);
+    rtabmap_sub_ = nh_.subscribe("/rtabmap/grid_map", 1, &HeightmapToCostMap::rtabmap_cb, this);
     cost_map_pub_ = nh_.advertise<nav_msgs::OccupancyGrid>(map_topic_, 10);
 
     float w = MAP_MAX_X - MAP_MIN_X + 0.5f;
@@ -79,7 +90,6 @@ HeightmapToCostMap::HeightmapToCostMap() : cloud_topic_("/points/velodyne_obstac
     float h = MAP_MAX_Y - MAP_MIN_Y + 0.5f;
     height_ = int(h / RESOLUTION_ + 0.5f);
 
-    ttl_grid_.assign(width_ * height_, 0);
     hit_count_grid_.assign(width_ * height_, 0);
 
     ROS_INFO("[HeightmapToCostMap] Loaded! Map size: %d x %d with memory filter enabled.", width_, height_);
@@ -91,6 +101,11 @@ void HeightmapToCostMap::cloud_cb(const sensor_msgs::PointCloud2ConstPtr &cloud_
     pcl::fromROSMsg(*cloud_msg, *cloud_xyz_);
     cloud_xyz = cloud_xyz_;
     bGetPoint = true;
+}
+
+void HeightmapToCostMap::rtabmap_cb(const nav_msgs::OccupancyGridConstPtr &msg)
+{
+    rtabmap_msg_ = msg;
 }
 
 void HeightmapToCostMap::generate_costmap()
@@ -125,7 +140,6 @@ void HeightmapToCostMap::generate_costmap()
             geometry_msgs::TransformStamped t_inv_msg;
             t_inv_msg.transform = tf2::toMsg(T_inv);
 
-            std::vector<int> new_ttl_grid(width_ * height_, 0);
             std::vector<int> new_hit_grid(width_ * height_, 0);
 
             for (int y = 0; y < height_; ++y) {
@@ -144,12 +158,10 @@ void HeightmapToCostMap::generate_costmap()
                     if (x_old >= 0 && x_old < width_ && y_old >= 0 && y_old < height_) {
                         int idx_new = MAP_IDX(width_, x, y);
                         int idx_old = MAP_IDX(width_, x_old, y_old);
-                        new_ttl_grid[idx_new] = ttl_grid_[idx_old];
                         new_hit_grid[idx_new] = hit_count_grid_[idx_old];
                     }
                 }
             }
-            ttl_grid_ = new_ttl_grid;
             hit_count_grid_ = new_hit_grid;
         }
         first_frame_ = false;
@@ -178,7 +190,7 @@ void HeightmapToCostMap::generate_costmap()
             }
         }
 
-        // --- 3. TEMPORAL FILTER & TTL DECAY ---
+        // --- 3. TEMPORAL FILTER FOR CAMERA OBSTACLES ---
         nav_msgs::MapMetaData mapMeta;
         mapMeta.resolution = RESOLUTION_;
         mapMeta.width = width_;
@@ -205,11 +217,88 @@ void HeightmapToCostMap::generate_costmap()
             }
 
             // Require 2 consecutive frames before marking as obstacle (false-positive filter)
-            // TTL persistence disabled — RTAB static layer handles corners now
             bool show = (hit_count_grid_[i] >= 2) || hits_this_frame[i];
             if (show) {
                 oMap.data[i] = 100;
                 point_count++;
+            }
+        }
+
+        // --- 3.5 OVERLAY RTAB-MAP IN BLIND SPOTS (outside FOV +-45 deg) ---
+        if (rtabmap_msg_ && !rtabmap_msg_->data.empty()) {
+            geometry_msgs::TransformStamped rtab_to_base_tf;
+            geometry_msgs::TransformStamped base_to_rtab_tf;
+            bool tf_ok = false;
+            try {
+                rtab_to_base_tf = tf_buffer_.lookupTransform(target_frame, rtabmap_msg_->header.frame_id, ros::Time(0));
+                base_to_rtab_tf = tf_buffer_.lookupTransform(rtabmap_msg_->header.frame_id, target_frame, ros::Time(0));
+                tf_ok = true;
+            } catch (tf2::TransformException &ex) {
+                ROS_WARN_THROTTLE(2.0, "[Costmap Memory] TF Error looking up RTAB-Map to %s: %s", target_frame.c_str(), ex.what());
+            }
+
+            if (tf_ok) {
+                double res = rtabmap_msg_->info.resolution;
+                double origin_x = rtabmap_msg_->info.origin.position.x;
+                double origin_y = rtabmap_msg_->info.origin.position.y;
+                unsigned int rtab_w = rtabmap_msg_->info.width;
+                unsigned int rtab_h = rtabmap_msg_->info.height;
+
+                // Robot coordinates in the RTABmap frame
+                double robot_x_rtab = base_to_rtab_tf.transform.translation.x;
+                double robot_y_rtab = base_to_rtab_tf.transform.translation.y;
+
+                double rtab_radius = RTABMAP_OVERLAY_RADIUS;
+                double fov_rad = CAMERA_FOV_ANGLE * (M_PI / 180.0);
+
+                // Bounding box in metric coordinates
+                double min_x = robot_x_rtab - rtab_radius;
+                double max_x = robot_x_rtab + rtab_radius;
+                double min_y = robot_y_rtab - rtab_radius;
+                double max_y = robot_y_rtab + rtab_radius;
+
+                // Convert bounding box to RTAB map grid indices
+                int start_x = std::max(0, (int)floor((min_x - origin_x) / res));
+                int end_x = std::min((int)rtab_w - 1, (int)ceil((max_x - origin_x) / res));
+                int start_y = std::max(0, (int)floor((min_y - origin_y) / res));
+                int end_y = std::min((int)rtab_h - 1, (int)ceil((max_y - origin_y) / res));
+
+                for (int gy = start_y; gy <= end_y; ++gy) {
+                    for (int gx = start_x; gx <= end_x; ++gx) {
+                        int rtab_idx = gy * rtab_w + gx;
+                        int8_t cell_val = rtabmap_msg_->data[rtab_idx];
+                        if (cell_val > 50) {
+                            // Center coordinates in RTABmap frame
+                            geometry_msgs::Point pt_rtab;
+                            pt_rtab.x = origin_x + (gx + 0.5) * res;
+                            pt_rtab.y = origin_y + (gy + 0.5) * res;
+                            pt_rtab.z = 0.0;
+
+                            // Transform to robot base frame
+                            geometry_msgs::Point pt_base;
+                            tf2::doTransform(pt_rtab, pt_base, rtab_to_base_tf);
+
+                            // Check distance
+                            double dist_sq = pt_base.x * pt_base.x + pt_base.y * pt_base.y;
+                            if (dist_sq <= rtab_radius * rtab_radius) {
+                                // Check angle relative to robot heading (x-axis in base_footprint)
+                                double angle = atan2(pt_base.y, pt_base.x);
+                                if (std::abs(angle) > fov_rad) { // Outside camera FOV
+                                    // Map pt_base to our local costmap grid
+                                    int cx = int((pt_base.x - MAP_MIN_X) / RESOLUTION_);
+                                    int cy = int((pt_base.y - MAP_MIN_Y) / RESOLUTION_);
+                                    if (cx >= 0 && cx < width_ && cy >= 0 && cy < height_) {
+                                        int tidx = MAP_IDX(width_, cx, cy);
+                                        if (oMap.data[tidx] != 100) {
+                                            oMap.data[tidx] = 100;
+                                            point_count++;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
             }
         }
 

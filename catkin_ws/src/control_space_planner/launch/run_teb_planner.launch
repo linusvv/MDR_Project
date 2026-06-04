@@ -14,7 +14,7 @@
         <!-- local_costmap configurations needed by TEB -->
         <rosparam>
             local_costmap:
-                global_frame: odom
+                global_frame: map
                 robot_base_frame: base_footprint
                 robot_radius: 0.30
                 footprint_padding: 0.00
@@ -28,23 +28,18 @@
                 height: 4.0
                 resolution: 0.1
                 plugins:
-                 - {name: rtabmap_layer,       type: "costmap_2d::StaticLayer"}  # Permanent SLAM walls — corners always visible!
-                 - {name: custom_obstacle_layer, type: "costmap_2d::StaticLayer"}  # Real-time dynamic obstacles
+                 - {name: custom_obstacle_layer, type: "costmap_2d::StaticLayer"}  # Real-time dynamic obstacles (now with RTAB-Map blind spot overlay)
                  - {name: inflation_layer,      type: "costmap_2d::InflationLayer"}
-                rtabmap_layer:
-                    map_topic: /rtabmap/grid_map
-                    subscribe_to_updates: true
-                    track_unknown_space: false
                 custom_obstacle_layer:
                     map_topic: /map/local_map/obstacle
                     subscribe_to_updates: true
                 inflation_layer:
-                    inflation_radius: 0.25
-                    cost_scaling_factor: 5.0
+                    inflation_radius: 0.35
+                    cost_scaling_factor: 10.0
             
             TebLocalPlannerROS:
                 odom_topic: /odom
-                map_frame: odom
+                map_frame: map
                 
                 # Costmap Converter Configuration
                 costmap_converter_plugin: ""
@@ -90,8 +85,8 @@
                 # occupied cell to a 0.52m-away obstacle appears at 0.50m, which
                 # exceeded the previous 0.50m limit by 0cm → borderline infeasible.
                 # 0.05m gives a comfortable 0.17m margin above the 0.35m hard limit.
-                min_obstacle_dist: 0.05
-                inflation_dist: 0.10  # soft cost zone beyond the hard limit
+                min_obstacle_dist: 0.02
+                inflation_dist: 0.04  # soft cost zone beyond the hard limit
                 include_costmap_obstacles: True
                 costmap_obstacles_behind_robot_dist: 1.0
                 obstacle_poses_affected: 20 # Reduced from 30 to speed up 50Hz planning
@@ -100,8 +95,8 @@
                 no_inner_iterations: 3 # Reduced for 50Hz loop speed
                 no_outer_iterations: 2 # Reduced for 50Hz loop speed
                 penalty_epsilon: 0.01  # Must stay below min speed (0.02 m/s); was 0.1 causing negative bound warnings
-                weight_obstacle: 100.0 # Moderate: strong enough to avoid walls, not so strong it jitters away from the straight path
-                weight_viopoint: 500.0 # VERY HIGH: rigidly pins the robot to the global plan so it drives straight
+                weight_obstacle: 100.0 # Balanced to prevent aggressive swerving away from walls
+                weight_viopoint: 100.0 # Balanced to guide the robot along the path smoothly without oscillation
                 weight_adapt_factor: 2.0
         </rosparam>
     </node>

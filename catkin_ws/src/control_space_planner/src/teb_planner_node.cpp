@@ -147,8 +147,8 @@ public:
         geometry_msgs::Twist cmd_vel;
 
         // 1. Obstacle too close crash-avoidance override
-        // If an obstacle is closer than 0.32m (2cm from physical footprint edge of 0.30m), override with backing up slowly
-        if (min_obstacle_dist < 0.32) {
+        // If an obstacle is closer than 0.31m (1cm from physical footprint edge of 0.30m), override with backing up slowly
+        if (min_obstacle_dist < 0.31) {
             ROS_WARN_THROTTLE(0.5, "OBSTACLE TOO CLOSE (%.2fm). Backing up slowly to avoid crash...", min_obstacle_dist);
             cmd_vel.linear.x = -0.03; // Back up at 3 cm/s
             cmd_vel.linear.y = 0.0;

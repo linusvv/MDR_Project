@@ -24,7 +24,7 @@ import json
 import subprocess
 from gpt_llm_client.srv import LLMQuery, LLMQueryRequest
 from std_srvs.srv import Empty as EmptySrv
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String, Int32
 
 
 try:
@@ -69,6 +69,8 @@ class RobotWebServer:
         self.mapped_shops = []  # Replaced self.stores with dynamic mapped_shops
         self.tasks_fulfilled = 0
         self.overshoot_m = 0.0
+        self.approach_dist_m = 0.60
+        self.tag_align_offset_deg = 0.0
         self.detected_tags = {}
         self.local_costmap = None
         self.motion_candidates = []
@@ -98,14 +100,7 @@ class RobotWebServer:
 
         # Load AprilTag bundles configuration & Store coordinates
         rospack = rospkg.RosPack()
-        try:
-            pkg_path = rospack.get_path('robot_web_ui')
-            mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
-            self.yaml_path = os.path.join(mdr_path, 'HW4', 'tags.yaml')
-        except Exception:
-            self.yaml_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/tags.yaml"
-
-        self.bundles = self.load_bundles(self.yaml_path)
+        self.bundles = self.load_bundles(None)
         self.load_tag_true_poses()
         self.sign_database = self.load_sign_database()
         
@@ -163,6 +158,39 @@ class RobotWebServer:
         t_yolo = threading.Thread(target=delayed_yolo_start)
         t_yolo.daemon = True
         t_yolo.start()
+
+        # ════════════════════════════════════════════════════════════════════
+        # ── Mission Orchestrator handshake (ADDED) ──────────────────────────
+        # In the AprilTag hand-off design the NAV TEAMMATE is the navigator and
+        # mission_orchestrator is the BRAIN. web_server's only job in the mission
+        # is to turn the user's sentence (via the LLM) into per-item counts and
+        # publish them on /mission/item_counts.
+        #
+        # ~external_nav (default True): the nav teammate + orchestrator drive the
+        #   whole mission, so web_server does NOT run its own shopping navigation.
+        # ~use_orchestrator_pickup: kept for the legacy/standalone path where
+        #   web_server itself navigates and delegates picking (set external_nav
+        #   false to use it).
+        self.external_nav            = rospy.get_param('~external_nav', True)
+        self.use_orchestrator_pickup = rospy.get_param('~use_orchestrator_pickup', True)
+        self.pub_item_counts      = rospy.Publisher('/mission/item_counts',  String, queue_size=1, latch=True)
+        self.pub_shop_arrived     = rospy.Publisher('/mission/shop_arrived', String, queue_size=1)
+        self.pub_mission_finished = rospy.Publisher('/mission/finished',     Bool,   queue_size=1, latch=True)
+        self.pick_complete_event  = threading.Event()
+        rospy.Subscriber('/mission/pick_complete', Bool, self._pick_complete_cb)
+        # How long to wait for the orchestrator to finish picking at one shop.
+        self.orchestrator_pick_timeout = rospy.get_param('~orchestrator_pick_timeout', 180.0)
+
+        # ── GOTO SIGNBOARD command (web_server is the navigator) ─────────────
+        # The orchestrator publishes a SIGNBOARD number on /mission/goto_signboard.
+        # web_server drives there using its EXISTING signboard navigation, and on
+        # arrival publishes /mission/shop_arrived itself — so this node issues the
+        # command AND sets the arrival flag. If the nav teammate detects arrival
+        # instead, they publish /mission/shop_arrived and you set
+        # ~publish_shop_arrived_on_arrival:=false to avoid a double flag.
+        self.publish_shop_arrived_on_arrival = rospy.get_param('~publish_shop_arrived_on_arrival', True)
+        self._goto_busy = False
+        rospy.Subscriber('/mission/goto_signboard', Int32, self._goto_signboard_cb)
 
 
         # Complex Action State
@@ -235,6 +263,245 @@ class RobotWebServer:
         self.yolo_grab_state = msg.data
         rospy.loginfo(f"[web_server] Grabbing YOLO activation changed to {msg.data}")
 
+    # ════════════════════════════════════════════════════════════════════════
+    # ── Mission Orchestrator handshake helpers (ADDED) ──────────────────────
+    # ════════════════════════════════════════════════════════════════════════
+    def _pick_complete_cb(self, msg):
+        """Orchestrator signals it has finished picking at the current shop."""
+        if msg.data:
+            self.pick_complete_event.set()
+
+    def _goto_signboard_cb(self, msg):
+        """Orchestrator commands navigation to SIGNBOARD number msg.data.
+        web_server drives there with its existing tag navigation and, on arrival,
+        publishes /mission/shop_arrived (the hand-back to the orchestrator)."""
+        n = int(msg.data)
+        tag_name = "SIGNBOARD%02d" % n
+        if self._goto_busy:
+            rospy.logwarn(f"[web_server] Already navigating; ignoring goto {tag_name}.")
+            return
+        threading.Thread(target=self._goto_and_flag, args=(tag_name,), daemon=True).start()
+
+    def _goto_and_flag(self, tag_name):
+        self._goto_busy = True
+        try:
+            self.load_tag_true_poses()
+            if tag_name not in self.tag_true_poses:
+                rospy.logerr(f"[web_server] {tag_name} not found in tag poses — cannot navigate.")
+                return
+            rospy.loginfo(f"[web_server] GOTO command: navigating to {tag_name} ...")
+            self.append_bot_chat_message(f"Heading to {tag_name}...")
+
+            # Use the existing signboard/landmark navigation.
+            self.start_navigation_to_tag(tag_name)
+            rospy.sleep(0.3)  # let the nav thread spin up
+            while not rospy.is_shutdown() and self.navigating_to_tag:
+                rospy.sleep(0.1)
+
+            rospy.loginfo(f"[web_server] Arrived at {tag_name}.")
+            # Hand control back to the orchestrator (unless the nav teammate does it).
+            if self.publish_shop_arrived_on_arrival:
+                self.pub_shop_arrived.publish(String(data=tag_name))
+        except Exception as e:
+            rospy.logerr(f"[web_server] GOTO {tag_name} failed: {e}")
+        finally:
+            self._goto_busy = False
+
+    # ════════════════════════════════════════════════════════════════════════
+    # ── COMPETITION ITEM VOCABULARY  (EDIT THIS right before the competition) ─
+    # ════════════════════════════════════════════════════════════════════════
+    # The problem statement names items WITHOUT aliasing. Map each official item
+    # name to its grab-YOLO class. The official names are not final yet — when
+    # they are announced, just edit the left-hand-side strings here. Everything
+    # else (LLM prompt + offline parser) is generated from this table.
+    #
+    #   official item name (as it appears in the sentence)  ->  YOLO class
+    REQUEST_ITEM_TO_CLASS = {
+        "hot coffee":    "mug",
+        "ice coffee":    "iceCoffee",
+        "first-aid kit": "drug",
+        "burger":        "hamburger",
+    }
+
+    def _empty_counts(self):
+        return {"drug": 0, "hamburger": 0, "iceCoffee": 0, "mug": 0}
+
+    def compute_item_counts(self, tasks):
+        """Legacy helper: collapse 'tasks' (store + free-text items) into the
+        four canonical counts using the competition vocabulary."""
+        counts = self._empty_counts()
+        for t in tasks:
+            for item in t.get("items", []):
+                name = str(item).lower().strip()
+                for req_name, cls in self.REQUEST_ITEM_TO_CLASS.items():
+                    if req_name.lower() in name:
+                        counts[cls] += 1
+                        break
+        return counts
+
+    # ── Item -> the store the robot navigates to in order to pick it ─────────
+    # (Used only for navigation/UI grouping; the orchestrator's
+    #  ITEM_SHOP_CONSTRAINTS may allow more shops than this primary one.)
+    ITEM_PRIMARY_STORE = {
+        "drug":      "Pharmacy",
+        "hamburger": "Fast-food restaurant",
+        "iceCoffee": "Cafe",
+        "mug":       "Convenience store",
+    }
+    # Human-readable item names for chat replies / todo-list display.
+    ITEM_DISPLAY = {
+        "drug": "drug", "hamburger": "hamburger",
+        "iceCoffee": "ice coffee", "mug": "mug",
+    }
+    ITEM_ORDER = ["drug", "hamburger", "iceCoffee", "mug"]
+
+    def build_tasks_from_counts(self, counts):
+        """Deterministically group the four item counts into per-store tasks for
+        navigation, so the LLM never has to pick stores (removes a whole class of
+        misclassification). Each needed item is repeated 'count' times."""
+        store_items = {}
+        for item in self.ITEM_ORDER:
+            n = int(counts.get(item, 0))
+            if n <= 0:
+                continue
+            store = self.ITEM_PRIMARY_STORE[item]
+            store_items.setdefault(store, [])
+            store_items[store].extend([self.ITEM_DISPLAY[item]] * n)
+        return [{"target": s, "items": its} for s, its in store_items.items()]
+
+    def reply_from_counts(self, counts):
+        """Friendly fallback reply built from the four item counts."""
+        parts = []
+        for item in self.ITEM_ORDER:
+            n = int(counts.get(item, 0))
+            if n > 0:
+                name = self.ITEM_DISPLAY[item]
+                parts.append(f"{n} {name}" + ("s" if n > 1 else ""))
+        if not parts:
+            return ("I can only fetch drug, hamburger, ice coffee, or mug — "
+                    "please ask for one of those!")
+        return "Got it — I'll pick up: " + ", ".join(parts) + "."
+
+    def local_parse_counts(self, message):
+        """Offline parser producing the four item counts directly from the
+        competition vocabulary (REQUEST_ITEM_TO_CLASS). Used when the LLM
+        service is unavailable. Honors quantities like '2 burgers'."""
+        import re
+        m = " " + message.lower() + " "
+        words = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
+                 "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
+        counts = self._empty_counts()
+        # Match longer item names first so "ice coffee" wins over a bare "coffee".
+        for req_name in sorted(self.REQUEST_ITEM_TO_CLASS, key=len, reverse=True):
+            cls = self.REQUEST_ITEM_TO_CLASS[req_name]
+            best = 0
+            for mt in re.finditer(re.escape(req_name.lower()), m):
+                prefix = m[max(0, mt.start() - 12):mt.start()]
+                qty = 1
+                dm = re.search(r"(\d+)\s*$", prefix)
+                if dm:
+                    qty = int(dm.group(1))
+                else:
+                    wm = re.search(r"(\b\w+\b)\s*$", prefix)
+                    if wm and wm.group(1) in words:
+                        qty = words[wm.group(1)]
+                best = max(best, qty)
+            if best > 0:
+                counts[cls] += best
+        return counts
+
+    def build_llm_prompt(self, message):
+        """Build the LLM prompt from the editable competition vocabulary so the
+        model maps each official item name to its YOLO class and returns counts."""
+        name_lines = "\n".join(
+            f'  - "{name}" -> "{cls}"'
+            for name, cls in self.REQUEST_ITEM_TO_CLASS.items()
+        )
+        return (
+            "You are the order parser for a delivery robot. The robot can pick up "
+            "ONLY the items listed below. Each item name maps to a fixed class key:\n"
+            f"{name_lines}\n\n"
+            f"The user said: '{message}'.\n\n"
+            "Count how many of each CLASS the user wants. Quantities matter "
+            "(e.g. 'two burgers' -> the burger class = 2). If a class is not "
+            "requested its count is 0. Ignore anything not in the list above.\n\n"
+            "Return ONLY a raw JSON object (no markdown, no extra text) with exactly "
+            "two keys:\n"
+            "  1. \"counts\": an object with integer values for keys "
+            "\"drug\", \"hamburger\", \"iceCoffee\", \"mug\".\n"
+            "  2. \"reply\" : a short friendly sentence telling the user what you will fetch.\n\n"
+            "Example (item names may differ from the table above — always use the table):\n"
+            "User: 'two burgers and an ice coffee please' ->\n"
+            "{\"counts\": {\"drug\": 0, \"hamburger\": 2, \"iceCoffee\": 1, \"mug\": 0}, "
+            "\"reply\": \"Sure! Fetching 2 burgers and 1 ice coffee.\"}"
+        )
+
+    def execute_store_pickup(self, target, target_norm, items):
+        """Pick items at the current shop.
+
+        If an orchestrator is running (use_orchestrator_pickup), delegate the
+        real pick to it: announce the shop and block until /mission/pick_complete
+        (or timeout). Otherwise fall back to the original simulated pickup so the
+        node still works standalone. Either way the UI todo-list is updated.
+        """
+        if self.use_orchestrator_pickup:
+            rospy.loginfo(f"[web_server] Delegating pickup at {target_norm} to orchestrator.")
+            self.pick_complete_event.clear()
+            self.pub_shop_arrived.publish(String(data=target_norm))
+
+            # Reflect "picking" in the UI while the orchestrator works.
+            with self.lock:
+                if getattr(self, 'active_todo_list', None):
+                    for s in self.active_todo_list["stores"]:
+                        if self.normalize_category(s["category"]) == target_norm:
+                            for it in s["items"]:
+                                it["status"] = "picking_up"
+
+            got = self.pick_complete_event.wait(timeout=self.orchestrator_pick_timeout)
+            if not got:
+                rospy.logwarn("[web_server] Orchestrator pick timed out; continuing.")
+
+            # Mark items/store completed for the UI (orchestrator owns true counts).
+            with self.lock:
+                if getattr(self, 'active_todo_list', None):
+                    for s in self.active_todo_list["stores"]:
+                        if self.normalize_category(s["category"]) == target_norm:
+                            for it in s["items"]:
+                                it["status"] = "completed"
+                            s["status"] = "completed"
+            self.tasks_fulfilled += len(items)
+            self.append_bot_chat_message(f"Finished picking items at the {target}.")
+            return
+
+        # ── Fallback: original simulated pickup ──────────────────────────────
+        for item in items:
+            if not self.active_delivery_task:
+                break
+            with self.lock:
+                if getattr(self, 'active_todo_list', None):
+                    for s in self.active_todo_list["stores"]:
+                        if self.normalize_category(s["category"]) == target_norm:
+                            for it in s["items"]:
+                                if it["name"] == item:
+                                    it["status"] = "picking_up"
+            self.append_bot_chat_message(f"Picking up {item}...")
+            rospy.sleep(2.0)
+            with self.lock:
+                if getattr(self, 'active_todo_list', None):
+                    for s in self.active_todo_list["stores"]:
+                        if self.normalize_category(s["category"]) == target_norm:
+                            for it in s["items"]:
+                                if it["name"] == item:
+                                    it["status"] = "completed"
+            self.append_bot_chat_message(f"Loaded {item}!")
+            self.tasks_fulfilled += 1
+        with self.lock:
+            if getattr(self, 'active_todo_list', None):
+                for s in self.active_todo_list["stores"]:
+                    if self.normalize_category(s["category"]) == target_norm:
+                        s["status"] = "completed"
+        self.append_bot_chat_message(f"Finished loading items from the {target}.")
+
     def toggle_yolo_light_switch(self):
         if not (self.yolo_nav_enabled and self.yolo_grab_enabled):
             rospy.logwarn("[web_server] Cannot toggle light switch: one or both YOLO models are disabled.")
@@ -267,54 +534,12 @@ class RobotWebServer:
                 self.delivery_chat_history.pop(0)
 
     def start_planners(self):
-        """Starts the motion planner nodes (TEB planner, costmap, etc.) if they are not already running."""
-        with self.lock:
-            if getattr(self, 'planner_process', None) is None:
-                rospy.loginfo("[web_server] Starting motion planner nodes on the fly...")
-                try:
-                    # Start costmap generator
-                    self.costmap_process = subprocess.Popen(
-                        ["roslaunch", "local_costmap_generator", "run.launch"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                    # Start control space planner (TEB, custom vector, etc.)
-                    self.planner_process = subprocess.Popen(
-                        ["roslaunch", "control_space_planner", "run.launch"],
-                        stdout=subprocess.DEVNULL,
-                        stderr=subprocess.DEVNULL
-                    )
-                    rospy.loginfo("[web_server] Motion planner nodes started successfully.")
-                except Exception as e:
-                    rospy.logerr(f"[web_server] Failed to start motion planners: {e}")
+        """No-op because planners are launched from the beginning by the launch file."""
+        pass
 
     def stop_planners(self):
-        """Kills the motion planner nodes to save computational resources when idle."""
-        with self.lock:
-            if getattr(self, 'planner_process', None) is not None:
-                rospy.loginfo("[web_server] Stopping control space planner...")
-                try:
-                    self.planner_process.terminate()
-                    self.planner_process.wait(timeout=2.0)
-                except Exception:
-                    try:
-                        self.planner_process.kill()
-                    except Exception:
-                        pass
-                self.planner_process = None
-
-            if getattr(self, 'costmap_process', None) is not None:
-                rospy.loginfo("[web_server] Stopping local costmap generator...")
-                try:
-                    self.costmap_process.terminate()
-                    self.costmap_process.wait(timeout=2.0)
-                except Exception:
-                    try:
-                        self.costmap_process.kill()
-                    except Exception:
-                        pass
-                self.costmap_process = None
-                rospy.loginfo("[web_server] Motion planner nodes stopped.")
+        """No-op because planners are launched from the beginning by the launch file."""
+        pass
 
     def stop_robot(self):
         """Immediately stops all autonomous navigation and the robot movement."""
@@ -638,6 +863,7 @@ class RobotWebServer:
 
     def find_tag_thread(self):
         rospy.loginfo("[Find Tag] Starting tag search process...")
+        self.start_planners()
         rate = rospy.Rate(10)
         scan_duration = 15.8
         tag_found = False
@@ -740,6 +966,7 @@ class RobotWebServer:
         # Cleanup
         self.searching_tag = False
         self.stop_search()
+        self.stop_planners()
         if tag_found:
             rospy.loginfo("[Find Tag] Search successfully completed.")
         else:
@@ -767,10 +994,12 @@ class RobotWebServer:
 
     def navigate_to_pose(self, x, y, yaw, ignore_yaw=False, dist_tol=0.2, cost_thresh=70):
         """Standard method to navigate to a specific map pose using the global planner."""
+        self.start_planners()
         # 0. Safety Pre-check
         if not self.is_pose_reachable(x, y, threshold=cost_thresh):
             rospy.logerr(f"[Navigation] Goal ({x:.2f}, {y:.2f}) is blocked in local costmap. Aborting.")
             self.navigating_to_pose_active = False
+            self.stop_planners()
             return False
 
         self.navigating_to_pose_active = True
@@ -830,6 +1059,7 @@ class RobotWebServer:
             
         self.navigating_to_pose_active = False
         self.stop_search(keep_delivery=True) # Clears path but keeps workflow target
+        self.stop_planners()
         return arrived
 
     def check_for_shop(self, target_category):
@@ -842,7 +1072,7 @@ class RobotWebServer:
             depth_raw = getattr(self, 'depth_raw', None)
             
         if img is not None:
-            results = self.yolo_model.predict(img, conf=0.8, verbose=False, device='cuda')
+            results = self.yolo_model.predict(img, conf=0.7, verbose=False, device='cuda')
             for res in results:
                 for box in res.boxes:
                     cls_val = int(box.cls[0].cpu().item())
@@ -948,21 +1178,20 @@ class RobotWebServer:
                 rospy.loginfo("[Approach Workflow] Found shop in pre-sweep!")
                 found = True
             else:
-                # [FIX 2] Sweep outwards from the center to eliminate the blind 60-degree rotation delay
-                rospy.loginfo("[Approach Workflow] Commencing stepped visual sweep...")
-                sweep_angles = [20, -20, 40, -40, 60, -60]
-                
-                for target_deg in sweep_angles:
+                # Do stepped sweep from +60° left to -60° right in 20-degree steps
+                rospy.loginfo("[Approach Workflow] Commencing stepped visual sweep in 20-degree increments...")
+                for step_idx in range(7):
                     if not self.active_delivery_task:
                         break
                     
+                    target_deg = 60 - 20 * step_idx
+                    # Correct formula: simply offset ref_yaw by target_deg, then normalize to [-pi, pi]
                     raw_step = ref_yaw + math.radians(target_deg)
                     target_yaw_step = (raw_step + math.pi) % (2 * math.pi) - math.pi
                     rospy.loginfo(f"[Approach Workflow] Visual Sweep: {target_deg:+.0f}° offset → {math.degrees(target_yaw_step):.1f}° absolute")
                     
                     # Smoothly rotate to this angle at very low speed (damped deceleration)
-                    # Smoothly rotate to this angle at very low speed
-                    self.rotate_to_yaw(target_yaw_step, p_gain=1.2, speed_limit=0.35, threshold=0.03)
+                    self.rotate_to_yaw(target_yaw_step, p_gain=1.2, speed_limit=0.35, threshold=0.03, decel_zone=0.25)
                     self.cmd_vel_pub.publish(Twist()) # Stop movement
                     
                     # Pause for 1.0 second (10 ticks at 10 Hz) — gives camera & RTABMap time to stabilize
@@ -998,8 +1227,7 @@ class RobotWebServer:
                 rospy.logwarn("[Approach Workflow] Centering failed (lost focus). Assuming not detected, nudging forward to retry sweep...")
                 self.nudge_forward_and_recover(ref_yaw)
                 continue
-                
-            # PHASE 3: CALCULATE EXACT STORE LOCATION
+              # PHASE 3: CALCULATE EXACT STORE LOCATION
             rx, ry, ryaw = self.get_current_robot_pose()
             wall_dist = self.get_distance_to_wall_ahead(max_dist=6.0)
             
@@ -1015,6 +1243,7 @@ class RobotWebServer:
             shop_y = ry + wall_dist * math.sin(ryaw)
             
             # PHASE 4: CALCULATE 90-DEGREE WAYPOINT
+            # The corridor runs along ref_yaw. The shop is perpendicular — either +90° or -90° off the corridor.
             n1 = (ref_yaw + math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
             n2 = (ref_yaw - math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
             
@@ -1022,17 +1251,21 @@ class RobotWebServer:
             vec_n1 = np.array([math.cos(n1), math.sin(n1)])
             vec_n2 = np.array([math.cos(n2), math.sin(n2)])
             
+            # outward_normal: direction FROM shop TOWARD robot (robot is on this side of the wall)
             outward_normal = n1 if np.dot(vec_to_robot, vec_n1) > np.dot(vec_to_robot, vec_n2) else n2
             
             target_dist = getattr(self, 'approach_dist_m', 0.60)
             target_x = shop_x + target_dist * math.cos(outward_normal)
             target_y = shop_y + target_dist * math.sin(outward_normal)
             
+            # Apply overshoot along the corridor direction
             overshoot_m = getattr(self, 'overshoot_m', 0.0)
             target_x += overshoot_m * math.cos(ref_yaw)
             target_y += overshoot_m * math.sin(ref_yaw)
             
-            facing_yaw = (outward_normal + math.pi) % (2*math.pi) - math.pi
+            # Robot parks at outward position and must face OUTWARD (away from the shop wall, which is outward_normal).
+            facing_yaw = outward_normal + math.pi
+            facing_yaw = (facing_yaw + math.pi) % (2*math.pi) - math.pi  # normalize to [-pi, pi]
             
             rospy.loginfo(f"[Approach Workflow] Target Pose: ({target_x:.2f}, {target_y:.2f}) facing {math.degrees(facing_yaw):.1f}° (outward)")
             
@@ -1092,8 +1325,7 @@ class RobotWebServer:
                     cmd.angular.z = 0.12
                     start_t = rospy.Time.now()
                     while not rospy.is_shutdown() and self.active_delivery_task:
-                        # [FIX 1] Changed .toSec() to .to_sec() to prevent AttributeError crash
-                        if (rospy.Time.now() - start_t).to_sec() > 5.0:
+                        if (rospy.Time.now() - start_t).toSec() > 5.0:
                             break
                         det_near = self.check_for_shop(target_category)
                         if det_near:
@@ -1109,8 +1341,7 @@ class RobotWebServer:
                         cmd.angular.z = -0.12
                         start_t = rospy.Time.now()
                         while not rospy.is_shutdown() and self.active_delivery_task:
-                            # [FIX 1] Changed .toSec() to .to_sec() to prevent AttributeError crash
-                            if (rospy.Time.now() - start_t).to_sec() > 10.0:
+                            if (rospy.Time.now() - start_t).toSec() > 10.0:
                                 break
                             det_near = self.check_for_shop(target_category)
                             if det_near:
@@ -1154,21 +1385,26 @@ class RobotWebServer:
         return False
 
     def nudge_forward_and_recover(self, corridor_yaw):
-        """Helper to recover from lost/failed sweep: rotates back to corridor, rotates to clear costmap, then translates forward."""
+        """Helper to recover from failed/blocked sweep or navigation: rotates back, does safe recovery, and nudges forward."""
+        if not self.active_delivery_task:
+            return
         rospy.loginfo("[Nudge Recovery] Rotating back to corridor direction...")
-        self.rotate_to_yaw(corridor_yaw, threshold=0.05)
+        self.rotate_to_yaw(corridor_yaw, p_gain=1.5, speed_limit=0.4, threshold=0.04)
+        if not self.active_delivery_task:
+            return
         self.stop_search(keep_delivery=True)
         
         # In-place rotation recovery to clear costmaps
         self.recover_robot()
+        if not self.active_delivery_task:
+            return
         
         # Nudge forward
         rx, ry, ryaw = self.get_current_robot_pose()
-        # Try a 0.5m nudge first, check reachability
-        nudge_dist = 0.50
-        
         # Try steps: 0.5m, 0.35m, 0.20m
         for step in [0.50, 0.35, 0.20]:
+            if not self.active_delivery_task:
+                return
             fx = rx + step * math.cos(corridor_yaw)
             fy = ry + step * math.sin(corridor_yaw)
             if self.is_pose_reachable(fx, fy, threshold=98):
@@ -1177,108 +1413,243 @@ class RobotWebServer:
                 break
         else:
             # If all are blocked in costmap pre-check, execute a small blind nudge to clear the costmap inflation
+            if not self.active_delivery_task:
+                return
             rospy.logwarn("[Nudge Recovery] Nudge path blocked in costmap. Executing safe blind nudge...")
             cmd = Twist()
             cmd.linear.x = 0.1
             self.cmd_vel_pub.publish(cmd)
-            rospy.sleep(2.0)
+            
+            rate = rospy.Rate(10)
+            for _ in range(20): # 2 seconds
+                if not self.active_delivery_task:
+                    break
+                rate.sleep()
+            
             self.cmd_vel_pub.publish(Twist())
 
 
+
+    def _wait_for_tag_navigation(self):
+        """Wait for nav_to_tag_thread to finish. Returns True if active_delivery_task survives."""
+        rospy.sleep(0.3)  # allow thread to start
+        while not rospy.is_shutdown() and self.navigating_to_tag and self.active_delivery_task:
+            rospy.sleep(0.1)
+        return bool(self.active_delivery_task)
+
+    def _navigate_to_tag_with_retry(self, tag_name, max_tries=2):
+        """Navigate to a tag, retrying up to max_tries times if the robot fails to arrive."""
+        pose_info = self.tag_true_poses.get(tag_name)
+        if pose_info is None:
+            return False
+        gx, gy = pose_info[0], pose_info[1]
+        psi_deg = pose_info[2]
+        psi_rad = math.radians(psi_deg)
+        approach_dist = getattr(self, 'approach_dist_m', 0.60)
+        tx = gx + approach_dist * math.cos(psi_rad)
+        ty = gy + approach_dist * math.sin(psi_rad)
+
+        for attempt in range(max_tries):
+            if not self.active_delivery_task:
+                return False
+            rospy.loginfo(f"[Tag Nav Retry] Attempt {attempt + 1}/{max_tries} to reach {tag_name}")
+            self.start_navigation_to_tag(tag_name, is_part_of_task=True)
+            if not self._wait_for_tag_navigation():
+                return False  # task was cancelled
+            # Check how close we got to the offset goal
+            rx, ry, _ = self.get_current_robot_pose()
+            dist = math.hypot(rx - tx, ry - ty)
+            if dist < 0.25:
+                rospy.loginfo(f"[Tag Nav Retry] Arrived at {tag_name} offset (dist: {dist:.2f}m).")
+                return True
+            rospy.logwarn(f"[Tag Nav Retry] Did not arrive at {tag_name} offset (dist: {dist:.2f}m). {'Retrying...' if attempt + 1 < max_tries else 'Giving up.'}")
+            if attempt + 1 < max_tries:
+                rospy.sleep(1.0)
+        return False
 
     def delivery_search_workflow(self, target_category, is_part_of_task=False):
         success = False
         try:
             rospy.loginfo(f"[Delivery Task] Starting workflow for: {target_category}")
             
-            # 1. FIND CLOSEST CROSSROAD SIGN (among known signs that point to this category)
+            # 1. BUILD SORTED CANDIDATE LIST (all signs pointing to this category, sorted by distance)
             rx, ry, _ = self.get_current_robot_pose()
-            best_tag = None
-            min_dist = float('inf')
-            target_dir = 0.0
-            
-            # Use local copies to avoid lock contention during heavy logic
-            with self.lock:
-                current_R = self.R.copy()
-                current_T = self.T.copy()
-                
             target_norm = self.normalize_category(target_category)
+            
+            # tag_true_poses are in the map frame directly — no transform needed
+            candidates = []
+            seen_tags = set()
             for entry in self.sign_database:
                 entry_norm = self.normalize_category(entry['category'])
                 if target_norm == entry_norm:
                     tag_name = entry['tag']
-                    if tag_name in self.tag_true_poses:
+                    if tag_name in self.tag_true_poses and tag_name not in seen_tags:
+                        seen_tags.add(tag_name)
                         pose_info = self.tag_true_poses[tag_name]
-                        # Project to map using current estimation
-                        tag_pt = np.array([pose_info[0], pose_info[1]])
-                        tag_map = np.dot(current_R, tag_pt) + current_T
-                        dist = math.hypot(rx - tag_map[0], ry - tag_map[1])
-                        
-                        if dist < min_dist:
-                            min_dist = dist
-                            best_tag = tag_name
-                            target_dir = entry['direction']
-                            
-            if not best_tag:
+                        dist = math.hypot(rx - pose_info[0], ry - pose_info[1])
+                        # Find direction for this tag (use first match)
+                        direction = entry['direction']
+                        candidates.append((dist, tag_name, direction))
+
+            if not candidates:
                 rospy.logwarn(f"[Delivery Task] No sign found for {target_category} in database.")
                 if not is_part_of_task:
                     self.active_delivery_task = None
                 return False
 
-            # 2. GO TO THE APRITAG (using motion planner)
-            rospy.loginfo(f"[Delivery Task] Step 1: Navigating to {best_tag} (dist: {min_dist:.2f}m)")
-            self.start_navigation_to_tag(best_tag, is_part_of_task=True)
-            
-            # Wait until arrived (navigation logic sets navigating_to_tag to False on arrival)
-            # We add a small delay to ensure the thread has started
-            rospy.sleep(0.2)
-            while not rospy.is_shutdown() and self.navigating_to_tag and self.active_delivery_task:
-                rospy.sleep(0.1)
+            # Sort closest first — we try in order, falling back to next intersection on failure
+            candidates.sort(key=lambda c: c[0])
+            rospy.loginfo(f"[Delivery Task] Found {len(candidates)} candidate sign(s) for {target_category}: "
+                          + ", ".join(f"{t}({d:.1f}m)" for d, t, _ in candidates))
+
+            # 2. ITERATE THROUGH CANDIDATES UNTIL ONE SUCCEEDS
+            for cand_idx, (cand_dist, best_tag, target_dir) in enumerate(candidates):
+                if not self.active_delivery_task:
+                    return False
+
+                rospy.loginfo(f"[Delivery Task] Trying candidate {cand_idx + 1}/{len(candidates)}: {best_tag} (dist: {cand_dist:.2f}m)")
                 
-            if not self.active_delivery_task: 
-                rospy.loginfo("[Delivery Task] Task cancelled during navigation.")
-                return False
+                if target_norm == "PICKUP POINT":
+                    # Special Pickup Point direct navigation
+                    rospy.loginfo(f"[Delivery Task] Special logic for PICKUP POINT: Navigating straight to offset of {best_tag}...")
+                    pose_info = self.tag_true_poses.get(best_tag)
+                    if pose_info is None:
+                        rospy.logerr(f"[Delivery Task] Critical error: {best_tag} missing from tag_true_poses")
+                        continue
+                    
+                    gx, gy = pose_info[0], pose_info[1]
+                    tag_true_yaw_deg = pose_info[2]
+                    
+                    approach_dist = getattr(self, 'approach_dist_m', 0.60)
+                    tag_yaw = math.radians(tag_true_yaw_deg)
+                    tx = gx + approach_dist * math.cos(tag_yaw)
+                    ty = gy + approach_dist * math.sin(tag_yaw)
+                    facing_yaw = (tag_yaw + math.pi)
+                    facing_yaw = (facing_yaw + math.pi) % (2 * math.pi) - math.pi  # normalize to [-pi, pi]
+                    
+                    rospy.loginfo(f"[Delivery Task] Target offset pose: ({tx:.2f}, {ty:.2f}) facing {math.degrees(facing_yaw):.1f}°")
+                    
+                    nav_ok = False
+                    for attempt in range(2):
+                        if not self.active_delivery_task:
+                            return False
+                        rospy.loginfo(f"[Pickup Nav Retry] Attempt {attempt + 1}/2 to reach offset of {best_tag}")
+                        
+                        success_nav = self.navigate_to_pose(tx, ty, facing_yaw, ignore_yaw=False, dist_tol=0.20, cost_thresh=98)
+                        if not self.active_delivery_task:
+                            return False
+                            
+                        # Double check how close we got
+                        rx, ry, ryaw = self.get_current_robot_pose()
+                        dist = math.hypot(rx - tx, ry - ty)
+                        angle_diff = (facing_yaw - ryaw + math.pi) % (2 * math.pi) - math.pi
+                        
+                        if success_nav or (dist < 0.25 and abs(angle_diff) < 0.25):
+                            rospy.loginfo(f"[Pickup Nav Retry] Successfully reached pickup offset at {best_tag}!")
+                            
+                            # Final snapping to orientation
+                            self.cmd_vel_pub.publish(Twist())
+                            
+                            for _ in range(3):
+                                if not self.active_delivery_task:
+                                    break
+                                rospy.sleep(0.1)
+                                
+                            if not self.active_delivery_task:
+                                return False
+                                
+                            self.rotate_to_yaw(facing_yaw, p_gain=1.5, speed_limit=0.4, threshold=0.03)
+                            
+                            for _ in range(3):
+                                if not self.active_delivery_task:
+                                    break
+                                rospy.sleep(0.1)
+                                
+                            if not self.active_delivery_task:
+                                return False
+                                
+                            self.rotate_to_yaw(facing_yaw, p_gain=2.0, speed_limit=0.2, threshold=0.015)
+                            
+                            nav_ok = True
+                            break
+                        
+                        rospy.logwarn(f"[Pickup Nav Retry] Failed to reach offset of {best_tag} (dist: {dist:.2f}m, angle: {math.degrees(angle_diff):.1f}°). Retrying...")
+                        if attempt < 1:
+                            rospy.sleep(1.0)
+                            
+                    if nav_ok:
+                        rospy.loginfo(f"[Delivery Task] SUCCESS: Arrived at PICKUP POINT at {best_tag}!")
+                        success = True
+                        break  # done — do not try other candidates
+                    else:
+                        rospy.logwarn(f"[Delivery Task] Failed to reach PICKUP POINT candidate {best_tag} after retries. "
+                                      + (f"Trying next candidate..." if cand_idx + 1 < len(candidates) else "No more candidates."))
+                        continue  # try next candidate
+                else:
+                    # --- Step 2a: NAVIGATE TO SIGN (with retry) ---
+                    rospy.loginfo(f"[Delivery Task] Step 1: Navigating to {best_tag}")
+                    nav_ok = self._navigate_to_tag_with_retry(best_tag, max_tries=2)
+                    if not nav_ok:
+                        if not self.active_delivery_task:
+                            return False
+                        rospy.logwarn(f"[Delivery Task] Navigation failed for {best_tag} after retries. "
+                                      + (f"Trying next candidate..." if cand_idx + 1 < len(candidates) else "No more candidates."))
+                        continue  # try next intersection
 
-            # --- Step 3: ALIGN TO SIGN DIRECTION ---
-            rospy.loginfo(f"[Delivery Task] Step 2: Aligning to sign direction ({target_dir}°)")
-            if best_tag not in self.tag_true_poses:
-                rospy.logerr(f"[Delivery Task] Critical error: {best_tag} missing from tag_true_poses")
-                continue
+                    if not self.active_delivery_task:
+                        return False
 
-            pose_info = self.tag_true_poses[best_tag]
-            tag_true_yaw_deg = pose_info[2]
+                    # --- Step 2b: ALIGN TO SIGN DIRECTION ---
+                    rospy.loginfo(f"[Delivery Task] Step 2: Aligning to sign direction ({target_dir}°)")
+                    if best_tag not in self.tag_true_poses:
+                        rospy.logerr(f"[Delivery Task] Critical error: {best_tag} missing from tag_true_poses")
+                        continue
 
-            # ORIENTATION GEOMETRY CORRECTION:
-            # tag_true_yaw_deg is the vector the sign normal faces. 
-            # The robot arrives standing opposite to the normal vector (tag_true_yaw + 180 deg).
-            # Arrow directions (Left=+90, Right=-90) are relative to what the robot sees looking at the sign.
-            raw_target = math.radians(tag_true_yaw_deg) + math.pi + math.radians(target_dir) + math.radians(self.tag_align_offset_deg)
-            target_yaw = (raw_target + math.pi) % (2 * math.pi) - math.pi  # normalize to [-pi, pi]
+                    pose_info = self.tag_true_poses[best_tag]
+                    tag_true_yaw_deg = pose_info[2]
 
-            rospy.loginfo(f"[Delivery Task] Tag reference yaw: {tag_true_yaw_deg:.1f}°, Arrive Face: {math.degrees(math.radians(tag_true_yaw_deg)+math.pi):.1f}°"
-                                  f" → Target Corridor Heading: {math.degrees(target_yaw):.1f}°")
-            rospy.loginfo(f"[Delivery Task] Rotating to target yaw: {math.degrees(target_yaw):.1f} deg")
-            # Smooth alignment with corridor before sweep
-            self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=0.5)
-            
-            if not self.active_delivery_task:
-                return False
-                
-            # 4. DISCOVER SHOP & APPROACH USING WAYPOINT
-            rospy.loginfo(f"[Delivery Task] Step 3: Discovering and approaching {target_category}...")
-            # Use the new waypoint-based approach for reliability, passing the corridor alignment
-            success = self.approach_shop_via_waypoint(target_category, corridor_yaw=target_yaw)
-            
-            if success:
-                rospy.loginfo(f"[Delivery Task] SUCCESS: Arrived at {target_category}!")
-            else:
-                rospy.logwarn(f"[Delivery Task] Failed to final-approach {target_category} storefront.")
+                    # tag_true_poses are stored directly in the map frame.
+                    # ORIENTATION GEOMETRY:
+                    # tag_true_yaw_deg (psi) = Reference heading of the sign/corridor in map frame.
+                    # Arrow directions (Up=0, Left=90, Right=-90, Down=180) are relative to this reference.
+                    # Therefore: corridor_yaw = tag_true_yaw + target_dir (without extra 180 deg offset)
+                    raw_target = math.radians(tag_true_yaw_deg) + math.radians(target_dir) + math.radians(self.tag_align_offset_deg)
+                    target_yaw = (raw_target + math.pi) % (2 * math.pi) - math.pi  # normalize to [-pi, pi]
+
+                    rospy.loginfo(f"[Delivery Task] Tag reference yaw: {tag_true_yaw_deg:.1f}°, arrow offset: {target_dir:.1f}°"
+                                  f" → corridor target: {math.degrees(target_yaw):.1f}°")
+
+                    # Let the robot come to a full stop before rotating
+                    self.cmd_vel_pub.publish(Twist())
+                    rospy.sleep(0.5)
+
+                    # First rotation pass — coarse alignment (slow and damped)
+                    self.rotate_to_yaw(target_yaw, p_gain=1.5, speed_limit=0.4, threshold=0.04)
+                    rospy.sleep(0.5)
+                    # Second pass — fine correction (very slow and precise)
+                    self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=0.2, threshold=0.015)
+
+                    if not self.active_delivery_task:
+                        return False
+
+                    # --- Step 2c: DISCOVER SHOP & APPROACH ---
+                    rospy.loginfo(f"[Delivery Task] Step 3: Discovering and approaching {target_category}...")
+                    success = self.approach_shop_via_waypoint(target_category, corridor_yaw=target_yaw)
+
+                    if success:
+                        rospy.loginfo(f"[Delivery Task] SUCCESS: Arrived at {target_category}!")
+                        break  # done — do not try other candidates
+                    else:
+                        rospy.logwarn(f"[Delivery Task] Approach failed from {best_tag}. "
+                                      + (f"Trying next candidate..." if cand_idx + 1 < len(candidates) else "No more candidates."))
+                        # continue to next candidate
+
         except Exception as e:
             rospy.logerr(f"[Delivery Task] Unexpected error in workflow: {e}")
             import traceback
             rospy.logerr(traceback.format_exc())
             success = False
-            
+
         if not is_part_of_task:
             self.active_delivery_task = None
         return success
@@ -1380,6 +1751,10 @@ class RobotWebServer:
                             
                             # Wait for arrival
                             pose_info = self.tag_true_poses[resolved_tag]
+                            psi_deg = pose_info[2]
+                            psi_rad = math.radians(psi_deg)
+                            approach_dist = getattr(self, 'approach_dist_m', 0.60)
+                            
                             if "STORE_" in resolved_tag:
                                 gx, gy = pose_info[0], pose_info[1]
                             else:
@@ -1388,9 +1763,13 @@ class RobotWebServer:
                                     T = self.T.copy()
                                 tag_map = np.dot(R, np.array([pose_info[0], pose_info[1]])) + T
                                 gx, gy = tag_map[0], tag_map[1]
-                                
+                            
+                            # Calculate offset target pose
+                            tx = gx + approach_dist * math.cos(psi_rad)
+                            ty = gy + approach_dist * math.sin(psi_rad)
+                            
                             rx, ry, _ = self.get_current_robot_pose()
-                            success = (math.hypot(rx - gx, ry - gy) < 0.35) and (self.active_delivery_task is not None)
+                            success = (math.hypot(rx - tx, ry - ty) < 0.35) and (self.active_delivery_task is not None)
                         else:
                             rospy.logerr(f"[Shopping List] Could not resolve target for: {target_upper}")
                             break # Break retry loop if category is completely unresolvable
@@ -1507,8 +1886,13 @@ class RobotWebServer:
                             # Wait for arrival...
                             pose_info = self.tag_true_poses[resolved_tag]
                             gx, gy = pose_info[0], pose_info[1]
+                            psi_deg = pose_info[2]
+                            psi_rad = math.radians(psi_deg)
+                            approach_dist = getattr(self, 'approach_dist_m', 0.60)
+                            tx = gx + approach_dist * math.cos(psi_rad)
+                            ty = gy + approach_dist * math.sin(psi_rad)
                             rx, ry, _ = self.get_current_robot_pose()
-                            success = (math.hypot(rx - gx, ry - gy) < 0.35) and (self.active_delivery_task is not None)
+                            success = (math.hypot(rx - tx, ry - ty) < 0.35) and (self.active_delivery_task is not None)
                 if success:
                     break
             
@@ -1523,18 +1907,29 @@ class RobotWebServer:
         rospy.loginfo("[Shopping List] Sequential shopping list workflow completed.")
         self.active_delivery_task = None
 
-    def rotate_to_yaw(self, target_yaw, p_gain=1.5, speed_limit=0.8, threshold=0.03):
-        """Simple proportional controller for rotation in-place."""
-        rate = rospy.Rate(10)
+    def rotate_to_yaw(self, target_yaw, p_gain=1.5, speed_limit=0.5, threshold=0.03, min_speed=0.08, decel_zone=0.3):
+        """Proportional controller for rotation in-place with smooth deceleration near target and min speed."""
+        rate = rospy.Rate(15)
         while not rospy.is_shutdown() and self.active_delivery_task:
             _, _, ryaw = self.get_current_robot_pose()
             diff = (target_yaw - ryaw + math.pi) % (2 * math.pi) - math.pi
             if abs(diff) < threshold: break
             
+            # Proportional velocity
+            speed = p_gain * diff
+            
+            # Slower and slower the closer we get to target_yaw
+            if abs(diff) < decel_zone:
+                scale = abs(diff) / decel_zone
+                speed = speed * scale
+                
+            # Clamping to [min_speed, speed_limit] while maintaining correct direction sign
+            sign = 1.0 if diff >= 0 else -1.0
+            speed_val = max(min_speed, abs(speed))
+            speed = sign * min(speed_limit, speed_val)
+            
             cmd = Twist()
-            cmd.angular.z = p_gain * diff 
-            # Clamp
-            cmd.angular.z = max(-speed_limit, min(speed_limit, cmd.angular.z))
+            cmd.angular.z = speed
             self.cmd_vel_pub.publish(cmd)
             rate.sleep()
         self.cmd_vel_pub.publish(Twist()) # Stop
@@ -1542,6 +1937,7 @@ class RobotWebServer:
     def nav_to_tag_thread(self, tag_name):
         self.load_tag_true_poses()
         rospy.loginfo(f"[Tag Nav] Starting navigation to landmark {tag_name}...")
+        self.start_planners()
         
         # Enable C++ planner
         rospy.set_param("/exploration_state", "EXPLORE")
@@ -1554,9 +1950,12 @@ class RobotWebServer:
         psi_rad = math.radians(psi_deg)
         
         # All signboard and landmark coordinates are defined directly in the 'map' frame
-        gx = tag_pt[0]
-        gy = tag_pt[1]
-        gyaw = psi_rad
+        # Apply approach distance offset to stand in front of the tag
+        approach_dist = getattr(self, 'approach_dist_m', 0.60)
+        gx = tag_pt[0] + approach_dist * math.cos(psi_rad)
+        gy = tag_pt[1] + approach_dist * math.sin(psi_rad)
+        gyaw = psi_rad + math.pi
+        gyaw = (gyaw + math.pi) % (2 * math.pi) - math.pi  # Normalize to [-pi, pi]
         
         rospy.loginfo(f"[Tag Nav] Target Pose in Map: ({gx:.2f}, {gy:.2f}, heading: {math.degrees(gyaw):.1f}°)")
         
@@ -1572,7 +1971,7 @@ class RobotWebServer:
             # Distance to the target position
             dist = math.hypot(rx - gx, ry - gy)
             
-            # Check if arrived at position (under signboard)
+            # Check if arrived at position (offset in front of signboard)
             if dist < 0.25:
                 rospy.loginfo("[Tag Nav] Arrived at target signboard position successfully.")
                 break
@@ -1612,6 +2011,7 @@ class RobotWebServer:
             
         self.navigating_to_tag = False
         self.stop_search(keep_delivery=getattr(self, 'is_part_of_task', False))
+        self.stop_planners()
 
     def publish_path_to_goal(self, gx, gy):
         path = Path()
@@ -1659,6 +2059,8 @@ class RobotWebServer:
 
     def recover_robot(self):
         """Costmap clearing recovery by rotating in place."""
+        if not self.active_delivery_task:
+            return
         rospy.loginfo("[Recovery] Attempting costmap clearing recovery by rotating in place.")
         cmd = Twist()
         cmd.angular.z = 0.5
@@ -1666,56 +2068,103 @@ class RobotWebServer:
         # Publish continuously to prevent cmd_vel_to_chassis watchdog timeout
         rate = rospy.Rate(10)
         for _ in range(15):  # 1.5 seconds at 10Hz
+            if not self.active_delivery_task:
+                cmd.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd)
+                return
             self.cmd_vel_pub.publish(cmd)
             rate.sleep()
             
         cmd.angular.z = 0.0
         self.cmd_vel_pub.publish(cmd)
-        rospy.sleep(1.0)
+        
+        # Safe sleep checking for cancellation
+        for _ in range(10):
+            if not self.active_delivery_task:
+                break
+            rospy.sleep(0.1)
 
 
     def load_bundles(self, yaml_path):
-        # Resolve path using rospkg
+        rospack = rospkg.RosPack()
         try:
-            pkg_path = rospkg.RosPack().get_path('robot_web_ui')
+            pkg_path = rospack.get_path('robot_web_ui')
             mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
-            hw4_path = os.path.join(mdr_path, 'HW4', 'tags.yaml')
+            signboards_path = os.path.join(mdr_path, 'HW4', 'signboards.yaml')
         except Exception:
-            hw4_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/tags.yaml"
+            signboards_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/signboards.yaml"
 
+        tag_config = rospy.get_param('/hw4/apriltag_localization_node/tag_config_name', None)
+        if tag_config is None:
+            tag_config = rospy.get_param('/apriltag_localization_node/tag_config_name', '2026/ee478_n1_room113')
+        if not tag_config.endswith('.yaml'):
+            tag_config += '.yaml'
         try:
-            apriltag_path = os.path.join(rospkg.RosPack().get_path('apriltag_localization'), 'tags.yaml')
+            apriltag_path = rospack.get_path('apriltag_localization')
+            active_yaml = os.path.join(apriltag_path, 'config', tag_config)
         except Exception:
-            apriltag_path = os.path.join(os.path.dirname(__file__), '../../AprilTagLocalization/tags.yaml')
+            active_yaml = os.path.join(os.path.dirname(__file__), '../../AprilTagLocalization/config', tag_config)
 
-        # Try multiple potential paths
-        paths = [
-            yaml_path,
-            hw4_path,
-            apriltag_path
-        ]
-        
-        for path in paths:
-            if os.path.exists(path):
-                try:
-                    with open(path, 'r') as f:
-                        config = yaml.safe_load(f)
-                    bundles = {}
-                    if config and 'tag_bundles' in config:
-                        for bundle in config['tag_bundles']:
-                            name = bundle.get('name', '')
-                            layout = bundle.get('layout', [])
-                            # Create a sorted tuple of tag IDs in this bundle
+        bundles = {}
+        try:
+            # 1. Load sizes from active_yaml (ee478_n1_room113.yaml)
+            signboard_sizes = {}
+            if os.path.exists(active_yaml):
+                with open(active_yaml, 'r') as f:
+                    room_config = yaml.safe_load(f)
+                if room_config and 'TAG_TRUE_RT' in room_config and 'TAGS' in room_config['TAG_TRUE_RT']:
+                    for tag_def in room_config['TAG_TRUE_RT']['TAGS']:
+                        name = tag_def[0]
+                        size = float(tag_def[1])
+                        signboard_sizes[name] = size
+
+            # 2. Load signboards.yaml and build bundles
+            if os.path.exists(signboards_path):
+                with open(signboards_path, 'r') as f:
+                    signboards = yaml.safe_load(f)
+                if signboards:
+                    for board_name, tags in signboards.items():
+                        if not isinstance(tags, dict):
+                            continue
+                        size = signboard_sizes.get(board_name, 0.02)
+                        layout = []
+                        for tag_str, data in tags.items():
+                            try:
+                                tag_id = int(tag_str)
+                            except ValueError:
+                                continue
+                            
+                            dir_str = data.get('direction', 'Up').strip().lower()
+                            if dir_str == 'left':
+                                x_offset = -0.0655
+                            elif dir_str == 'right':
+                                x_offset = 0.0879
+                            else:
+                                x_offset = 0.0112
+                                
+                            layout.append({
+                                'id': tag_id,
+                                'size': size,
+                                'x': x_offset,
+                                'y': 0.0,
+                                'z': 0.0,
+                                'qw': 1.0,
+                                'qx': 0.0,
+                                'qy': 0.0,
+                                'qz': 0.0
+                            })
+                        if layout:
                             ids = tuple(sorted([item['id'] for item in layout]))
                             bundles[ids] = {
-                                'name': name,
+                                'name': board_name,
                                 'layout': {item['id']: item for item in layout}
                             }
-                        rospy.loginfo(f"Successfully loaded {len(bundles)} AprilTag bundles from {path}")
-                        return bundles
-                except Exception as e:
-                    rospy.logwarn(f"Failed to load yaml from {path}: {e}")
-        rospy.logwarn("Could not load AprilTag bundles config. Falling back to standalone tags only.")
+                    rospy.loginfo(f"Successfully generated {len(bundles)} AprilTag bundles dynamically from {signboards_path} and {active_yaml}")
+                    return bundles
+        except Exception as e:
+            rospy.logwarn(f"Failed to generate AprilTag bundles dynamically: {e}")
+            
+        rospy.logwarn("Could not dynamically load AprilTag bundles. Falling back to empty bundles.")
         return {}
 
     def draw_tags(self, img):
@@ -2448,6 +2897,8 @@ def api_status():
         "local_planner": local_planner,
         "mapped_shops": server.mapped_shops if hasattr(server, "mapped_shops") else [],
         "overshoot_cm": (server.overshoot_m * 100.0) if hasattr(server, 'overshoot_m') else 0.0,
+        "approach_dist_cm": (server.approach_dist_m * 100.0) if hasattr(server, 'approach_dist_m') else 60.0,
+        "tag_align_offset_deg": server.tag_align_offset_deg if hasattr(server, 'tag_align_offset_deg') else 0.0,
         "chat_messages": server.delivery_chat_history if hasattr(server, 'delivery_chat_history') else [],
         "todo_list": server.active_todo_list if hasattr(server, 'active_todo_list') else None,
         "yolo_nav_state": server.yolo_nav_state if hasattr(server, 'yolo_nav_state') else True,
@@ -2482,6 +2933,22 @@ def set_overshoot():
     server.overshoot_m = overshoot_cm / 100.0
     rospy.loginfo(f"Approach overshoot set to {overshoot_cm} cm in backend.")
     return jsonify({"status": "success", "overshoot_cm": overshoot_cm})
+
+@app.route('/api/set_approach_dist', methods=['POST'])
+def set_approach_dist():
+    data = request.json or {}
+    dist_cm = float(data.get('approach_dist_cm', 60.0))
+    server.approach_dist_m = dist_cm / 100.0
+    rospy.loginfo(f"Approach target distance set to {dist_cm} cm ({server.approach_dist_m:.2f} m) in backend.")
+    return jsonify({"status": "success", "approach_dist_cm": dist_cm})
+
+@app.route('/api/set_tag_align_offset', methods=['POST'])
+def set_tag_align_offset():
+    data = request.json or {}
+    offset_deg = float(data.get('offset_deg', 0.0))
+    server.tag_align_offset_deg = offset_deg
+    rospy.loginfo(f"Tag alignment offset set to {offset_deg} degrees in backend.")
+    return jsonify({"status": "success", "offset_deg": offset_deg})
 
 @app.route('/api/cmd_vel', methods=['POST'])
 def cmd_vel():
@@ -2731,63 +3198,52 @@ def delivery_send():
         return jsonify({"reply": "I did not receive a message. Please say something!"})
         
     server.append_user_chat_message(message)
-    
-    tasks = []
+
+    # The robot can pick up ONLY four items. The LLM's single job is to map the
+    # user's sentence to a COUNT of each of these four (quantities matter). The
+    # store-to-visit grouping is then derived deterministically in code, so the
+    # LLM can never mis-assign stores.
+    counts = {"drug": 0, "hamburger": 0, "iceCoffee": 0, "mug": 0}
     reply = ""
-    
+
     use_local = rospy.get_param("/use_local_ai", True)
-    
+
     if not use_local:
         # Call the /llm_query service of the stateless client to parse the user's intent!
         try:
             rospy.wait_for_service("llm_query", timeout=2.0)
             llm_query_srv = rospy.ServiceProxy("llm_query", LLMQuery)
-            
-            prompt = (
-                f"The user wants to get some items. They said: '{message}'.\n"
-                f"Please match the items they requested to one of our 5 store categories:\n"
-                f"- 'Cafe' (for coffee, ice coffee, tea, latte, cappuccino, espresso, drinks, etc.)\n"
-                f"- 'Convenience store' (for onigiri, banana, snacks, chips, tissue, water, general shop items, etc.)\n"
-                f"- 'Fast-food restaurant' (for burger, fries, hamburger, food, pizza, chicken nuggets, etc.)\n"
-                f"- 'Pharmacy' (for medicine, aspirin, cough drop, band-aid, pills, etc.)\n"
-                f"- 'Pickup Point' (for packages, parcels, etc.)\n\n"
-                f"If there are items, group them by category.\n"
-                f"Return ONLY a raw JSON object with two keys:\n"
-                f"1. 'tasks': A list of objects, where each object has:\n"
-                f"   - 'target': The exact category string ('Cafe', 'Convenience store', 'Fast-food restaurant', 'Pharmacy', or 'Pickup Point')\n"
-                f"   - 'items': A list of strings containing the items matched to this category.\n"
-                f"2. 'reply': A polite conversational response to display to the user, listing the items and where you will pick them up (e.g., 'sounds good, here is where I will go to get your items: Cafe for coffee and ice coffee, Convenience store for onigiri and banana, Fast-food restaurant for burger and fries.').\n\n"
-                f"Example JSON output:\n"
-                f"{{\n"
-                f"  \"tasks\": [\n"
-                f"    {{\"target\": \"Cafe\", \"items\": [\"coffee\", \"ice coffee\"]}},\n"
-                f"    {{\"target\": \"Convenience store\", \"items\": [\"onigiri\", \"banana\"]}},\n"
-                f"    {{\"target\": \"Fast-food restaurant\", \"items\": [\"burger\", \"fries\"]}}\n"
-                f"  ],\n"
-                f"  \"reply\": \"sounds good, here is where I will go to get your items: Cafe for coffee and ice coffee, Convenience store for onigiri and banana, Fast-food restaurant for burger and fries.\"\n"
-                f"}}"
-            )
-            
+
+            # Prompt is generated from the editable competition vocabulary
+            # (RobotWebServer.REQUEST_ITEM_TO_CLASS).
+            prompt = server.build_llm_prompt(message)
+
             llm_req = LLMQueryRequest()
             llm_req.prompt = prompt
             llm_res = llm_query_srv(llm_req)
-            
-            # Parse reply safely
+
             cleaned_resp = llm_res.response.strip()
             if cleaned_resp.startswith("```json"):
                 cleaned_resp = cleaned_resp[7:]
+            if cleaned_resp.startswith("```"):
+                cleaned_resp = cleaned_resp[3:]
             if cleaned_resp.endswith("```"):
                 cleaned_resp = cleaned_resp[:-3]
             cleaned_resp = cleaned_resp.strip()
-            
+
             parsed = json.loads(cleaned_resp)
-            tasks = parsed.get("tasks", [])
-            reply = parsed.get("reply", "Understood! Executing tasks.")
-            
+            raw_counts = parsed.get("counts", {}) or {}
+            for k in counts:
+                try:
+                    counts[k] = int(raw_counts.get(k, 0) or 0)
+                except (ValueError, TypeError):
+                    counts[k] = 0
+            reply = parsed.get("reply", "") or ""
+
         except Exception as e:
             rospy.logwarn(f"LLM Query failed or timed out: {e}. Falling back to offline parser.")
             use_local = True
-            
+
     if use_local:
         # Standard local backup parser for simple keywords
         m = message.lower()
@@ -2857,14 +3313,17 @@ def delivery_send():
                 } for t in tasks
             ]
         }
-        server.start_shopping_list_workflow(tasks)
+
+        # In the AprilTag hand-off design the nav teammate + orchestrator drive
+        # the mission, so web_server does NOT run its own navigation. Only the
+        # legacy/standalone path (external_nav false) navigates here.
+        if not getattr(server, 'external_nav', True):
+            server.start_shopping_list_workflow(tasks)
     else:
-        server.active_todo_list = {
-            "status": "idle",
-            "stores": []
-        }
-        
-    return jsonify({"reply": reply, "tasks": tasks})
+        tasks = []
+        server.active_todo_list = {"status": "idle", "stores": []}
+
+    return jsonify({"reply": reply, "counts": counts, "tasks": tasks})
 
 @app.route('/api/map_info')
 def api_map_info():

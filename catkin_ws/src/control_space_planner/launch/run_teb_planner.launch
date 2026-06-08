@@ -58,13 +58,13 @@
                 weight_kinematics_forward_drive: 5000.0 # Strongly penalize backing up to force pivoting
                 weight_kinematics_turning_radius: 0.01 # Extemely low penalty so it gladly pivots in tight spaces
                 weight_optimaltime: 2.0 # Slightly higher so the path is driven efficiently without micro-oscillations
-                max_vel_x: 0.05 # Halved from 0.10
-                max_vel_x_backwards: 0.0 # Halved from 0.05
-                max_vel_y: 0.0     # Sideways movement disabled for front-sensor setup
-                max_vel_theta: 0.25 # Halved from 0.25
+                max_vel_x: 0.07 # Halved from 0.10
+                max_vel_x_backwards: 0.035 # Halved from 0.05
+                max_vel_y: 0.01     # Sideways movement disabled for front-sensor setup
+                max_vel_theta: 0.20 # Halved from 0.25
                 acc_lim_x: 0.1 # Halved from 0.2
-                acc_lim_y: 0.0     # Sideways movement disabled
-                acc_lim_theta: 0.2 # Halved from 0.4
+                acc_lim_y: 0.01     # Sideways movement disabled
+                acc_lim_theta: 0.05 # Halved from 0.4
                 min_turning_radius: 0.0
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  

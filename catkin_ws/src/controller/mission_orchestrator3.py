@@ -50,6 +50,7 @@ Counting rule
 
 import os
 import re
+import math
 import json
 import threading
 
@@ -80,14 +81,23 @@ ITEM_TO_YOLO_CLASS = {
 # NOTE: not finalized — adjust before the competition. Strings are compared
 # case-insensitively against the yaml 'store_type' values.
 ITEM_SHOP_CONSTRAINTS = {
-    "drug":      ["Pharmacy, Convenience Store"],
-    "hamburger": ["Hamburger, Convenience Store"],
+    "drug":      ["Pharmacy", "Convenience Store"],
+    "hamburger": ["Hamburger", "Convenience Store"],
     "iceCoffee": ["Cafe", "Convenience Store"],
-    "mug":       ["Cafe, Convenience Store"],
+    "mug":       ["Cafe", "Convenience Store"],
 }
 
 # The store_type that represents the final drop-off in signboards.yaml.
 PICKUP_STORE_TYPE = "Pickup Point"
+
+# Optional explicit pickup-zone coordinate (map frame), behind stores 5/7.
+# If None, the robot just navigates to a Pickup-Point signboard (apriltag only).
+# Set e.g. [0.0, 1.9] once the exact drop-off point is known.
+PICKUP_LOCATION = None
+
+# How far (m) in front of a store the robot parks before picking. The robot
+# approaches from the corridor side (away from the wall) and faces the store.
+STORE_APPROACH_DIST = 0.60
 
 # ── Timing / tolerances ─────────────────────────────────────────────────────
 PRESENCE_TIMEOUT   = 6.0    # s to wait for grab-YOLO to confirm an item is here
@@ -128,18 +138,28 @@ class MissionOrchestrator(object):
         # Dispatch bookkeeping
         self._current_sb        = None    # signboard # we last sent
         self._current_storetypes = []     # store_types at that signboard
+        self._current_target    = None    # {sb, location, corridor_yaw, store_type}
         self._tried_signboards  = set()   # signboards already serviced this mission
+        self._tried_stores      = set()   # store locations already serviced
         self._busy              = False
 
         # Live signals
         self._target_visible = False
         self._pick_cycles    = 0
 
+        # Counting policy: decrement on each completed pick (the "picked up
+        # object" heartbeat). If True, ALSO require the grab target to vanish
+        # afterward as confirmation (more strict, but can stall counting if the
+        # YOLO keeps seeing it). Default False so a successful pick always counts.
+        self.require_disappear = rospy.get_param("~require_disappear", False)
+
         # ── Load the arena map (signboards.yaml) ─────────────────────────────
         self._load_signboards()
 
         # ── Publishers ──────────────────────────────────────────────────────
         self.pub_goto  = rospy.Publisher(self.goto_topic,     Int32,  queue_size=1, latch=True)
+        # Rich goto for web_server (Plan B): signboard + store location + heading.
+        self.pub_goto_rich = rospy.Publisher("/mission/goto", String, queue_size=1, latch=True)
         self.pub_info  = rospy.Publisher("/mission/goto_info", String, queue_size=1, latch=True)
         self.pub_fin   = rospy.Publisher(self.finished_topic, Bool,   queue_size=1, latch=True)
         self.pub_grab  = rospy.Publisher("/yolo_grab/activate", Bool,   queue_size=1, latch=True)
@@ -174,9 +194,14 @@ class MissionOrchestrator(object):
             candidates.append(os.path.join(pkg, "signboards.yaml"))
         except Exception:
             pass
+        try:
+            pkg = rospkg.RosPack().get_path("controller")
+            candidates.append(os.path.join(pkg, "signboards_cheet.yaml"))
+        except Exception:
+            pass
         candidates += [
+            "/home/ee478_team1/catkin_ws/src/MDR_Project/catkin_ws/src/controller/signboards_cheet.yaml",
             "/home/ee478_team1/catkin_ws/src/MDR_Project/catkin_ws/src/controller/signboards.yaml",
-            "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/signboards.yaml",
         ]
 
         cfg = None
@@ -188,9 +213,19 @@ class MissionOrchestrator(object):
                 used = p
                 break
 
-        # signboard# -> [store_type, ...]   and   store_type(lower) -> [signboard#, ...]
+        import math
+        _DIRO = {"up": 0.0, "left": 90.0, "right": -90.0, "down": 180.0}
+
+        # signboard# -> (x, y)
+        self.signboard_xy = {}
+        # signboard# -> [store_type, ...]
         self.signboard_storetypes = {}
+        # store_type(lower) -> [signboard#, ...]   (kept for compatibility)
         self.storetype_signboards = {}
+        # store_type(lower) -> [ {sb, location:[x,y]|None, corridor_yaw_deg}, ... ]
+        # This is the Plan-B routing table: each "target" carries the actual
+        # store location and the heading from the signboard toward the store.
+        self.storetype_targets = {}
 
         if not cfg:
             rospy.logwarn("[orchestrator] signboards.yaml not found — dispatch will be empty!")
@@ -201,19 +236,38 @@ class MissionOrchestrator(object):
             if not m:
                 continue
             sb = int(m.group(1))
+            # signboard heading psi (deg) and position from the tag field
+            psi = 0.0
+            if isinstance(body, dict) and isinstance(body.get("tag"), (list, tuple)) and len(body["tag"]) >= 6:
+                try:
+                    psi = float(body["tag"][5])
+                    self.signboard_xy[sb] = (float(body["tag"][2]), float(body["tag"][3]))
+                except (ValueError, TypeError):
+                    psi = 0.0
             # Support both {stores: {id: {...}}} and {id: {...}} layouts.
             stores = body.get("stores", body) if isinstance(body, dict) else {}
             for _id, data in stores.items():
                 if not isinstance(data, dict) or "store_type" not in data:
                     continue
                 st = str(data["store_type"]).strip()
+                key = st.lower()
+                direction = str(data.get("direction", "Up")).strip().lower()
+                corridor_yaw = (psi + _DIRO.get(direction, 0.0)) % 360.0
+                loc = data.get("location", None)
+                if isinstance(loc, (list, tuple)) and len(loc) >= 2:
+                    loc = [float(loc[0]), float(loc[1])]
+                else:
+                    loc = None
+
                 self.signboard_storetypes.setdefault(sb, [])
                 if st not in self.signboard_storetypes[sb]:
                     self.signboard_storetypes[sb].append(st)
-                key = st.lower()
                 self.storetype_signboards.setdefault(key, [])
                 if sb not in self.storetype_signboards[key]:
                     self.storetype_signboards[key].append(sb)
+                self.storetype_targets.setdefault(key, []).append({
+                    "sb": sb, "location": loc, "corridor_yaw": corridor_yaw,
+                })
 
         rospy.loginfo(f"[orchestrator] Loaded signboards from {used}: "
                       f"{len(self.signboard_storetypes)} boards, "
@@ -272,6 +326,7 @@ class MissionOrchestrator(object):
             self.remaining    = {k: int(counts.get(k, 0)) for k in ITEM_TYPES}
             self.picked_total = 0
             self._tried_signboards = set()
+            self._tried_stores = set()
         rospy.loginfo(f"[orchestrator] New mission. Need: {self.remaining}")
         self.pub_fin.publish(Bool(False))
         self._dispatch_next()
@@ -305,74 +360,116 @@ class MissionOrchestrator(object):
     # ── Dispatch: choose and send the next signboard
     # ─────────────────────────────────────────────────────────────────────────
     def _dispatch_next(self):
-        """Pick the next signboard that can supply a still-needed item and send
-        it to the nav teammate. If nothing is left, send the pickup zone."""
+        """Pick the next store that can supply a still-needed item and send the
+        nav command (signboard + store location). If nothing is left, pickup."""
         if self._total_remaining() == 0:
             self._dispatch_pickup()
             return
 
-        choice = self._choose_signboard()
+        choice = self._choose_target()
         if choice is None:
-            rospy.logwarn("[orchestrator] No signboard left for the remaining items "
+            rospy.logwarn("[orchestrator] No store left for the remaining items "
                           f"{self.remaining}. Heading to pickup anyway.")
             self._dispatch_pickup()
             return
 
-        sb, storetypes = choice
-        self._current_sb = sb
-        self._current_storetypes = storetypes
+        store_type, tgt = choice
+        self._current_target = dict(tgt, store_type=store_type)
+        self._current_sb = tgt["sb"]
+        self._current_storetypes = [store_type]
         self._set_state(self.NAVIGATING)
 
-        # Grant control: publishing the signboard number == "go + you drive".
-        self.pub_goto.publish(Int32(data=sb))
-        self.pub_info.publish(String(data=json.dumps({
-            "signboard": sb, "store_types": storetypes})))
-        rospy.loginfo(f"[orchestrator] -> Sent signboard {sb} (stores: {storetypes}) "
-                      f"to nav. Remaining: {self.remaining}")
+        loc = tgt["location"]
+        goto = {
+            "signboard":        tgt["sb"],
+            "store_x":          loc[0],
+            "store_y":          loc[1],
+            "corridor_yaw_deg": tgt["corridor_yaw"],
+            "store_type":       store_type,
+            "approach_dist":    STORE_APPROACH_DIST,
+            "pickup":           False,
+        }
+        # Rich command (web_server drives both legs). Also publish the bare
+        # signboard number for the nav teammate's node (compatibility).
+        self.pub_goto_rich.publish(String(data=json.dumps(goto)))
+        self.pub_goto.publish(Int32(data=tgt["sb"]))
+        self.pub_info.publish(String(data=json.dumps(goto)))
+        rospy.loginfo(f"[orchestrator] -> GOTO signboard {tgt['sb']} then store "
+                      f"{store_type}@({loc[0]:.2f},{loc[1]:.2f}) "
+                      f"yaw={tgt['corridor_yaw']:.0f}°. Remaining: {self.remaining}")
 
-    def _choose_signboard(self):
-        """Return (signboard#, [store_types]) for the next needed item, skipping
-        signboards already serviced. Returns None if nothing is reachable."""
-        with self.lock:
-            remaining = dict(self.remaining)
+    def _choose_target(self):
+        """Return (store_type, target) for the next needed item — the nearest
+        un-serviced store of an allowed type. Target carries location + heading."""
         for item in ITEM_ORDER:
-            if remaining.get(item, 0) <= 0:
-                continue
+            with self.lock:
+                if self.remaining.get(item, 0) <= 0:
+                    continue
             for st in ITEM_SHOP_CONSTRAINTS.get(item, []):
-                for sb in self.storetype_signboards.get(st.lower(), []):
-                    if sb not in self._tried_signboards:
-                        return sb, self.signboard_storetypes.get(sb, [])
+                # Unique un-serviced stores of this type; for each store pick the
+                # signboard closest to it (shortest, safest approach leg).
+                best_per_store = {}
+                for tgt in self.storetype_targets.get(st.lower(), []):
+                    loc = tgt.get("location")
+                    if not loc:
+                        continue
+                    key = (round(loc[0], 2), round(loc[1], 2))
+                    if key in self._tried_stores:
+                        continue
+                    sbxy = self.signboard_xy.get(tgt["sb"])
+                    d = (math.hypot(sbxy[0] - loc[0], sbxy[1] - loc[1])
+                         if sbxy else 0.0)
+                    if key not in best_per_store or d < best_per_store[key][0]:
+                        best_per_store[key] = (d, tgt)
+                if best_per_store:
+                    # nearest store overall (by signboard-store leg length)
+                    _, tgt = min(best_per_store.values(), key=lambda v: v[0])
+                    return st, tgt
         return None
 
     def _dispatch_pickup(self):
-        """Send a Pickup-Point signboard and raise the finish flag."""
-        sbs = self.storetype_signboards.get(PICKUP_STORE_TYPE.lower(), [])
+        """Send the pickup zone and raise the finish flag."""
         self._set_state(self.GO_TO_PICKUP)
         self.pub_fin.publish(Bool(True))          # finish flag
-        if not sbs:
+
+        targets = self.storetype_targets.get(PICKUP_STORE_TYPE.lower(), [])
+        if not targets and PICKUP_LOCATION is None:
             rospy.logwarn("[orchestrator] No Pickup Point in signboards.yaml!")
             self._publish_state()
             return
-        sb = sbs[0]
+        tgt = targets[0] if targets else {"sb": 0, "corridor_yaw": 0.0}
+        sb = tgt["sb"]
         self._current_sb = sb
+        loc = PICKUP_LOCATION  # may be None -> web_server does apriltag-only leg
+        goto = {
+            "signboard":        sb,
+            "store_x":          (loc[0] if loc else None),
+            "store_y":          (loc[1] if loc else None),
+            "corridor_yaw_deg": tgt.get("corridor_yaw", 0.0),
+            "store_type":       PICKUP_STORE_TYPE,
+            "approach_dist":    STORE_APPROACH_DIST,
+            "pickup":           True,
+        }
+        self.pub_goto_rich.publish(String(data=json.dumps(goto)))
         self.pub_goto.publish(Int32(data=sb))
-        self.pub_info.publish(String(data=json.dumps({
-            "signboard": sb, "store_types": [PICKUP_STORE_TYPE]})))
-        rospy.loginfo(f"[orchestrator] All items collected. -> Sent pickup signboard "
-                      f"{sb} and set finish flag.")
+        self.pub_info.publish(String(data=json.dumps(goto)))
+        rospy.loginfo(f"[orchestrator] All items collected. -> Sent pickup "
+                      f"(signboard {sb}) and set finish flag.")
 
     # ─────────────────────────────────────────────────────────────────────────
     # ── Service a shop (we have control)
     # ─────────────────────────────────────────────────────────────────────────
     def _service_current_shop(self):
         self._busy = True
+        tgt = self._current_target or {}
         sb = self._current_sb
-        storetypes = list(self._current_storetypes)
+        store_type = tgt.get("store_type", "")
+        storetypes = [store_type] if store_type else list(self._current_storetypes)
         self._set_state(self.PICKING)
-        rospy.loginfo(f"[orchestrator] === At signboard {sb} (stores: {storetypes}) ===")
+        rospy.loginfo(f"[orchestrator] === At {store_type} store (signboard {sb}) ===")
         try:
             self._grab_on()
-            # Which still-needed items are allowed at this signboard's store types?
+            # Which still-needed items are sold at this store's type?
             candidates = self._candidates_for(storetypes)
             if not candidates:
                 rospy.loginfo(f"[orchestrator] No needed item belongs at {storetypes}.")
@@ -385,11 +482,14 @@ class MissionOrchestrator(object):
             rospy.logerr(f"[orchestrator] Error servicing signboard {sb}: {e}")
         finally:
             self._grab_off()
-            self._tried_signboards.add(sb)     # don't revisit this signboard
+            self._tried_signboards.add(sb)
+            loc = tgt.get("location")
+            if loc:
+                self._tried_stores.add((round(loc[0], 2), round(loc[1], 2)))
             self._busy = False
             rospy.loginfo(f"[orchestrator] === Done at signboard {sb}. "
                           f"Remaining: {self.remaining} ===")
-            # Hand the next signboard (or pickup) back to the nav teammate.
+            # Dispatch the next store (or pickup).
             self._dispatch_next()
 
     def _candidates_for(self, storetypes):
@@ -421,24 +521,29 @@ class MissionOrchestrator(object):
                 rospy.loginfo(f"[orchestrator] '{item}' not visible at signboard {sb}.")
                 break
 
-            # Step 6: arm picks autonomously; wait for one full cycle.
+            # Step 6: arm picks autonomously; wait for one full cycle (the
+            # pick_arm "picked up object" heartbeat marks completion).
             if not self._wait_one_pick_cycle(PICK_CYCLE_TIMEOUT):
-                rospy.logwarn(f"[orchestrator] Pick cycle timed out for '{item}'.")
+                rospy.logwarn(f"[orchestrator] Pick cycle timed out for '{item}' "
+                              f"(no 'picked up object' heartbeat).")
                 break
 
-            # Step 6/7: after backing up, if it disappeared, count it.
+            # Step 6/7: COUNT the pick. By default a completed pick always counts;
+            # only require disappearance when require_disappear is set.
             rospy.sleep(SETTLE_AFTER_PICK)
-            if self._confirm_disappeared(DISAPPEAR_CONFIRM):
+            counted = True
+            if self.require_disappear and not self._confirm_disappeared(DISAPPEAR_CONFIRM):
+                counted = False
+                rospy.logwarn(f"[orchestrator] '{item}' still visible after pick "
+                              f"(require_disappear) -> not counting, retrying.")
+            if counted:
                 with self.lock:
                     self.remaining[item] -= 1
                     self.picked_total   += 1
                 picked += 1
-                rospy.loginfo(f"[orchestrator] '{item}' picked & gone. "
+                rospy.loginfo(f"[orchestrator] COUNTED '{item}'. "
                               f"Remaining[{item}]={self.remaining[item]}")
                 self._publish_state()
-            else:
-                rospy.logwarn(f"[orchestrator] '{item}' still visible after pick "
-                              f"-> grasp likely failed, retrying.")
         return picked
 
     # ─────────────────────────────────────────────────────────────────────────

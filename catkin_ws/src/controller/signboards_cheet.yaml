@@ -1,0 +1,179 @@
+##### TAG DEFINITION OF ENVIRONMENT #####
+# tag: [NAME, SIZE(m), X(m), Y(m), Z(m), psi(Deg)]
+# stores: id -> {store_type, direction, location:[x,y] (map frame; null for Pickup Point)}
+
+SIGNBOARD01:
+  tag: ["SIGNBOARD01", 0.020, -2.00, -2.135, 0.365, 270.0]
+  stores:
+    1:
+      store_type: "Convenience Store"
+      direction: "Left"
+      location: [-1.00, -1.65]
+
+SIGNBOARD02:
+  tag: ["SIGNBOARD02", 0.020, -2.00, 0.635, 0.365, 090.0]
+  stores:
+    2:
+      store_type: "Pickup Point"
+      direction: "Up"
+      location: null
+    3:
+      store_type: "Convenience Store"
+      direction: "Right"
+      location: [-1.00, 1.50]
+
+SIGNBOARD03:
+  tag: ["SIGNBOARD03", 0.020, -2.00, 0.865, 0.365, 270.0]
+  stores:
+    4:
+      store_type: "Convenience Store"
+      direction: "Left"
+      location: [-1.00, 1.50]
+    5:
+      store_type: "Hamburger"
+      direction: "Up"
+      location: [-1.25, -1.15]
+
+SIGNBOARD04:
+  tag: ["SIGNBOARD04", 0.020, -1.88, -2.250, 0.365, 180.0]
+  stores:
+    6:
+      store_type: "Hamburger"
+      direction: "Right"
+      location: [-1.25, -1.15]
+
+SIGNBOARD05:
+  tag: ["SIGNBOARD05", 0.020, -1.88, 0.750, 0.365, 180.0]
+  stores:
+    7:
+      store_type: "Hamburger"
+      direction: "Left"
+      location: [-1.25, -1.15]
+    8:
+      store_type: "Pickup Point"
+      direction: "Right"
+      location: null
+
+SIGNBOARD06:
+  tag: ["SIGNBOARD06", 0.020, -0.12, -2.250, 0.365, 000.0]
+  stores:
+    9:
+      store_type: "Pharmacy"
+      direction: "Left"
+      location: [0.75, -1.20]
+    10:
+      store_type: "Cafe"
+      direction: "Up"
+      location: [1.00, -1.65]
+
+SIGNBOARD07:
+  tag: ["SIGNBOARD07", 0.020, -0.12, 0.750, 0.365, 000.0]
+  stores:
+    11:
+      store_type: "Pharmacy"
+      direction: "Up"
+      location: [1.00, 1.50]
+    12:
+      store_type: "Cafe"
+      direction: "Right"
+      location: [-0.75, -0.85]
+
+SIGNBOARD08:
+  tag: ["SIGNBOARD08", 0.020, 0.00, -2.135, 0.365, 270.0]
+  stores:
+    13:
+      store_type: "Cafe"
+      direction: "Left"
+      location: [1.00, -1.65]
+    14:
+      store_type: "Convenience Store"
+      direction: "Right"
+      location: [-1.00, -1.65]
+
+SIGNBOARD09:
+  tag: ["SIGNBOARD09", 0.020, 0.00, 0.635, 0.365, 090.0]
+  stores:
+    15:
+      store_type: "Convenience Store"
+      direction: "Left"
+      location: [-1.00, 1.50]
+    16:
+      store_type: "Pharmacy"
+      direction: "Right"
+      location: [1.00, 1.50]
+
+SIGNBOARD10:
+  tag: ["SIGNBOARD10", 0.020, 0.12, -2.250, 0.365, 180.0]
+  stores:
+    17:
+      store_type: "Convenience Store"
+      direction: "Up"
+      location: [-1.00, -1.65]
+    18:
+      store_type: "Pharmacy"
+      direction: "Right"
+      location: [0.75, -1.20]
+
+SIGNBOARD11:
+  tag: ["SIGNBOARD11", 0.020, 0.12, 0.750, 0.365, 180.0]
+  stores:
+    19:
+      store_type: "Cafe"
+      direction: "Left"
+      location: [-0.75, -0.85]
+    20:
+      store_type: "Convenience Store"
+      direction: "Up"
+      location: [-1.00, 1.50]
+
+SIGNBOARD12:
+  tag: ["SIGNBOARD12", 0.020, 1.88, -2.250, 0.365, 000.0]
+  stores:
+    21:
+      store_type: "Hamburger"
+      direction: "Left"
+      location: [1.25, -0.85]
+
+SIGNBOARD13:
+  tag: ["SIGNBOARD13", 0.020, 1.88, 0.750, 0.365, 000.0]
+  stores:
+    22:
+      store_type: "Pickup Point"
+      direction: "Left"
+      location: null
+    23:
+      store_type: "Hamburger"
+      direction: "Right"
+      location: [1.25, -0.85]
+
+SIGNBOARD14:
+  tag: ["SIGNBOARD14", 0.020, 2.00, -2.135, 0.365, 270.0]
+  stores:
+    24:
+      store_type: "Cafe"
+      direction: "Right"
+      location: [1.00, -1.65]
+
+SIGNBOARD15:
+  tag: ["SIGNBOARD15", 0.020, 2.00, 0.635, 0.365, 090.0]
+  stores:
+    25:
+      store_type: "Pharmacy"
+      direction: "Left"
+      location: [1.00, 1.50]
+    26:
+      store_type: "Pickup Point"
+      direction: "Up"
+      location: null
+
+SIGNBOARD16:
+  tag: ["SIGNBOARD16", 0.020, 2.00, 0.865, 0.365, 270.0]
+  stores:
+    27:
+      store_type: "Hamburger"
+      direction: "Up"
+      location: [1.25, -0.85]
+    28:
+      store_type: "Pharmacy"
+      direction: "Right"
+      location: [1.00, 1.50]

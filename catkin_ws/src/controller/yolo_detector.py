@@ -312,6 +312,22 @@ if __name__ == '__main__':
     # Activation gate (controlled by orchestrator)
     rospy.Subscriber('/yolo_grab/activate', Bool, activate_cb)
 
+    # ── GPU warm-up ──────────────────────────────────────────────────────────
+    # The model is already resident on the GPU (loaded at import). Run ONE dummy
+    # inference now so the CUDA context, cuDNN/TensorRT kernels and workspace are
+    # built up-front — otherwise the first real frame after activation stalls for
+    # seconds. After this the node sits IDLE: sync_callback returns at the
+    # activation gate (before any cv_bridge conversion or inference) while
+    # _active is False, so it consumes effectively no CPU/GPU until the
+    # orchestrator flips /yolo_grab/activate to True.
+    try:
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        model(dummy, conf=CONF_THRESH, device=0, verbose=False)
+        rospy.loginfo("[yolo_detector] GPU warm-up complete — model resident on "
+                      "GPU, node IDLE until /yolo_grab/activate is True.")
+    except Exception as e:
+        rospy.logwarn(f"[yolo_detector] GPU warm-up failed (continuing): {e}")
+
     # RGB + Depth 동기화 구독
     color_sub = message_filters.Subscriber('/camera/color/image_raw', Image)
     depth_sub = message_filters.Subscriber(

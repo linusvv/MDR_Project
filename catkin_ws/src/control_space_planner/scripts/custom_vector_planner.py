@@ -24,9 +24,9 @@ class CustomVectorPlanner:
         self.ARRIVAL_THRES = 0.4   # meters
         
         # Max velocity limits
-        self.MAX_VEL_X = 0.8
-        self.MAX_VEL_Y = 0.4
-        self.MAX_VEL_W = 2.0
+        self.MAX_VEL_X = 0.4
+        self.MAX_VEL_Y = 0.2
+        self.MAX_VEL_W = 1.0
 
         # State variables
         self.ego_x = 0.0
@@ -38,10 +38,18 @@ class CustomVectorPlanner:
         self.last_closest_idx = 0
         self.was_active = False
 
+        # Parameter caching fields
+        self.param_check_count = 0
+        self.cached_planner_type = "control_space"
+        self.cached_is_paused = False
+        self.cached_state = "IDLE"
+        self.cached_max_vel = 0.03
+        self.cached_max_omega = 0.15
+
         # Subscribers
-        rospy.Subscriber("/map/local_map/obstacle", OccupancyGrid, self.cb_occupancy_grid)
-        rospy.Subscriber("/map_odom", Odometry, self.cb_ego_odom)
-        rospy.Subscriber("/graph_planner/path/global_path", Path, self.cb_global_path)
+        rospy.Subscriber("/map/local_map/obstacle", OccupancyGrid, self.cb_occupancy_grid, queue_size=1)
+        rospy.Subscriber("/map_odom", Odometry, self.cb_ego_odom, queue_size=1)
+        rospy.Subscriber("/graph_planner/path/global_path", Path, self.cb_global_path, queue_size=1)
 
         # Publishers
         self.pubCommand = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
@@ -87,8 +95,17 @@ class CustomVectorPlanner:
         self.pubSelectedMotion.publish(pc_msg)
 
     def plan(self):
+        # Throttle parameter queries (run at 50Hz, query at 5Hz)
+        self.param_check_count += 1
+        if self.param_check_count % 10 == 0 or self.param_check_count <= 1:
+            self.cached_planner_type = rospy.get_param("/local_planner_type", "control_space")
+            self.cached_is_paused = rospy.get_param("/exploration_paused", False)
+            self.cached_state = rospy.get_param("/exploration_state", "IDLE")
+            self.cached_max_vel = rospy.get_param("/robot/max_vel", 0.06)
+            self.cached_max_omega = rospy.get_param("/robot/max_vel_theta", 0.3)
+
         # 1. Gate parameter check
-        planner_type = rospy.get_param("/local_planner_type", "control_space")
+        planner_type = self.cached_planner_type
         if planner_type != "custom_vector":
             if self.was_active:
                 # Stop the robot on transition
@@ -98,13 +115,14 @@ class CustomVectorPlanner:
             return
         
         # Check emergency stop condition
-        is_paused = rospy.get_param("/exploration_paused", False)
-        state = rospy.get_param("/exploration_state", "IDLE")
+        is_paused = self.cached_is_paused
+        state = self.cached_state
         if is_paused or state in ["IDLE", "STOP", "RECOVERY"]:
-            if self.global_path:
+            if self.was_active or self.global_path:
                 cmd = Twist()
                 self.pubCommand.publish(cmd)
                 self.global_path = []
+                self.was_active = False
             return
 
         self.was_active = True
@@ -176,7 +194,28 @@ class CustomVectorPlanner:
         col_end = min(w, center_col + search_radius_cells + 1)
         row_start = max(0, center_row - search_radius_cells)
         row_end = min(h, center_row + search_radius_cells + 1)
-        
+        # Automatic Emergency Brake Check
+        min_obs_d = float('inf')
+        for r in range(row_start, row_end):
+            for c in range(col_start, col_end):
+                cost = self.local_map.data[r * w + c]
+                if cost >= 90:
+                    cx = origin_x + c * resol + 0.5 * resol
+                    cy = origin_y + r * resol + 0.5 * resol
+                    d = math.hypot(cx, cy)
+                    if d < min_obs_d:
+                        min_obs_d = d
+
+        if min_obs_d < 0.35:
+            rospy.logwarn(f"[custom_vector_planner] EMERGENCY BRAKE: Obstacle too close ({min_obs_d:.2f}m). Stopping robot!")
+            cmd = Twist()
+            self.pubCommand.publish(cmd)
+            rospy.set_param("/exploration_paused", True)
+            rospy.set_param("/exploration_state", "STOP")
+            self.global_path = []
+            self.was_active = False
+            return
+
         for r in range(row_start, row_end):
             for c in range(col_start, col_end):
                 cost = self.local_map.data[r * w + c]
@@ -224,8 +263,8 @@ class CustomVectorPlanner:
             cmd.angular.z = 2.0 * desired_local_yaw
         
         # Clamp controls using dynamic limits
-        max_vel = rospy.get_param("/robot/max_vel", 0.06)
-        max_omega = rospy.get_param("/robot/max_vel_theta", 0.3)
+        max_vel = self.cached_max_vel
+        max_omega = self.cached_max_omega
         self.MAX_VEL_X = max_vel
         self.MAX_VEL_Y = max_vel
         self.MAX_VEL_W = max_omega

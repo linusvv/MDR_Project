@@ -92,6 +92,8 @@ public:
                 pubCommand.publish(cmd_vel);
                 was_running_ = false;
             }
+            recovery_state_ = 0;
+            consecutive_failures_ = 0;
             return;
         }
         
@@ -146,14 +148,19 @@ public:
 
         geometry_msgs::Twist cmd_vel;
 
-        // 1. Obstacle too close crash-avoidance override
-        // If an obstacle is closer than 0.32m (2cm from physical footprint edge of 0.30m), override with backing up slowly
-        if (min_obstacle_dist < 0.32) {
-            ROS_WARN_THROTTLE(0.5, "OBSTACLE TOO CLOSE (%.2fm). Backing up slowly to avoid crash...", min_obstacle_dist);
-            cmd_vel.linear.x = -0.03; // Back up at 3 cm/s
+        // 1. Obstacle too close crash-avoidance override / Emergency Brake
+        // If an obstacle is closer than 0.35m (5cm from physical footprint edge of 0.30m), trigger automatic emergency stop
+        if (min_obstacle_dist < 0.35) {
+            ROS_WARN_THROTTLE(0.5, "EMERGENCY BRAKE: Obstacle too close (%.2fm). Stopping robot!", min_obstacle_dist);
+            cmd_vel.linear.x = 0.0;
             cmd_vel.linear.y = 0.0;
             cmd_vel.angular.z = 0.0;
             pubCommand.publish(cmd_vel);
+
+            // Trigger global emergency stop
+            nh_.setParam("/exploration_paused", true);
+            nh_.setParam("/exploration_state", "STOP");
+
             consecutive_failures_ = 0;
             recovery_state_ = 0;
             return;

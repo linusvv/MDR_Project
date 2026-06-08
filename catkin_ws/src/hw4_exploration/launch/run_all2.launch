@@ -1,0 +1,165 @@
+<launch>
+    <arg name="use_rviz" default="false"/>
+    <arg name="sim" default="false"/>
+
+    <!-- 0. Tag Pose Injector logic has been moved into map_odom_publisher.py for smooth TF alignment -->
+
+    <!-- ==================== SIMULATION SPECIFIC SETUP ==================== -->
+    <group if="$(arg sim)">
+        <!-- 1. Start Gazebo simulation with mecanum robot -->
+        <include file="$(find nexus_4wd_mecanum_gazebo)/launch/nexus_4wd_mecanum_world.launch" />
+
+        <!-- 2. Start AprilTag Localization for global pose correction -->
+        <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
+            <arg name="tag_file_name" value="2025/re540_simulation" />
+            <arg name="camera_name" value="/camera/color" />
+            <arg name="image_topic" value="image_raw_throttle" />
+            <arg name="world_frame_name" value="map" />
+            <arg name="camera_frame_name" value="camera_link" />
+            <arg name="image_frame_name" value="camera_color_optical_frame" />
+            <arg name="with_visualization" value="false" />
+            <arg name="with_realsense_tf" value="false" />
+            <arg name="broadcast_world2cam_tf" value="false" />
+        </include>
+
+        <!-- 3. Start RTAB-Map SLAM (Configured to use stable Wheel Odometry) -->
+        <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2500 --Kp/MaxFeatures 2500 --Rtabmap/LoopThr 0.11 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
+            <arg name="rgb_topic" value="/camera/color/image_raw"/>
+            <arg name="depth_topic" value="/camera/depth/image_raw"/>
+            <arg name="camera_info_topic" value="/camera/color/camera_info"/>
+            <arg name="depth_camera_info_topic" value="/camera/depth/camera_info"/>
+            <arg name="frame_id" value="base_footprint"/>
+            <arg name="odom_topic" value="/odom"/>
+            <arg name="visual_odometry" value="false"/>
+            <arg name="icp_odometry" value="false"/>
+            <arg name="publish_tf_odom" value="false"/>
+            <arg name="vo_frame_id" value="odom"/>
+            <arg name="subscribe_scan" value="false"/>
+            <arg name="approx_sync" value="true"/>
+            <arg name="rviz" value="false"/>
+            <arg name="rtabmap_viz" value="false"/>
+            <arg name="map_frame_id" value="rtabmap_map"/>
+        </include>
+    </group>
+
+    <!-- ==================== REAL ROBOT SPECIFIC SETUP ==================== -->
+    <group unless="$(arg sim)">
+        <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" />
+        <remap from="/camera/aligned_depth_to_color/image_raw_throttle" to="/camera/aligned_depth_to_color/image_raw" />
+
+        <!-- 1. Check if 3D camera is running, start it if not -->
+        <node name="camera_checker" pkg="hw4_exploration" type="camera_checker.py" output="screen" />
+
+        <!-- 1.5 Convert depth image to point cloud for local costmap -->
+        <node pkg="nodelet" type="nodelet" name="depth_image_proc_manager" args="manager" output="screen" />
+        <node pkg="nodelet" type="nodelet" name="depth_to_pointcloud" args="load depth_image_proc/point_cloud_xyz depth_image_proc_manager" output="screen">
+            <remap from="camera_info" to="/camera/color/camera_info" />
+            <remap from="image_rect" to="/camera/aligned_depth_to_color/image_raw_throttle" />
+            <remap from="points" to="/camera/depth/points" />
+        </node>
+
+        <!-- 1.6 Load the robot URDF and start robot_state_publisher for TF static transforms -->
+        <param name="robot_description" command="$(find xacro)/xacro '$(find nexus_4wd_mecanum_description)/urdf/nexus_4wd_mecanum.xacro'" />
+        <node name="robot_state_publisher" pkg="robot_state_publisher" type="robot_state_publisher" />
+
+        <!-- 1.7 Start cmd_vel to chassis_control velocity bridge -->
+        <node name="cmd_vel_to_chassis" pkg="hw4_exploration" type="cmd_vel_to_chassis.py" output="screen" />
+
+        <!-- 2. Start AprilTag Localization (Real room tag list) -->
+        <include file="$(find apriltag_localization)/launch/apriltag_localization.launch">
+            <arg name="tag_file_name" value="2026/ee478_n1_room113" />
+            <arg name="camera_name" value="/camera/color" />
+            <arg name="image_topic" value="image_raw_throttle" />
+            <arg name="world_frame_name" value="map" />
+            <arg name="camera_frame_name" value="camera_link" />
+            <arg name="image_frame_name" value="camera_color_optical_frame" />
+            <arg name="with_visualization" value="false" />
+            <arg name="with_realsense_tf" value="false" />
+            <arg name="broadcast_world2cam_tf" value="false" />
+        </include>
+
+        <!-- 3. Start RTAB-Map SLAM (Configured for Visual Odometry) -->
+        <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
+            <arg name="rgb_topic" value="/camera/color/image_raw_throttle"/>
+            <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw_throttle"/>
+            <arg name="camera_info_topic" value="/camera/color/camera_info"/>
+            <arg name="depth_camera_info_topic" value="/camera/color/camera_info"/>
+            <arg name="frame_id" value="base_footprint"/>
+            <arg name="odom_topic" value="/odom"/>
+            <arg name="visual_odometry" value="true"/>
+            <arg name="icp_odometry" value="false"/>
+            <arg name="publish_tf_odom" value="true"/>
+            <arg name="vo_frame_id" value="odom"/>
+            <arg name="subscribe_scan" value="false"/>
+            <arg name="approx_sync" value="true"/>
+            <arg name="rviz" value="false"/>
+            <arg name="rtabmap_viz" value="false"/>
+            <arg name="odom_args" value="--Odom/ResetCountdown 2 --Vis/MaxFeatures 600 --Vis/MinInliers 10 --OdomF2M/MaxSize 1000 --Odom/KeyFrameThr 0.6"/>
+            <arg name="map_frame_id" value="rtabmap_map"/>
+        </include>
+    </group>
+
+    <!-- ==================== COMMON SETUP ==================== -->
+
+    <!-- 2. Start local costmap generator -->
+    <include file="$(find local_costmap_generator)/launch/run.launch" />
+
+    <!-- 3.7 Start the Map Odom Publisher -->
+    <node name="map_odom_publisher" pkg="hw4_exploration" type="map_odom_publisher.py" output="screen" />
+
+    <!-- 5. Start the existing Python Motion Primitives Planner -->
+    <include file="$(find control_space_planner)/launch/run.launch" />
+
+    <!-- 6. Start LLM Client Node (Crash-free Startup) -->
+    <node name="simple_llm_client" pkg="gpt_llm_client" type="simple_llm_client.py" output="screen" />
+    
+    <!-- 7. Start Vision Perception Services -->
+    <node name="vision_perception_node" pkg="hw4_exploration" type="vision_perception_node.py" output="screen">
+        <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" unless="$(arg sim)" />
+    </node>
+    
+    <!-- 8. Start Store Coordinator (Map Anchor Points) -->
+    <node name="store_coordinator_node" pkg="hw4_exploration" type="store_coordinator_node.py" output="screen" />
+    
+    <!-- 9. Start AprilTag Visualizer -->
+    <node name="tag_visualizer" pkg="hw4_exploration" type="tag_visualizer.py" output="screen" />
+
+    <!-- 10. Start the Robot Web UI Server -->
+    <node name="robot_web_ui_server" pkg="robot_web_ui" type="web_server_node2.py" output="screen" respawn="true">
+        <param name="depth_topic" value="/camera/depth/image_raw" if="$(arg sim)" />
+        <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
+        <param name="enable_camera_viz" value="false" />
+        <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" unless="$(arg sim)" />
+        <remap from="/camera/aligned_depth_to_color/image_raw_throttle" to="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
+    </node>
+
+    <!-- ==================== PICK & DELIVERY PIPELINE ==================== -->
+    <!-- NOTE: set pkg="..." below to the package that actually contains these
+         scripts (the arm/grab package). They are kept running idle from start. -->
+    <arg name="pick_pkg" default="controller"/>
+
+    <!-- 10.1 Grab YOLO detector — loads model on GPU, then idles until the
+              orchestrator activates /yolo_grab/activate. -->
+    <node name="yolo_detector" pkg="$(arg pick_pkg)" type="yolo_detector.py" output="screen" respawn="true" />
+
+    <!-- 10.2 Pick arm node — stays up, picks whatever /yolo/arm_point reports. -->
+    <node name="pick_arm_node" pkg="$(arg pick_pkg)" type="pick_arm_node.py" output="screen" respawn="true" />
+
+    <!-- 10.3 Mission Orchestrator — owns global state, switches nav<->grab YOLO,
+              runs the per-shop pick loop and counts items. -->
+    <node name="mission_orchestrator" pkg="$(arg pick_pkg)" type="mission_orchestrator.py" output="screen" respawn="true" />
+
+    <!-- 11. Start Web Video Server and Throttles for much faster UI streaming -->
+    <node name="web_video_server" pkg="web_video_server" type="web_video_server" output="screen">
+        <param name="port" value="8080" />
+    </node>
+    <!-- Throttle the camera streams to 5 Hz to save bandwidth (Simulation only, real robot camera runs at 6 Hz directly) -->
+    <node name="throttle_color" pkg="topic_tools" type="throttle" args="messages /camera/color/image_raw 5.0 /camera/color/image_raw_throttle" if="$(arg sim)" />
+    <node name="throttle_depth_sim" pkg="topic_tools" type="throttle" args="messages /camera/depth/image_raw 5.0 /camera/depth/image_raw_throttle" if="$(arg sim)" />
+
+    <group if="$(arg use_rviz)">
+        <node pkg="rviz" type="rviz" name="rviz_display" args="-d $(find hw4_exploration)/rviz/ee478_rtabmap.rviz" output="screen" />
+    </group>
+</launch>

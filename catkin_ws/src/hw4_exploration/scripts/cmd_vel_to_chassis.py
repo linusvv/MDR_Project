@@ -17,7 +17,7 @@ except ImportError:
             self.velocity_y = 0.0
 
 # How long (seconds) without a /cmd_vel message before sending a stop command
-CMD_VEL_TIMEOUT = 0.5
+CMD_VEL_TIMEOUT = 0.15
 
 class CmdVelToChassis:
     def __init__(self):
@@ -32,17 +32,17 @@ class CmdVelToChassis:
         self.current_vel_msg.angular = 0.0
         
         self.vel_pub = rospy.Publisher('/chassis_control/set_velocity', SetVelocity, queue_size=1)
-        self.sub = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_cb)
+        self.sub = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_cb, queue_size=1)
 
-        # Publish timer: fires at 60 Hz to send continuous commands to the motor controller
-        self.publish_timer = rospy.Timer(rospy.Duration(1.0 / 60.0), self.publish_cb)
+        # Watchdog timer: fires at 10 Hz to monitor timeout
+        self.publish_timer = rospy.Timer(rospy.Duration(1.0 / 10.0), self.publish_cb)
         
-        rospy.loginfo("[cmd_vel_to_chassis] Node started. Bridging /cmd_vel to /chassis_control/set_velocity at 60Hz (timeout=%.1fs)", CMD_VEL_TIMEOUT)
+        rospy.loginfo("[cmd_vel_to_chassis] Node started. Bridging /cmd_vel to /chassis_control/set_velocity on receive (timeout=%.1fs, watchdog=10Hz)", CMD_VEL_TIMEOUT)
 
     def cmd_vel_cb(self, msg):
         # Speed components with dynamic limit clamping
-        max_vel_m = rospy.get_param("/robot/max_vel", 0.06)
-        max_omega = rospy.get_param("/robot/max_vel_theta", 0.3)
+        max_vel_m = rospy.get_param("/robot/max_vel", 0.03)
+        max_omega = rospy.get_param("/robot/max_vel_theta", 0.15)
         
         linear_x = msg.linear.x
         linear_y = msg.linear.y
@@ -77,22 +77,20 @@ class CmdVelToChassis:
         self.last_cmd_time = rospy.Time.now()
         self.is_stopped = False
 
+        # Publish immediately on receipt
+        self.vel_pub.publish(self.current_vel_msg)
+
     def publish_cb(self, event):
-        """Continuously publish at 60Hz. Send zero-velocity if /cmd_vel has gone silent."""
+        """Watchdog: fires at 10Hz to stop the robot if /cmd_vel goes silent."""
         elapsed = (rospy.Time.now() - self.last_cmd_time).to_sec()
         
         if elapsed > CMD_VEL_TIMEOUT:
             if not self.is_stopped:
                 self.current_vel_msg.velocity = 0.0
-                self.current_vel_msg.direction = self.last_direction_deg
                 self.current_vel_msg.angular = 0.0
                 self.vel_pub.publish(self.current_vel_msg)
                 self.is_stopped = True
                 rospy.loginfo("[cmd_vel_to_chassis] Watchdog: no /cmd_vel for %.2fs — sending stop and idling.", elapsed)
-            return
-        
-        # Always publish the current command at 60Hz when active
-        self.vel_pub.publish(self.current_vel_msg)
 
 if __name__ == '__main__':
     try:

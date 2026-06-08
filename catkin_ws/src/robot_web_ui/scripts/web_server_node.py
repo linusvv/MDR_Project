@@ -88,9 +88,9 @@ class RobotWebServer:
         
         # Set default velocity bounds
         if not rospy.has_param("/robot/max_vel"):
-            rospy.set_param("/robot/max_vel", 0.20)
+            rospy.set_param("/robot/max_vel", 0.10)
         if not rospy.has_param("/robot/max_vel_theta"):
-            rospy.set_param("/robot/max_vel_theta", 0.80)
+            rospy.set_param("/robot/max_vel_theta", 0.40)
             
         self.lock = threading.Lock()
         self.tf_listener = tf.TransformListener()
@@ -277,8 +277,25 @@ class RobotWebServer:
             cv_image = self.bridge.imgmsg_to_cv2(msg, "bgr8")
             
             if self.enable_camera_viz:
-                # Draw AprilTags and YOLO overlays if we have camera info
+                # Run YOLO prediction outside the lock
+                now = time.time()
+                yolo_results = None
+                
+                # Retrieve parameters outside the lock to minimize contention
+                yolo_model = self.yolo_model
+                viz_yolo = self.viz_yolo
+                yolo_active = self._yolo_active
+                
+                if yolo_model is not None and viz_yolo and yolo_active:
+                    if now - self.last_yolo_viz_time > 0.5:
+                        yolo_results = yolo_model.predict(cv_image, conf=0.25, verbose=False, device='cuda')
+                
+                # Draw overlays and update state under the lock
                 with self.lock:
+                    if yolo_results is not None:
+                        self.last_yolo_viz_results = yolo_results
+                        self.last_yolo_viz_time = now
+                        
                     if self.camera_info is not None:
                         cv_image = self.draw_tags(cv_image)
                         
@@ -1551,23 +1568,16 @@ class RobotWebServer:
         dist_coeffs = np.zeros((4,1)) # Assume rectified image
         
         # --- Optimized YOLO Detections for Visualization ---
-        # Only run at ~2Hz to prevent web UI lag during intense robot tasks
-        now = time.time()
-        if self.yolo_model is not None and self.viz_yolo and self._yolo_active:
-            if now - self.last_yolo_viz_time > 0.5: # 2 FPS
-                # Lower confidence for visualization helps see distant/partial shops
-                self.last_yolo_viz_results = self.yolo_model.predict(img, conf=0.25, verbose=False, device='cuda')
-                self.last_yolo_viz_time = now
-                
-            for res in self.last_yolo_viz_results:
-                for box in res.boxes:
-                    x1, y1, x2, y2 = map(int, box.xyxy[0])
-                    cls = int(box.cls[0])
-                    label = res.names[cls]
-                    conf = float(box.conf[0])
-                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                    cv2.putText(img, f"{label} {conf:.2f}", (x1, y1 - 10), 
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        # Draw cached YOLO results (prediction was already done outside the lock)
+        for res in self.last_yolo_viz_results:
+            for box in res.boxes:
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+                cls = int(box.cls[0])
+                label = res.names[cls]
+                conf = float(box.conf[0])
+                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                cv2.putText(img, f"{label} {conf:.2f}", (x1, y1 - 10), 
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         
         def draw_single_tag(img, tag_id, size, rvec, tvec):
             if not self.viz_apriltag:
@@ -2091,7 +2101,7 @@ class RobotWebServer:
                     viz[raw_data == -1] = [5, 5, 5]
                     
                     # 2. Gradient space (0 < data < 100)
-                    mask_gradient = (raw_data > 0) & (raw_data < 100)
+                    mask_gradient = (raw_data > 0) & (raw_data < 100) & (raw_data != 95)
                     if np.any(mask_gradient):
                         occ_vals = raw_data[mask_gradient].astype(np.float32)
                         viz[mask_gradient, 2] = np.clip(occ_vals * 2.5, 0, 255).astype(np.uint8) # Red
@@ -2099,6 +2109,9 @@ class RobotWebServer:
                     
                     # 3. Solid walls (data >= 100) -> White
                     viz[raw_data >= 100] = [220, 220, 220]
+                    
+                    # 4. RTABMap points (data == 95) -> Magenta
+                    viz[raw_data == 95] = [255, 0, 255]
                     
                     # Draw motion primitives (all candidates in dim green)
                     for primitive in candidates:
@@ -2330,7 +2343,7 @@ def cmd_vel():
 @app.route('/api/set_max_vel', methods=['POST'])
 def set_max_vel():
     data = request.json or {}
-    max_vel = float(data.get('max_vel', 0.20))
+    max_vel = float(data.get('max_vel', 0.10))
     max_vel_theta = float(data.get('max_vel_theta', max_vel * 4.0))
     
     rospy.set_param("/robot/max_vel", max_vel)

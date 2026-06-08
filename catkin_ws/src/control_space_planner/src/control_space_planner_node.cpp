@@ -170,6 +170,8 @@ void MotionPlanner::PublishCommand(std::vector<Node> motionMinCost)
       if (motionMinCost[i].cost_colli >= 90 && !recovering) {
           ROS_WARN_THROTTLE(1, "EMERGENCY BRAKE: Wall proximity detected (Cost: %f)", motionMinCost[i].cost_colli);
           this->StopRobot();
+          this->nh_.setParam("/exploration_paused", true);
+          this->nh_.setParam("/exploration_state", "STOP");
           return;
       }
   }

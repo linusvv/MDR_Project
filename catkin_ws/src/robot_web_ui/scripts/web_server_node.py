@@ -70,6 +70,7 @@ class RobotWebServer:
         self.overshoot_m = 0.0
         self.detected_tags = {}
         self.local_costmap = None
+        self.local_costmap_viz = None  # Diagnostic: camera=75, RTABMap=50
         self.motion_candidates = []
         self.local_plan_pts = []
         self.trunc_target = None
@@ -86,11 +87,11 @@ class RobotWebServer:
         rospy.set_param("/use_local_ai", True)
         rospy.set_param("/local_planner_type", "teb")
         
-        # Set default velocity bounds
+        # Set default velocity bounds (conservative for real hardware)
         if not rospy.has_param("/robot/max_vel"):
-            rospy.set_param("/robot/max_vel", 0.20)
+            rospy.set_param("/robot/max_vel", 0.12)
         if not rospy.has_param("/robot/max_vel_theta"):
-            rospy.set_param("/robot/max_vel_theta", 0.80)
+            rospy.set_param("/robot/max_vel_theta", 0.35)
             
         self.lock = threading.Lock()
         self.tf_listener = tf.TransformListener()
@@ -194,6 +195,7 @@ class RobotWebServer:
 
         rospy.Subscriber('/rtabmap/grid_map', OccupancyGrid, self.map_cb)
         rospy.Subscriber('/map/local_map/obstacle', OccupancyGrid, self.local_map_cb)
+        rospy.Subscriber('/map/local_map/obstacle_viz', OccupancyGrid, self.local_map_viz_cb)
         rospy.Subscriber('/teb_planner_node/TebLocalPlannerROS/local_plan', Path, self.local_plan_cb)
         rospy.Subscriber('/car/trunc_target', PoseStamped, self.target_cb)
         rospy.Subscriber('/rosout', Log, self.rosout_cb)
@@ -252,24 +254,29 @@ class RobotWebServer:
         with self.lock:
             self.searching_tag = False
             self.navigating_to_tag = False
-        
+
         self.navigating_to_pose_active = False
         self.active_delivery_task = None
-        
+
         # 1. Stop the global/graph planner
         rospy.set_param("/exploration_state", "IDLE")
         rospy.set_param("/exploration_paused", True)
-        
-        # 2. Clear current path to stop local C++ planner
+
+        # 2. Publish empty path multiple times so TEB sees it even under load
         empty_path = Path()
         empty_path.header.frame_id = "map"
         empty_path.header.stamp = rospy.Time.now()
-        self.path_pub.publish(empty_path)
-        
-        # 3. Publish zero velocity
+        for _ in range(3):
+            self.path_pub.publish(empty_path)
+
+        # 3. Burst zero-velocity for 300 ms so TEB cannot immediately re-override
         stop_cmd = Twist()
-        self.cmd_vel_pub.publish(stop_cmd)
-        
+        deadline = rospy.Time.now() + rospy.Duration(0.3)
+        burst_rate = rospy.Rate(50)
+        while rospy.Time.now() < deadline:
+            self.cmd_vel_pub.publish(stop_cmd)
+            burst_rate.sleep()
+
         rospy.logwarn("[EMERGENCY STOP] Robot and planners stopped.")
 
     def color_cb(self, msg):
@@ -550,7 +557,7 @@ class RobotWebServer:
     def find_tag_thread(self):
         rospy.loginfo("[Find Tag] Starting tag search process...")
         rate = rospy.Rate(10)
-        scan_duration = 15.8
+        scan_duration = 35.0  # Full 360° at 0.18 rad/s ≈ 34.9 s
         tag_found = False
 
         while not rospy.is_shutdown() and self.searching_tag:
@@ -567,7 +574,7 @@ class RobotWebServer:
             
             start_time = rospy.Time.now()
             cmd = Twist()
-            cmd.angular.z = 0.4 # Slowly turn in place
+            cmd.angular.z = 0.18  # Slow rotation — avoids motion blur for AprilTag detection
             
             while not rospy.is_shutdown() and self.searching_tag and (rospy.Time.now() - start_time).to_sec() < scan_duration:
                 # Check for tag detection
@@ -734,7 +741,7 @@ class RobotWebServer:
             
             self.path_pub.publish(path)
             
-            if (rospy.Time.now() - start_time).to_sec() > 60.0:
+            if (rospy.Time.now() - start_time).to_sec() > 120.0:
                 rospy.logwarn("[Navigation] Timeout reached.")
                 break
             rate.sleep()
@@ -753,7 +760,7 @@ class RobotWebServer:
             depth_raw = getattr(self, 'depth_raw', None)
             
         if img is not None:
-            results = self.yolo_model.predict(img, conf=0.8, verbose=False, device='cuda')
+            results = self.yolo_model.predict(img, conf=0.60, verbose=False, device='cuda')
             for res in results:
                 for box in res.boxes:
                     label = res.names[int(box.cls[0])].upper()
@@ -779,12 +786,13 @@ class RobotWebServer:
                             roi = depth_raw[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
                             valid_depths = roi[roi > 0.1]
                             if valid_depths.size > 0:
-                                # Use 15th percentile to ensure we are looking at the 'front-most' edge
+                                # Use 15th percentile to get front-most edge; RealSense reports metres (32FC1)
                                 dist_to_shop = np.percentile(valid_depths, 15)
-                                if dist_to_shop > 50.0: dist_to_shop /= 1000.0
                                 depth_val = dist_to_shop
                         
-                        if depth_val == 0.0: depth_val = 1.8 
+                        if depth_val == 0.0:
+                            rospy.logwarn_throttle(5.0, "[YOLO] Depth unavailable, using 1.8 m fallback")
+                            depth_val = 1.8
                         if depth_val > 6.0: continue
 
                         return {
@@ -817,14 +825,14 @@ class RobotWebServer:
             x_center = det['img_x']
             error_norm = (x_center - img_w/2.0) / (img_w/2.0) # -1 to 1
             
-            if abs(error_norm) < 0.025: # Extremely tight centering (~1.2% offset allowed)
+            if abs(error_norm) < 0.06:  # ~3% offset tolerance (reliable under real camera latency/vibration)
                 self.cmd_vel_pub.publish(Twist())
                 rospy.sleep(0.5) # Wait for complete stop
                 return True
                 
             cmd = Twist()
-            cmd.angular.z = -1.0 * error_norm # smooth PI
-            cmd.angular.z = np.clip(cmd.angular.z, -0.4, 0.4) # limit speed for precision
+            cmd.angular.z = -0.5 * error_norm  # Reduced gain for real camera latency
+            cmd.angular.z = np.clip(cmd.angular.z, -0.25, 0.25)  # Conservative clip for real hardware
             self.cmd_vel_pub.publish(cmd)
             rate.sleep()
             
@@ -851,18 +859,17 @@ class RobotWebServer:
             
             # PHASE 1: DISCOVER THE STORE
             found = False
-            # Check pre-sweep
-            det = self.check_for_shop(target_category)
-            if det:
-                rospy.loginfo("[Approach Workflow] Found shop in pre-sweep!")
+            # Quick check at current heading before expensive sweep
+            if self.check_for_shop(target_category):
+                rospy.loginfo("[Approach Workflow] Found shop facing current heading!")
                 found = True
             else:
-                # Do continuous sweep left-to-right
-                rospy.loginfo("[Approach Workflow] Snapping to left boundary to begin continuous sweep...")
-                left_yaw = (ref_yaw + math.radians(60) + math.pi) % (2*math.pi) - math.pi
-                self.rotate_to_yaw(left_yaw, p_gain=2.5, speed_limit=1.5, threshold=0.03)
+                # Structured sweep: snap to left (+90° from corridor) then sweep right to -90°
+                rospy.loginfo("[Approach Workflow] Snapping to left boundary (+90°) for structured sweep...")
+                left_yaw = (ref_yaw + math.radians(90) + math.pi) % (2*math.pi) - math.pi
+                self.rotate_to_yaw(left_yaw, p_gain=1.2, speed_limit=0.35, threshold=0.05)
                 self.cmd_vel_pub.publish(Twist())
-                rospy.sleep(0.2)
+                rospy.sleep(0.3)
                 
                 if self.check_for_shop(target_category):
                     rospy.loginfo("[Approach Workflow] Discovered shop at left boundary.")
@@ -871,7 +878,7 @@ class RobotWebServer:
                     rospy.loginfo("[Approach Workflow] Commencing smooth continuous visual sweep...")
                     rate = rospy.Rate(15)
                     cmd = Twist()
-                    cmd.angular.z = -0.5 # Smooth rotation rightwards
+                    cmd.angular.z = -0.20  # Slow sweep for reliable YOLO detection
                     
                     sweep_start = rospy.Time.now()
                     while not rospy.is_shutdown() and self.active_delivery_task:
@@ -881,7 +888,7 @@ class RobotWebServer:
                             self.cmd_vel_pub.publish(Twist()) # Halt instantly
                             found = True
                             break
-                        if (rospy.Time.now() - sweep_start).to_sec() > 4.5:
+                        if (rospy.Time.now() - sweep_start).to_sec() > 18.0:  # 180° at 0.20 rad/s ≈ 15.7 s
                             break
                         rate.sleep()
                     self.cmd_vel_pub.publish(Twist())
@@ -925,7 +932,7 @@ class RobotWebServer:
             
             outward_normal = n1 if np.dot(vec_to_robot, vec_n1) > np.dot(vec_to_robot, vec_n2) else n2
             
-            target_dist = 0.60
+            target_dist = rospy.get_param("/delivery/approach_standoff_m", 0.60)
             target_x = shop_x + target_dist * math.cos(outward_normal)
             target_y = shop_y + target_dist * math.sin(outward_normal)
             
@@ -952,30 +959,28 @@ class RobotWebServer:
                 self.nudge_forward_and_recover(ref_yaw)
                 continue
                 
-            # PHASE 6: EXECUTE (Slow TEB)
-            v_max = rospy.get_param("/navigation/max_vel_x", 0.3)
-            rospy.set_param("/navigation/max_vel_x", 0.08)
+            # PHASE 6: EXECUTE (Slow TEB) — navigate to standoff point, any direction is fine
+            v_max = rospy.get_param("/navigation/max_vel_x", 0.12)
             rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x", 0.08)
             rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", 0.08)
-            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.3)
-            
-            rospy.loginfo("[Approach Workflow] Engaging TEB planner to exact spatial dot...")
-            nav_success = self.navigate_to_pose(target_x, target_y, target_yaw, ignore_yaw=True, dist_tol=0.10, cost_thresh=98)
-            
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.25)
+
+            rospy.loginfo("[Approach Workflow] Engaging TEB planner to standoff point (any arrival direction)...")
+            # ignore_yaw=True: TEB handles orientation freely; no forced 90° squaring up
+            nav_success = self.navigate_to_pose(target_x, target_y, 0.0, ignore_yaw=True, dist_tol=0.15, cost_thresh=98)
+
             # Restore speeds
-            rospy.set_param("/navigation/max_vel_x", v_max)
             rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x", v_max)
-            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", 0.15)
-            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.8)
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_x_backwards", 0.10)
+            rospy.set_param("/move_base/TebLocalPlannerROS/max_vel_theta", 0.25)
             
             if not nav_success:
                 rospy.logerr("[Approach Workflow] Navigation to shopfront failed or was blocked. Nudging forward to retry sweep...")
                 self.nudge_forward_and_recover(ref_yaw)
                 continue
-                
-            # FINAL SQUARING UP
-            rospy.loginfo("[Approach Workflow] Executing final exact rotation snap to 90 degrees...")
-            self.rotate_to_yaw(target_yaw, threshold=0.015)
+
+            # Arrived — no forced squaring up; TEB already oriented the robot optimally
+            rospy.loginfo("[Approach Workflow] Successfully arrived at shop standoff point.")
             return True
             
         rospy.logerr(f"[Approach Workflow] Failed to approach shop {target_category} after {max_attempts} attempts.")
@@ -1007,9 +1012,9 @@ class RobotWebServer:
             # If all are blocked in costmap pre-check, execute a small blind nudge to clear the costmap inflation
             rospy.logwarn("[Nudge Recovery] Nudge path blocked in costmap. Executing safe blind nudge...")
             cmd = Twist()
-            cmd.linear.x = 0.1
+            cmd.linear.x = 0.08
             self.cmd_vel_pub.publish(cmd)
-            rospy.sleep(2.0)
+            rospy.sleep(0.8)  # Short blind nudge (~6 cm) to clear costmap inflation
             self.cmd_vel_pub.publish(Twist())
 
 
@@ -1084,7 +1089,7 @@ class RobotWebServer:
             
             rospy.loginfo(f"[Delivery Task] Rotating to target yaw: {math.degrees(target_yaw):.1f} deg")
             # Fast alignment with corridor before sweep
-            self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=1.5)
+            self.rotate_to_yaw(target_yaw, p_gain=1.2, speed_limit=0.35)
             
             if not self.active_delivery_task:
                 return False
@@ -1110,8 +1115,8 @@ class RobotWebServer:
 
     def start_shopping_list_workflow(self, tasks):
         """Starts sequential traversal of multiple store destinations (shopping list)."""
-        self.stop_robot() # Reset all states
-        
+        self.stop_robot()  # Reset all states; active_delivery_task is now None
+
         self.active_delivery_task = "SHOPPING_LIST"
         self.task_thread = threading.Thread(target=self.shopping_list_worker, args=(tasks,))
         self.task_thread.daemon = True
@@ -1486,7 +1491,7 @@ class RobotWebServer:
         """Costmap clearing recovery by rotating in place."""
         rospy.loginfo("[Recovery] Attempting costmap clearing recovery by rotating in place.")
         cmd = Twist()
-        cmd.angular.z = 0.5
+        cmd.angular.z = 0.25  # Gentle recovery spin to minimise SLAM drift
         
         # Publish continuously to prevent cmd_vel_to_chassis watchdog timeout
         rate = rospy.Rate(10)
@@ -1642,7 +1647,7 @@ class RobotWebServer:
         return img
 
     def generate_frames(self, camera_type):
-        rate = rospy.Rate(30) # 30 FPS
+        rate = rospy.Rate(15)  # 15 FPS — reduces CPU contention under navigation load
         while not rospy.is_shutdown():
             frame = None
             if camera_type == 'color' and self.color_image is not None:
@@ -1664,6 +1669,11 @@ class RobotWebServer:
     def local_map_cb(self, msg):
         with self.lock:
             self.local_costmap = msg
+
+    def local_map_viz_cb(self, msg):
+        """Receives diagnostic viz costmap: camera=75, RTABMap=50, overlap=75 (camera wins)."""
+        with self.lock:
+            self.local_costmap_viz = msg
 
     def load_tag_true_poses(self):
         tag_config = rospy.get_param('/hw4/apriltag_localization_node/tag_config_name', None)
@@ -2079,27 +2089,86 @@ class RobotWebServer:
                     else:
                         tx, ty = target[0], target[1]
                 
-                # Render local costmap data with continuous gradient
+                # Render local costmap with color-coded layers
                 try:
-                    # ROS OccupancyGrid data is int8 (-1 unknown, 0-100 occupancy)
+                    # --- Use viz costmap if available (camera=75, RTABMap=50), else fall back ---
+                    with self.lock:
+                        viz_grid = self.local_costmap_viz
+
+                    # ROS OccupancyGrid data: int8 (-1 unknown, 0-100 occupancy)
                     raw_data = np.array(grid.data, dtype=np.int8).reshape((height, width))
-                    
-                    # Base view: Dark background for free space
-                    viz = np.full((height, width, 3), (30, 20, 10), dtype=np.uint8)
-                    
-                    # 1. Unknown space (-1) -> very dark
-                    viz[raw_data == -1] = [5, 5, 5]
-                    
-                    # 2. Gradient space (0 < data < 100)
-                    mask_gradient = (raw_data > 0) & (raw_data < 100)
-                    if np.any(mask_gradient):
-                        occ_vals = raw_data[mask_gradient].astype(np.float32)
-                        viz[mask_gradient, 2] = np.clip(occ_vals * 2.5, 0, 255).astype(np.uint8) # Red
-                        viz[mask_gradient, 1] = np.clip(occ_vals * 1.5, 0, 255).astype(np.uint8) # Green
-                    
-                    # 3. Solid walls (data >= 100) -> White
-                    viz[raw_data >= 100] = [220, 220, 220]
-                    
+
+                    # Dark background
+                    viz = np.full((height, width, 3), (25, 20, 18), dtype=np.uint8)
+
+                    # Unknown space
+                    viz[raw_data == -1] = [8, 8, 8]
+
+                    if viz_grid is not None and viz_grid.info.width == width and viz_grid.info.height == height:
+                        vdata = np.array(viz_grid.data, dtype=np.int8).reshape((height, width))
+
+                        # RTABMap-only cells (50): steel-blue
+                        mask_rtab = (vdata == 50)
+                        viz[mask_rtab] = [180, 100, 30]   # BGR: orange-ish blue → steel blue
+
+                        # Camera cells (75) and overlaps: warm orange
+                        mask_cam = (vdata == 75)
+                        viz[mask_cam] = [30, 120, 255]    # BGR: orange
+
+                        # Inflation gradient from nav costmap (values 1-99, not in viz)
+                        mask_grad = (raw_data > 0) & (raw_data < 100) & (vdata == 0)
+                        if np.any(mask_grad):
+                            occ = raw_data[mask_grad].astype(np.float32)
+                            viz[mask_grad, 2] = np.clip(occ * 1.8, 0, 160).astype(np.uint8)
+                            viz[mask_grad, 1] = np.clip(occ * 1.0, 0, 100).astype(np.uint8)
+                    else:
+                        # Fallback: no viz costmap — render nav costmap in white
+                        mask_gradient = (raw_data > 0) & (raw_data < 100)
+                        if np.any(mask_gradient):
+                            occ_vals = raw_data[mask_gradient].astype(np.float32)
+                            viz[mask_gradient, 2] = np.clip(occ_vals * 2.5, 0, 255).astype(np.uint8)
+                            viz[mask_gradient, 1] = np.clip(occ_vals * 1.5, 0, 255).astype(np.uint8)
+                        viz[raw_data >= 100] = [220, 220, 220]
+
+                    # --- FOV boundary lines from robot position ---
+                    # Costmap is in base_footprint frame: robot is at (0,0) facing +x
+                    # Get robot pixel position
+                    r_col_pre = int((rx - origin.position.x) / res)
+                    r_row_pre = int((ry - origin.position.y) / res)
+
+                    # Get current robot yaw in the costmap frame
+                    try:
+                        (_, rot_bf) = self.tf_listener.lookupTransform(costmap_frame, 'base_footprint', rospy.Time(0))
+                        robot_yaw_in_cf = tf.transformations.euler_from_quaternion(rot_bf)[2]
+                    except Exception:
+                        robot_yaw_in_cf = 0.0  # base_footprint→base_footprint: forward = +x = 0 rad
+
+                    fov_half_deg = 45.0  # must match CAMERA_FOV_ANGLE in heightmap_to_costmap.cpp
+                    fov_rad = math.radians(fov_half_deg)
+                    line_len = int(4.0 / res)  # 4 m long boundary lines in pixels
+
+                    for side in [+1, -1]:
+                        angle = robot_yaw_in_cf + side * fov_rad
+                        ex = r_col_pre + int(line_len * math.cos(angle))
+                        ey = r_row_pre + int(line_len * math.sin(angle))
+                        if 0 <= r_col_pre < width and 0 <= r_row_pre < height:
+                            cv2.line(viz,
+                                     (r_col_pre, r_row_pre),
+                                     (np.clip(ex, 0, width-1), np.clip(ey, 0, height-1)),
+                                     (0, 255, 180), 1)  # Bright green-teal FOV line
+
+                    # Fill interior of FOV cone with a faint tint so it's clearly delimited
+                    cone_pts = np.array([
+                        [r_col_pre, r_row_pre],
+                        [np.clip(r_col_pre + int(line_len * math.cos(robot_yaw_in_cf + fov_rad)), 0, width-1),
+                         np.clip(r_row_pre + int(line_len * math.sin(robot_yaw_in_cf + fov_rad)), 0, height-1)],
+                        [np.clip(r_col_pre + int(line_len * math.cos(robot_yaw_in_cf - fov_rad)), 0, width-1),
+                         np.clip(r_row_pre + int(line_len * math.sin(robot_yaw_in_cf - fov_rad)), 0, height-1)],
+                    ], dtype=np.int32)
+                    overlay = viz.copy()
+                    cv2.fillPoly(overlay, [cone_pts], (15, 30, 15))
+                    cv2.addWeighted(overlay, 0.18, viz, 0.82, 0, viz)  # 18% tint
+
                     # Draw motion primitives (all candidates in dim green)
                     for primitive in candidates:
                         for i in range(1, len(primitive)):
@@ -2440,7 +2509,7 @@ def api_detect():
         outward_normal = (snapped_yaw + math.pi) % (2*math.pi) - math.pi
         
         # The approach point is 60cm in front of the wall
-        target_dist = 0.60
+        target_dist = rospy.get_param("/delivery/approach_standoff_m", 0.60)
         target_x = shop_x + target_dist * math.cos(outward_normal)
         target_y = shop_y + target_dist * math.sin(outward_normal)
         
@@ -2805,15 +2874,8 @@ def api_reset():
         
     rospy.loginfo("Web server local state reset triggered.")
     
-    # 2. Reset Gazebo Simulation (models, controllers, and odometry)
-    try:
-        rospy.wait_for_service('/gazebo/reset_simulation', timeout=1.0)
-        reset_sim_srv = rospy.ServiceProxy('/gazebo/reset_simulation', EmptySrv)
-        reset_sim_srv()
-        rospy.loginfo("Gazebo simulation successfully reset.")
-    except Exception as e:
-        rospy.logwarn(f"Failed to reset Gazebo simulation: {e}")
-        
+    # NOTE: Gazebo reset removed — not applicable on real hardware.
+    # RTAB-Map reset below handles the SLAM state correctly for real-world operation.
     # 3. Reset RTAB-Map SLAM completely (reset database + trigger fresh map session)
     try:
         rospy.wait_for_service('/rtabmap/reset', timeout=1.0)

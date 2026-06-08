@@ -30,21 +30,22 @@
 
         <!-- 3. Start RTAB-Map SLAM (Configured to use stable Wheel Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2500 --Kp/MaxFeatures 2500 --Rtabmap/LoopThr 0.11 --Rtabmap/DetectionRate 1.5 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
-            <arg name="rgb_topic" value="/camera/color/image_raw"/>
-            <arg name="depth_topic" value="/camera/depth/image_raw"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
+            <arg name="rgb_topic" value="/camera/color/image_raw_throttle"/>
+            <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw_throttle"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
-            <arg name="depth_camera_info_topic" value="/camera/depth/camera_info"/>
+            <arg name="depth_camera_info_topic" value="/camera/color/camera_info"/>
             <arg name="frame_id" value="base_footprint"/>
             <arg name="odom_topic" value="/odom"/>
-            <arg name="visual_odometry" value="false"/>
+            <arg name="visual_odometry" value="true"/>
             <arg name="icp_odometry" value="false"/>
-            <arg name="publish_tf_odom" value="false"/>
+            <arg name="publish_tf_odom" value="true"/>
             <arg name="vo_frame_id" value="odom"/>
             <arg name="subscribe_scan" value="false"/>
             <arg name="approx_sync" value="true"/>
             <arg name="rviz" value="false"/>
             <arg name="rtabmap_viz" value="false"/>
+            <arg name="odom_args" value="--Odom/ResetCountdown 2 --Vis/MaxFeatures 600 --Vis/MinInliers 10 --OdomF2M/MaxSize 1000 --Odom/KeyFrameThr 0.6"/>
             <arg name="map_frame_id" value="rtabmap_map"/>
         </include>
     </group>
@@ -109,10 +110,23 @@
     <!-- 3.7 Start the Map Odom Publisher -->
     <node name="map_odom_publisher" pkg="hw4_exploration" type="map_odom_publisher.py" output="screen" />
 
+    <!-- 4. Local costmap generator (obstacle topic 생산).
+         heightmap_node          -> /points/velodyne_obstacles  (teb costmap이 먹는 소스)
+         heightmap_to_costmap    -> /map/local_map/obstacle      (astar costmap이 먹는 소스)
+         이게 빠져서 astar local_costmap 이 비어 있었음. teb 때는 이 launch 를 따로
+         돌리고 있었던 것. astar 통합 launch 에도 반드시 포함해야 함. -->
+    <include file="$(find local_costmap_generator)/launch/run.launch" />
+
     <!-- 5. Local planner = A* ONLY.
          run_astar_planner.launch 가 /local_planner_type=astar 를 set하고,
          A* 노드 + (inflation_layer 포함) local_costmap 을 띄운다. teb 미포함. -->
     <include file="$(find control_space_planner)/launch/run_astar_planner.launch" />
+
+    <!-- 5.1 글로벌 /local_planner_type 을 astar 로 강제 고정.
+         include(run_astar_planner.launch) 뒤에 두어, 그 안에서 ns/다른 값이
+         들어오더라도 마지막에 글로벌 경로(/)를 astar 로 덮어쓴다.
+         => 이전 teb 실행의 잔재값이 param 서버에 남아도 launch 시점에 astar 로 갱신됨. -->
+    <param name="local_planner_type" type="str" value="astar" />
 
     <!-- run.launch 안에 함께 있던 나머지 planner 노드들 (param 게이트로 /cmd_vel 엔 조용) -->
     <node name="control_space_planner_node" pkg="control_space_planner" type="control_space_planner_node" output="screen"/>
@@ -131,7 +145,7 @@
     <node name="tag_visualizer" pkg="hw4_exploration" type="tag_visualizer.py" output="screen" />
 
     <!-- 10. Start the Robot Web UI Server -->
-    <node name="robot_web_ui_server" pkg="robot_web_ui" type="web_server_node.py" output="screen" respawn="true">
+    <node name="robot_web_ui_server" pkg="robot_web_ui" type="web_server_node_astar.py" output="screen" respawn="true">
         <param name="depth_topic" value="/camera/depth/image_raw" if="$(arg sim)" />
         <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
         <param name="enable_camera_viz" value="false" />

@@ -6,7 +6,6 @@
 #include <tf2/utils.h>
 #include <costmap_2d/costmap_2d_ros.h>
 #include <costmap_2d/cost_values.h>
-#include <apriltag_ros/AprilTagDetectionArray.h>
 
 #include <memory>
 #include <cmath>
@@ -14,7 +13,6 @@
 #include <vector>
 #include <queue>
 #include <unordered_map>
-#include <set>
 #include <algorithm>
 
 // =============================================================================
@@ -82,12 +80,6 @@ public:
         pnh.param("crash_dist",       crash_dist_,       0.32);
         pnh.param("carrot_max_dist",  carrot_max_dist_,  2.0);
 
-        // pre-localization tag search
-        pnh.param("min_tags_for_lock", min_tags_for_lock_, 2);
-        pnh.param("search_vel",        search_vel_,        0.12);
-        pnh.param("search_turn",       search_turn_,       0.5);
-        pnh.param("search_clear_dist", search_clear_dist_, 0.20);  // 정면 20cm
-
         try {
             costmap_ros_.reset(new costmap_2d::Costmap2DROS("local_costmap", tf_buffer_));
             costmap_ros_->start();
@@ -100,23 +92,12 @@ public:
                                      &AStarPlannerNode::CallbackGoalPoint, this);
         pubCommand   = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1, true);
         pubLocalPlan = nh_.advertise<nav_msgs::Path>("/astar_local_plan", 1);
-
-        subTagDetections = nh_.subscribe("/tag_detections", 1,
-                                         &AStarPlannerNode::CallbackTags, this);
     }
 
     void CallbackGoalPoint(const nav_msgs::Path& msg) {
         if (msg.poses.empty()) return;
         global_path_   = msg;
         path_received_ = true;
-    }
-
-    // 본 AprilTag id 들을 누적 집계. 구분 태그 수가 임계치 이상이면 맵 lock 판단에 사용.
-    void CallbackTags(const apriltag_ros::AprilTagDetectionArray& msg) {
-        visible_tags_now_  = (int)msg.detections.size();
-        last_tag_msg_time_ = ros::Time::now();
-        for (const auto& det : msg.detections)
-            for (int id : det.id) tags_seen_.insert(id);
     }
 
     // -------------------------------------------------------------------------
@@ -136,21 +117,6 @@ public:
         }
 
         if (!costmap_ros_) return;
-
-        // ---- 0) pre-localization: 구분 태그 min_tags_for_lock 개를 볼 때까지 ----
-        //  단일 태그로는 하드코딩 맵 정합이 불안정하므로, 두 개(기본)를 누적해서
-        //  볼 때까지 빈 공간으로 전진하며 두 번째 태그를 찾는다. 충분히 보면
-        //  map_locked_ 를 걸고 정상 A* 주행으로 넘어간다 (이후 다시 search 안 함).
-        if (!map_locked_) {
-            if ((int)tags_seen_.size() >= min_tags_for_lock_) {
-                map_locked_ = true;
-                ROS_INFO("MAP LOCK: %zu distinct AprilTags seen (>= %d). Engaging A* navigation.",
-                         tags_seen_.size(), min_tags_for_lock_);
-            } else {
-                driveTagSearch(costmap_ros_->getCostmap());
-                return;
-            }
-        }
 
         // ---- resolve goal: hardcoded store [MAIN], else graph_planner [FALLBACK]
         double gx, gy;
@@ -428,51 +394,6 @@ private:
         return cmd;
     }
 
-    // ---- pre-localization tag-search behaviour ------------------------------
-    // 현재 헤딩 th 방향으로 costmap 을 따라가며 첫 장애물까지 거리(최대 max_d) 반환.
-    double rayClear(costmap_2d::Costmap2D* cm, double rx, double ry,
-                    double th, double max_d) {
-        double step = std::max(0.02, cm->getResolution());
-        for (double d = step; d <= max_d; d += step) {
-            double px = rx + std::cos(th) * d;
-            double py = ry + std::sin(th) * d;
-            unsigned int mx, my;
-            if (!cm->worldToMap(px, py, mx, my)) return d;        // costmap 경계
-            if (cm->getCost(mx, my) >= lethal_cost_) return d;    // 막힘
-        }
-        return max_d;
-    }
-
-    // 태그 2개 잠기기 전: 빈 공간으로 질주하며 두 번째 태그를 사냥한다.
-    void driveTagSearch(costmap_2d::Costmap2D* cm) {
-        geometry_msgs::Twist cmd;
-        double rx, ry, yaw;
-        if (!getRobotPose(rx, ry, yaw)) {
-            // 맵 포즈가 아직 없으면(태그 0개 등) 그냥 전진(빈 공간 가정).
-            cmd.linear.x = search_vel_;
-            pubCommand.publish(cmd);
-            ROS_WARN_THROTTLE(2.0, "Tag search: no map pose yet, forward. tags=%zu/%d",
-                              tags_seen_.size(), min_tags_for_lock_);
-            return;
-        }
-        // 정면(현재 헤딩)으로 장애물까지 거리. search_clear_dist_(=0.20m) 안에
-        // 장애물이 없으면 전진, 있으면 제자리에서 더 열린 쪽으로 회전.
-        double ahead = rayClear(cm, rx, ry, yaw, 1.5);
-        if (ahead > search_clear_dist_) {
-            cmd.linear.x = search_vel_;           // 20cm 앞 비었음 -> 전진
-        } else {
-            double left  = rayClear(cm, rx, ry, yaw + 0.6, 1.5);
-            double right = rayClear(cm, rx, ry, yaw - 0.6, 1.5);
-            cmd.angular.z = (left >= right) ? search_turn_ : -search_turn_;
-            cmd.linear.x  = 0.0;                  // 정면 확보될 때까지 제자리 회전
-        }
-        pubCommand.publish(cmd);
-        ROS_INFO_THROTTLE(1.0,
-            "Tag search: tags=%zu/%d visible=%d ahead=%.2fm cmd[vx %.2f w %.2f]",
-            tags_seen_.size(), min_tags_for_lock_, visible_tags_now_, ahead,
-            cmd.linear.x, cmd.angular.z);
-    }
-
     void handlePlanFailure() {
         consecutive_failures_++;
         if (consecutive_failures_ >= 10) {
@@ -496,12 +417,7 @@ private:
                 int cx = (int)mx + ddx, cy = (int)my + ddy;
                 if (cx < 0 || cy < 0 || cx >= (int)cm->getSizeInCellsX()
                     || cy >= (int)cm->getSizeInCellsY()) continue;
-                unsigned char c = cm->getCost(cx, cy);
-                // NO_INFORMATION(255, 미관측)을 장애물로 세면 시작하자마자 후진함.
-                // rolling costmap 은 시작 시 대부분 미관측이므로 반드시 제외하고,
-                // 실제로 막는 inscribed/lethal(>=253) 만 카운트한다.
-                if (c >= costmap_2d::INSCRIBED_INFLATED_OBSTACLE
-                    && c != costmap_2d::NO_INFORMATION) {
+                if (cm->getCost(cx, cy) > 50) {
                     double wx, wy; cm->mapToWorld(cx, cy, wx, wy);
                     double d = std::hypot(wx - rx, wy - ry);
                     if (d < min_dist) min_dist = d;
@@ -517,7 +433,6 @@ private:
     std::shared_ptr<costmap_2d::Costmap2DROS> costmap_ros_;
 
     ros::Subscriber subGoalPoint;
-    ros::Subscriber subTagDetections;
     ros::Publisher  pubCommand;
     ros::Publisher  pubLocalPlan;
 
@@ -525,12 +440,6 @@ private:
     bool path_received_ = false;
     int  last_closest_idx_ = 0;
     int  plan_publish_counter_ = 0;
-
-    // pre-localization tag search 상태
-    std::set<int> tags_seen_;        // 지금까지 본 구분 태그 id 집합
-    int       visible_tags_now_ = 0; // 현재 프레임에 보이는 태그 수
-    bool      map_locked_ = false;   // 충분히 봐서 맵 정합 신뢰 시작
-    ros::Time last_tag_msg_time_;
 
     int consecutive_failures_ = 0;
     int recovery_state_ = 0;        // 0 none, 1 backup, 2 spin
@@ -540,8 +449,6 @@ private:
     double lookahead_dist_, goal_tolerance_, inflation_weight_;
     double crash_dist_, carrot_max_dist_;
     int    lethal_cost_;
-    int    min_tags_for_lock_;
-    double search_vel_, search_turn_, search_clear_dist_;
 };
 
 int main(int argc, char** argv) {

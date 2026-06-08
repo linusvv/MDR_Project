@@ -58,6 +58,7 @@ private:
     ros::Subscriber sub_;
     ros::Subscriber rtabmap_sub_;
     ros::Publisher cost_map_pub_;
+    ros::Publisher viz_map_pub_;   // Diagnostic: camera=75, RTABMap=50, overlap=100
 
     tf2_ros::Buffer tf_buffer_;
     tf2_ros::TransformListener tf_listener_;
@@ -70,6 +71,7 @@ private:
     ros::Time last_process_time_;
     bool first_frame_ = true;
     geometry_msgs::TransformStamped last_map_tf_;
+    int decay_frame_counter_ = 0;   // Decay hit_count every 2nd frame (slows ghost removal)
 
     // Grid sizes
     int width_;
@@ -84,6 +86,7 @@ HeightmapToCostMap::HeightmapToCostMap() : cloud_topic_("/points/velodyne_obstac
     sub_ = nh_.subscribe(cloud_topic_, 1, &HeightmapToCostMap::cloud_cb, this);
     rtabmap_sub_ = nh_.subscribe("/rtabmap/grid_map", 1, &HeightmapToCostMap::rtabmap_cb, this);
     cost_map_pub_ = nh_.advertise<nav_msgs::OccupancyGrid>(map_topic_, 10);
+    viz_map_pub_  = nh_.advertise<nav_msgs::OccupancyGrid>("/map/local_map/obstacle_viz", 10);
 
     float w = MAP_MAX_X - MAP_MIN_X + 0.5f;
     width_ = int(w / RESOLUTION_ + 0.5f);
@@ -190,36 +193,45 @@ void HeightmapToCostMap::generate_costmap()
             }
         }
 
-        // --- 3. TEMPORAL FILTER FOR CAMERA OBSTACLES ---
+        // --- 3. TEMPORAL FILTER: persistent memory with slow decay ---
+        const int MAX_HIT_COUNT = 24;  // ~3 s at 8 Hz before an obstacle fully fades
+        const int MIN_SHOW_COUNT = 2;  // 2 consecutive hits required to confirm
+        decay_frame_counter_++;
+        bool do_decay = (decay_frame_counter_ % 2 == 0); // Decay every 2nd frame (~4 Hz)
+
         nav_msgs::MapMetaData mapMeta;
         mapMeta.resolution = RESOLUTION_;
         mapMeta.width = width_;
         mapMeta.height = height_;
-
         geometry_msgs::Pose oPose;
         oPose.position.x = MAP_MIN_X - RESOLUTION_/2;
         oPose.position.y = MAP_MIN_Y - RESOLUTION_/2;
         mapMeta.origin = oPose;
 
         nav_msgs::OccupancyGrid oMap;
+        nav_msgs::OccupancyGrid vizMap;  // Diagnostic map: camera=75, RTABMap=50
         oMap.info = mapMeta;
-        oMap.data.assign(width_ * height_, 0); 
-        oMap.header.frame_id = target_frame; 
+        oMap.data.assign(width_ * height_, 0);
+        oMap.header.frame_id = target_frame;
         oMap.header.stamp = current_time;
+        vizMap.info = mapMeta;
+        vizMap.data.assign(width_ * height_, 0);
+        vizMap.header.frame_id = target_frame;
+        vizMap.header.stamp = current_time;
 
         int point_count = 0;
         for (int i = 0; i < width_ * height_; ++i) {
             if (hits_this_frame[i]) {
-                hit_count_grid_[i]++;
+                if (hit_count_grid_[i] < MAX_HIT_COUNT) hit_count_grid_[i]++;
             } else {
-                // Decay hit counter quickly so stale detections don't linger
-                if (hit_count_grid_[i] > 0) hit_count_grid_[i]--;
+                if (do_decay && hit_count_grid_[i] > 0) hit_count_grid_[i]--;
             }
 
-            // Require 2 consecutive frames before marking as obstacle (false-positive filter)
-            bool show = (hit_count_grid_[i] >= 2) || hits_this_frame[i];
+            // Show confirmed memory OR immediate single-frame hit for safety
+            bool show = (hit_count_grid_[i] >= MIN_SHOW_COUNT) || hits_this_frame[i];
             if (show) {
                 oMap.data[i] = 100;
+                vizMap.data[i] = 75;  // Camera / depth-sensor obstacle
                 point_count++;
             }
         }
@@ -293,6 +305,10 @@ void HeightmapToCostMap::generate_costmap()
                                             oMap.data[tidx] = 100;
                                             point_count++;
                                         }
+                                        // Viz: RTABMap cell = 50, camera wins (75 stays if already set)
+                                        if (vizMap.data[tidx] == 0) {
+                                            vizMap.data[tidx] = 50;
+                                        }
                                     }
                                 }
                             }
@@ -333,6 +349,7 @@ void HeightmapToCostMap::generate_costmap()
         }
 
         cost_map_pub_.publish(oMap);
+        viz_map_pub_.publish(vizMap);
         bGetPoint = false;
     }
 }

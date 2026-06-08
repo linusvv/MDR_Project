@@ -23,10 +23,10 @@ class CustomVectorPlanner:
         self.REPULSION_DIST = 1.2  # meters
         self.ARRIVAL_THRES = 0.4   # meters
         
-        # Max velocity limits
-        self.MAX_VEL_X = 0.8
-        self.MAX_VEL_Y = 0.4
-        self.MAX_VEL_W = 2.0
+        # Max velocity limits — loaded from ROS params so first loop doesn't command at sim-scale speed
+        self.MAX_VEL_X = rospy.get_param("/robot/max_vel", 0.12)
+        self.MAX_VEL_Y = self.MAX_VEL_X
+        self.MAX_VEL_W = rospy.get_param("/robot/max_vel_theta", 0.35)
 
         # State variables
         self.ego_x = 0.0

@@ -44,9 +44,9 @@ class MotionPlanner:
         self.W_COST_STEERING = 1.0
 
         self.mapMinX = -5.0
-        self.mapMaxX = 15.0
-        self.mapMinY = -10.0
-        self.mapMaxY = 10.0
+        self.mapMaxX = 5.0   # Room 113 ~4 m wide; 10 m total gives comfortable margin
+        self.mapMinY = -5.0
+        self.mapMaxY = 5.0
         self.mapResol = 0.1
         self.OCCUPANCY_THRES = 40
 
@@ -74,7 +74,7 @@ class MotionPlanner:
         self.LOOKAHEAD_DIST = 1.0  # Slightly shorter for tighter following
         self.prev_w = 0.0
         self.recovery_time = 0
-        self.recovery_w = 1.5
+        self.recovery_w = 0.3  # Safe recovery spin (was 1.5 rad/s sim value)
         self.search_multiplier = 1.0
         
         # Pose smoothing buffers

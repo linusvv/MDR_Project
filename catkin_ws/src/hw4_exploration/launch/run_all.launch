@@ -103,14 +103,14 @@
 
     <!-- ==================== COMMON SETUP ==================== -->
 
-    <!-- 2. Start local costmap generator -->
-    <include file="$(find local_costmap_generator)/launch/run.launch" />
+    <!-- 2. Start local costmap generator (launched dynamically on-the-fly by the webserver) -->
+    <!-- <include file="$(find local_costmap_generator)/launch/run.launch" /> -->
 
     <!-- 3.7 Start the Map Odom Publisher -->
     <node name="map_odom_publisher" pkg="hw4_exploration" type="map_odom_publisher.py" output="screen" />
 
-    <!-- 5. Start the existing Python Motion Primitives Planner -->
-    <include file="$(find control_space_planner)/launch/run.launch" />
+    <!-- 5. Start the existing Python Motion Primitives Planner (launched dynamically on-the-fly by the webserver) -->
+    <!-- <include file="$(find control_space_planner)/launch/run.launch" /> -->
 
     <!-- 6. Start LLM Client Node (Crash-free Startup) -->
     <node name="simple_llm_client" pkg="gpt_llm_client" type="simple_llm_client.py" output="screen" />

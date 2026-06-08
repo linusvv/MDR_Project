@@ -56,6 +56,7 @@ private:
 
     // Variables
     pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_xyz;
+    sensor_msgs::PointCloud2ConstPtr latest_cloud_msg_;
     nav_msgs::OccupancyGrid rtabmap_grid_;
     tf::TransformListener tf_listener_;
 
@@ -83,17 +84,19 @@ void HeightmapToCostMap::rtabmap_cb(const nav_msgs::OccupancyGridConstPtr &map_m
 
 void HeightmapToCostMap::cloud_cb(const sensor_msgs::PointCloud2ConstPtr &cloud_msg)
 {
-    // Update point cloud data
-    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_xyz_(new pcl::PointCloud<pcl::PointXYZ>);
-    pcl::fromROSMsg(*cloud_msg, *cloud_xyz_); // conver to pcl object
-    cloud_xyz = cloud_xyz_;
+    latest_cloud_msg_ = cloud_msg;
     bGetPoint = true;
 }
 
 void HeightmapToCostMap::generate_costmap()
 {
-        if (bGetPoint)
+        if (bGetPoint && latest_cloud_msg_)
         {
+            // Update point cloud data lazily at 10Hz
+            pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_xyz_(new pcl::PointCloud<pcl::PointXYZ>);
+            pcl::fromROSMsg(*latest_cloud_msg_, *cloud_xyz_); // convert to pcl object
+            cloud_xyz = cloud_xyz_;
+
             int width_ = int(MAP_MAX_X - MAP_MIN_X + 0.5f);
             width_ = int(width_ / RESOLUTION_ + 0.5f);
 
@@ -126,7 +129,7 @@ void HeightmapToCostMap::generate_costmap()
                     (it->z >= MIN_OBSTACLE_HEIGHT && it->z < MAX_OBSTACLE_HEIGHT))
                 {
                     // CRITICAL: Filter out the robot footprint (0.32m radius) to prevent self-collision detections!
-                    if (sqrt(it->x * it->x + it->y * it->y) <= 0.32) continue;
+                    if ((it->x * it->x + it->y * it->y) <= 0.32 * 0.32) continue;
 
                     int x = int((it->x - MAP_MIN_X) / RESOLUTION_);
                     int y = int((it->y - MAP_MIN_Y) / RESOLUTION_);
@@ -148,11 +151,9 @@ void HeightmapToCostMap::generate_costmap()
                 bool can_transform = false;
                 try
                 {
-                    if (tf_listener_.waitForTransform(target_frame, source_frame, ros::Time(0), ros::Duration(0.1)))
-                    {
-                        tf_listener_.lookupTransform(target_frame, source_frame, ros::Time(0), transform);
-                        can_transform = true;
-                    }
+                    // Non-blocking lookup (Time(0) gets latest cache which is instantaneous)
+                    tf_listener_.lookupTransform(target_frame, source_frame, ros::Time(0), transform);
+                    can_transform = true;
                 }
                 catch (tf::TransformException &ex)
                 {
@@ -179,32 +180,42 @@ void HeightmapToCostMap::generate_costmap()
                     int min_row = std::max(0, int((min_map_y - origin_map_y) / res_map));
                     int max_row = std::min(height_map - 1, int((max_map_y - origin_map_y) / res_map + 1));
 
+                    // Precompute local coordinates of map origin and unit vectors
+                    tf::Point origin_local = transform * tf::Point(origin_map_x + 0.5 * res_map, origin_map_y + 0.5 * res_map, 0);
+                    tf::Vector3 dx_local = transform.getBasis() * tf::Vector3(res_map, 0, 0);
+                    tf::Vector3 dy_local = transform.getBasis() * tf::Vector3(0, res_map, 0);
+
+                    // Precompute squared distances and limits
+                    const double min_dist_sq = 0.32 * 0.32;
+                    const double max_dist_sq = 1.50 * 1.50;
+                    // tan(30 degrees) = 0.57735026919
+                    const double tan_30 = 0.57735026919;
+
                     for (int r = min_row; r <= max_row; ++r)
                     {
+                        // Precompute the row contribution to local frame position
+                        tf::Vector3 row_offset = origin_local + r * dy_local;
+
                         for (int c = min_col; c <= max_col; ++c)
                         {
                             int8_t val = rtabmap_grid_.data[r * width_map + c];
                             if (val > 50)
                             {
-                                double mx = origin_map_x + (c + 0.5) * res_map;
-                                double my = origin_map_y + (r + 0.5) * res_map;
-
-                                tf::Point pt_map(mx, my, 0);
-                                tf::Point pt_local = transform * pt_map;
+                                // Fast linear combination instead of expensive full matrix multiplication
+                                tf::Vector3 pt_local = row_offset + c * dx_local;
 
                                 if (pt_local.x() >= MAP_MIN_X && pt_local.x() < MAP_MAX_X &&
                                     pt_local.y() >= MAP_MIN_Y && pt_local.y() < MAP_MAX_Y)
                                 {
-                                    double rtab_dist = sqrt(pt_local.x() * pt_local.x() + pt_local.y() * pt_local.y());
-                                    if (rtab_dist <= 0.32 || rtab_dist > 1.50)
+                                    double dist_sq = pt_local.x() * pt_local.x() + pt_local.y() * pt_local.y();
+                                    if (dist_sq <= min_dist_sq || dist_sq > max_dist_sq)
                                         continue;
 
-                                    // Check if point is inside camera FOV (using 30 degrees half-angle to close the gap)
+                                    // Check if point is inside camera FOV using fast tan slope comparison
                                     bool inside_fov = false;
                                     if (pt_local.x() > 0.0)
                                     {
-                                        double angle = atan2(pt_local.y(), pt_local.x());
-                                        if (std::abs(angle) <= (30.0 * PI / 180.0))
+                                        if (std::abs(pt_local.y()) <= pt_local.x() * tan_30)
                                         {
                                             inside_fov = true;
                                         }

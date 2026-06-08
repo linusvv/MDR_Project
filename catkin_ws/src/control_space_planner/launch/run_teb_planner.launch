@@ -73,8 +73,8 @@
                     radius: 0.30    # Reverted to physical robot radius to fit inside corridors/hallways
  
                 # Goal Tolerance
-                xy_goal_tolerance: 0.20
-                yaw_goal_tolerance: 0.20
+                xy_goal_tolerance: 0.10
+                yaw_goal_tolerance: 0.10
                 free_goal_vel: True
  
                 # Obstacles

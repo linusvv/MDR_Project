@@ -21,6 +21,7 @@ import tf
 import tf.transformations
 
 import json
+import subprocess
 from gpt_llm_client.srv import LLMQuery, LLMQueryRequest
 from std_srvs.srv import Empty as EmptySrv
 from std_msgs.msg import Bool
@@ -205,6 +206,8 @@ class RobotWebServer:
         rospy.Subscriber('/yolo_nav/activate', Bool, self._yolo_nav_state_cb)
         rospy.Subscriber('/yolo_grab/activate', Bool, self._yolo_grab_state_cb)
 
+        self.planner_process = None
+        self.costmap_process = None
         rospy.loginfo("Web Server Node initialized.")
 
     def _yolo_nav_state_cb(self, msg):
@@ -247,6 +250,56 @@ class RobotWebServer:
             if len(self.delivery_chat_history) > 100:
                 self.delivery_chat_history.pop(0)
 
+    def start_planners(self):
+        """Starts the motion planner nodes (TEB planner, costmap, etc.) if they are not already running."""
+        with self.lock:
+            if getattr(self, 'planner_process', None) is None:
+                rospy.loginfo("[web_server] Starting motion planner nodes on the fly...")
+                try:
+                    # Start costmap generator
+                    self.costmap_process = subprocess.Popen(
+                        ["roslaunch", "local_costmap_generator", "run.launch"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    # Start control space planner (TEB, custom vector, etc.)
+                    self.planner_process = subprocess.Popen(
+                        ["roslaunch", "control_space_planner", "run.launch"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    rospy.loginfo("[web_server] Motion planner nodes started successfully.")
+                except Exception as e:
+                    rospy.logerr(f"[web_server] Failed to start motion planners: {e}")
+
+    def stop_planners(self):
+        """Kills the motion planner nodes to save computational resources when idle."""
+        with self.lock:
+            if getattr(self, 'planner_process', None) is not None:
+                rospy.loginfo("[web_server] Stopping control space planner...")
+                try:
+                    self.planner_process.terminate()
+                    self.planner_process.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        self.planner_process.kill()
+                    except Exception:
+                        pass
+                self.planner_process = None
+
+            if getattr(self, 'costmap_process', None) is not None:
+                rospy.loginfo("[web_server] Stopping local costmap generator...")
+                try:
+                    self.costmap_process.terminate()
+                    self.costmap_process.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        self.costmap_process.kill()
+                    except Exception:
+                        pass
+                self.costmap_process = None
+                rospy.loginfo("[web_server] Motion planner nodes stopped.")
+
     def stop_robot(self):
         """Immediately stops all autonomous navigation and the robot movement."""
         with self.lock:
@@ -269,6 +322,9 @@ class RobotWebServer:
         # 3. Publish zero velocity
         stop_cmd = Twist()
         self.cmd_vel_pub.publish(stop_cmd)
+        
+        # Kill the planners on stop
+        self.stop_planners()
         
         rospy.logwarn("[EMERGENCY STOP] Robot and planners stopped.")
 
@@ -566,6 +622,7 @@ class RobotWebServer:
 
     def find_tag_thread(self):
         rospy.loginfo("[Find Tag] Starting tag search process...")
+        self.start_planners()
         rate = rospy.Rate(10)
         scan_duration = 15.8
         tag_found = False
@@ -668,6 +725,7 @@ class RobotWebServer:
         # Cleanup
         self.searching_tag = False
         self.stop_search()
+        self.stop_planners()
         if tag_found:
             rospy.loginfo("[Find Tag] Search successfully completed.")
         else:
@@ -695,10 +753,12 @@ class RobotWebServer:
 
     def navigate_to_pose(self, x, y, yaw, ignore_yaw=False, dist_tol=0.2, cost_thresh=70):
         """Standard method to navigate to a specific map pose using the global planner."""
+        self.start_planners()
         # 0. Safety Pre-check
         if not self.is_pose_reachable(x, y, threshold=cost_thresh):
             rospy.logerr(f"[Navigation] Goal ({x:.2f}, {y:.2f}) is blocked in local costmap. Aborting.")
             self.navigating_to_pose_active = False
+            self.stop_planners()
             return False
 
         self.navigating_to_pose_active = True
@@ -758,6 +818,7 @@ class RobotWebServer:
             
         self.navigating_to_pose_active = False
         self.stop_search(keep_delivery=True) # Clears path but keeps workflow target
+        self.stop_planners()
         return arrived
 
     def check_for_shop(self, target_category):
@@ -1384,6 +1445,7 @@ class RobotWebServer:
     def nav_to_tag_thread(self, tag_name):
         self.load_tag_true_poses()
         rospy.loginfo(f"[Tag Nav] Starting navigation to landmark {tag_name}...")
+        self.start_planners()
         
         # Enable C++ planner
         rospy.set_param("/exploration_state", "EXPLORE")
@@ -1454,6 +1516,7 @@ class RobotWebServer:
             
         self.navigating_to_tag = False
         self.stop_search(keep_delivery=getattr(self, 'is_part_of_task', False))
+        self.stop_planners()
 
     def publish_path_to_goal(self, gx, gy):
         path = Path()

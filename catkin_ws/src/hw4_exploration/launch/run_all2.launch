@@ -102,6 +102,7 @@
     </group>
 
     <!-- ==================== COMMON SETUP ==================== -->
+    <node name="yolo_detector" pkg="$(arg pick_pkg)" type="yolo_detector.py" output="screen" respawn="true" />
 
     <!-- 2. Start local costmap generator -->
     <include file="$(find local_costmap_generator)/launch/run.launch" />
@@ -134,6 +135,7 @@
         <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" unless="$(arg sim)" />
         <remap from="/camera/aligned_depth_to_color/image_raw_throttle" to="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
     </node>
+    
 
     <!-- ==================== PICK & DELIVERY PIPELINE ==================== -->
     <!-- NOTE: set pkg="..." below to the package that actually contains these
@@ -142,7 +144,6 @@
 
     <!-- 10.1 Grab YOLO detector — loads model on GPU, then idles until the
               orchestrator activates /yolo_grab/activate. -->
-    <node name="yolo_detector" pkg="$(arg pick_pkg)" type="yolo_detector.py" output="screen" respawn="true" />
 
     <!-- 10.2 Pick arm node — stays up, picks whatever /yolo/arm_point reports. -->
     <node name="pick_arm_node" pkg="$(arg pick_pkg)" type="pick_arm_node.py" output="screen" respawn="true" />

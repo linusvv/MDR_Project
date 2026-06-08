@@ -131,21 +131,37 @@ class RobotWebServer:
             rospy.logwarn(f"YOLO model not found at {model_path} or ultralytics not installed.")
 
         # YOLO Activation Gate — controlled via /yolo_nav/activate (Bool)
-        # Starts ACTIVE (navigation is the default mode)
-        self._yolo_active = True
+        # Starts INACTIVE, then delayed start
+        self._yolo_active = False
+
+        # YOLO startup delay configuration (default 6.0 seconds, can be overridden via ROS parameter)
+        self.yolo_nav_delay_sec = rospy.get_param('~yolo_nav_delay_sec', 60.0)
 
         # YOLO control & state tracking
         self.pub_nav = rospy.Publisher('/yolo_nav/activate', Bool, queue_size=1, latch=True)
         self.pub_grab = rospy.Publisher('/yolo_grab/activate', Bool, queue_size=1, latch=True)
 
-        self.yolo_nav_state = True # starts active
+        self.yolo_nav_state = False # starts inactive
         self.yolo_grab_state = False # starts inactive
         self.yolo_nav_enabled = True # starts enabled
         self.yolo_grab_enabled = True # starts enabled
 
         # Publish initial latch states
-        self.pub_nav.publish(Bool(True))
+        self.pub_nav.publish(Bool(False))
         self.pub_grab.publish(Bool(False))
+
+        # Delayed start of YOLO for navigation (non-blocking)
+        def delayed_yolo_start():
+            rospy.sleep(self.yolo_nav_delay_sec)
+            if not rospy.is_shutdown():
+                rospy.loginfo(f"[web_server] Starting YOLO for navigation after {self.yolo_nav_delay_sec} seconds startup delay.")
+                self._yolo_active = True
+                self.yolo_nav_state = True
+                self.pub_nav.publish(Bool(True))
+
+        t_yolo = threading.Thread(target=delayed_yolo_start)
+        t_yolo.daemon = True
+        t_yolo.start()
 
         # ════════════════════════════════════════════════════════════════════
         # ── Mission Orchestrator handshake (ADDED) ──────────────────────────

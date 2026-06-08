@@ -132,21 +132,37 @@ class RobotWebServer:
             rospy.logwarn(f"YOLO model not found at {model_path} or ultralytics not installed.")
 
         # YOLO Activation Gate — controlled via /yolo_nav/activate (Bool)
-        # Starts ACTIVE (navigation is the default mode)
-        self._yolo_active = True
+        # Starts INACTIVE, then delayed start
+        self._yolo_active = False
+        
+        # YOLO startup delay configuration (default 6.0 seconds, can be overridden via ROS parameter)
+        self.yolo_nav_delay_sec = rospy.get_param('~yolo_nav_delay_sec', 0.0)
 
         # YOLO control & state tracking
         self.pub_nav = rospy.Publisher('/yolo_nav/activate', Bool, queue_size=1, latch=True)
         self.pub_grab = rospy.Publisher('/yolo_grab/activate', Bool, queue_size=1, latch=True)
 
-        self.yolo_nav_state = True # starts active
+        self.yolo_nav_state = False # starts inactive
         self.yolo_grab_state = False # starts inactive
         self.yolo_nav_enabled = True # starts enabled
         self.yolo_grab_enabled = True # starts enabled
 
         # Publish initial latch states
-        self.pub_nav.publish(Bool(True))
+        self.pub_nav.publish(Bool(False))
         self.pub_grab.publish(Bool(False))
+
+        # Delayed start of YOLO for navigation (non-blocking)
+        def delayed_yolo_start():
+            rospy.sleep(self.yolo_nav_delay_sec)
+            if not rospy.is_shutdown():
+                rospy.loginfo(f"[web_server] Starting YOLO for navigation after {self.yolo_nav_delay_sec} seconds startup delay.")
+                self._yolo_active = True
+                self.yolo_nav_state = True
+                self.pub_nav.publish(Bool(True))
+
+        t_yolo = threading.Thread(target=delayed_yolo_start)
+        t_yolo.daemon = True
+        t_yolo.start()
 
 
         # Complex Action State
@@ -834,7 +850,8 @@ class RobotWebServer:
             results = self.yolo_model.predict(img, conf=0.8, verbose=False, device='cuda')
             for res in results:
                 for box in res.boxes:
-                    label = res.names[int(box.cls[0])].upper()
+                    cls_val = int(box.cls[0].cpu().item())
+                    label = res.names[cls_val].upper()
                     clean_label = label.replace("STORE_", "").replace("_", " ")
                     label_norm = self.normalize_category(label)
                     
@@ -848,8 +865,9 @@ class RobotWebServer:
                             is_cafe or is_hamb or is_pharm or is_store
 
                     if match:
-                        shop_img_x = (box.xyxy[0][0] + box.xyxy[0][2]) / 2.0
-                        y1, x1, y2, x2 = int(box.xyxy[0][1]), int(box.xyxy[0][0]), int(box.xyxy[0][3]), int(box.xyxy[0][2])
+                        xyxy = box.xyxy[0].cpu().tolist()
+                        shop_img_x = (xyxy[0] + xyxy[2]) / 2.0
+                        y1, x1, y2, x2 = int(xyxy[1]), int(xyxy[0]), int(xyxy[2]), int(xyxy[3])
                         
                         depth_val = 0.0
                         if depth_raw is not None:
@@ -902,7 +920,7 @@ class RobotWebServer:
                 
             cmd = Twist()
             cmd.angular.z = -1.0 * error_norm # smooth PI
-            cmd.angular.z = np.clip(cmd.angular.z, -0.4, 0.4) # limit speed for precision
+            cmd.angular.z = max(-0.4, min(0.4, cmd.angular.z)) # limit speed for precision
             self.cmd_vel_pub.publish(cmd)
             rate.sleep()
             
@@ -935,34 +953,34 @@ class RobotWebServer:
                 rospy.loginfo("[Approach Workflow] Found shop in pre-sweep!")
                 found = True
             else:
-                # Do continuous sweep left-to-right
-                rospy.loginfo("[Approach Workflow] Snapping to left boundary to begin continuous sweep...")
-                left_yaw = (ref_yaw + math.radians(60) + math.pi) % (2*math.pi) - math.pi
-                self.rotate_to_yaw(left_yaw, p_gain=2.5, speed_limit=1.5, threshold=0.03)
-                self.cmd_vel_pub.publish(Twist())
-                rospy.sleep(0.2)
-                
-                if self.check_for_shop(target_category):
-                    rospy.loginfo("[Approach Workflow] Discovered shop at left boundary.")
-                    found = True
-                else:
-                    rospy.loginfo("[Approach Workflow] Commencing smooth continuous visual sweep...")
-                    rate = rospy.Rate(15)
-                    cmd = Twist()
-                    cmd.angular.z = -0.5 # Smooth rotation rightwards
+                # Do stepped sweep from left boundary to right boundary in 20-degree steps
+                rospy.loginfo("[Approach Workflow] Commencing stepped visual sweep in 20-degree increments...")
+                for step_idx in range(7):
+                    if not self.active_delivery_task:
+                        break
                     
-                    sweep_start = rospy.Time.now()
-                    while not rospy.is_shutdown() and self.active_delivery_task:
-                        self.cmd_vel_pub.publish(cmd)
-                        if self.check_for_shop(target_category):
-                            rospy.loginfo("[Approach Workflow] Discovered shop dynamically on-the-fly!")
-                            self.cmd_vel_pub.publish(Twist()) # Halt instantly
+                    target_deg = 60 - 20 * step_idx
+                    target_yaw_step = (ref_yaw + math.radians(target_deg) + math.pi) % (2*math.pi) - math.pi
+                    rospy.loginfo(f"[Approach Workflow] Visual Sweep: Rotating to {target_deg} degrees relative ({math.degrees(target_yaw_step):.1f} absolute)...")
+                    
+                    # Smoothly rotate to this angle
+                    self.rotate_to_yaw(target_yaw_step, p_gain=2.0, speed_limit=0.5, threshold=0.04)
+                    self.cmd_vel_pub.publish(Twist()) # Stop movement
+                    
+                    # Pause for 0.8 seconds and repeatedly check for shop (to give camera & RTABMap time to stabilize)
+                    pause_rate = rospy.Rate(10)
+                    for _ in range(8):
+                        if not self.active_delivery_task:
+                            break
+                        det = self.check_for_shop(target_category)
+                        if det:
+                            rospy.loginfo(f"[Approach Workflow] Discovered shop at {target_deg} degrees step!")
                             found = True
                             break
-                        if (rospy.Time.now() - sweep_start).to_sec() > 4.5:
-                            break
-                        rate.sleep()
-                    self.cmd_vel_pub.publish(Twist())
+                        pause_rate.sleep()
+                        
+                    if found:
+                        break
             
             # If we didn't find the shop during the sweep at all
             if not found:
@@ -1156,13 +1174,13 @@ class RobotWebServer:
             pose_info = self.tag_true_poses[best_tag]
             tag_true_yaw_deg = pose_info[2]
             
-            # Map yaw = true_yaw + rotation from R
+            # Map yaw = true_yaw + rotation from R + 180 degrees (opposite to facing the sign to face down the corridor)
             rot_angle = math.atan2(current_R[1, 0], current_R[0, 0])
-            target_yaw = math.radians(tag_true_yaw_deg) + rot_angle + math.radians(target_dir)
+            target_yaw = math.radians(tag_true_yaw_deg) + rot_angle + math.pi + math.radians(target_dir)
             
             rospy.loginfo(f"[Delivery Task] Rotating to target yaw: {math.degrees(target_yaw):.1f} deg")
-            # Fast alignment with corridor before sweep
-            self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=1.5)
+            # Smooth alignment with corridor before sweep
+            self.rotate_to_yaw(target_yaw, p_gain=2.0, speed_limit=0.5)
             
             if not self.active_delivery_task:
                 return False
@@ -1437,7 +1455,7 @@ class RobotWebServer:
             cmd = Twist()
             cmd.angular.z = p_gain * diff 
             # Clamp
-            cmd.angular.z = np.clip(cmd.angular.z, -speed_limit, speed_limit)
+            cmd.angular.z = max(-speed_limit, min(speed_limit, cmd.angular.z))
             self.cmd_vel_pub.publish(cmd)
             rate.sleep()
         self.cmd_vel_pub.publish(Twist()) # Stop
@@ -1634,10 +1652,10 @@ class RobotWebServer:
         # Draw cached YOLO results (prediction was already done outside the lock)
         for res in self.last_yolo_viz_results:
             for box in res.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                cls = int(box.cls[0])
+                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().tolist())
+                cls = int(box.cls[0].cpu().item())
                 label = res.names[cls]
-                conf = float(box.conf[0])
+                conf = float(box.conf[0].cpu().item())
                 cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
                 cv2.putText(img, f"{label} {conf:.2f}", (x1, y1 - 10), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)

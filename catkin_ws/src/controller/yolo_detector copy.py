@@ -26,19 +26,6 @@ Subscribed Topics:
         rostopic pub /yolo/class std_msgs/String "data: ''"
 """
 
-import os
-
-# ── CPU-spike control at init ─────────────────────────────────────────────
-# Loading torch/ultralytics/TensorRT spins up OpenMP/MKL/OpenBLAS thread pools
-# that briefly grab every core during init. Cap them BEFORE importing torch,
-# numpy & cv2 (these read the env vars at import time, so this must run first).
-# Inference is on CUDA, so the CPU thread count barely affects throughput.
-os.environ.setdefault("OMP_NUM_THREADS",      "1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS",      "1")
-os.environ.setdefault("NUMEXPR_NUM_THREADS",  "1")
-os.environ.setdefault("OMP_WAIT_POLICY",      "PASSIVE")  # idle threads sleep, don't spin
-
 import threading
 
 import rospy
@@ -47,17 +34,28 @@ import cv2
 import message_filters
 from sensor_msgs.msg import Image, CameraInfo
 from geometry_msgs.msg import Point, PointStamped
-from std_msgs.msg import String
+from std_msgs.msg import String, Bool
 from cv_bridge import CvBridge
 from ultralytics import YOLO
 
 # ── Parameters ────────────────────────────────────────────────────────────
-MODEL_PATH   = "/home/ee478_team1/catkin_ws/src/MDR_Project/catkin_ws/src/controller/best.engine"
+MODEL_PATH   = "./best.engine"
 CONF_THRESH  = 0.8
 DEPTH_SCALE  = 0.001      # RealSense: mm -> meters
 DEPTH_RADIUS = 3          # NxN sampling radius around bbox center (for noise reduction)
 MAX_DEPTH    = 1.5        # Ignore detections beyond this distance (meters)
 MIN_DEPTH    = 0.05       # Ignore detections closer than this distance (meters)
+
+# ── Activation Gate ──────────────────────────────────────────────────────
+# Controlled via /yolo_grab/activate (Bool). Starts INACTIVE.
+_active      = False
+_active_lock = threading.Lock()
+
+def activate_cb(msg):
+    global _active
+    with _active_lock:
+        _active = msg.data
+    rospy.loginfo(f"[yolo_detector] {'ACTIVATED' if msg.data else 'DEACTIVATED'}")
 
 # ── Target Class (동적 설정 — /yolo/class 토픽으로 런타임 변경 가능) ────
 # 빈 문자열이면 모든 클래스 허용, 값이 있으면 해당 클래스만 타겟
@@ -77,14 +75,6 @@ Ay =  0.015;  By = -0.316;  Cy =  0.299
 ARM_Z_FIXED = -0.015   # Fixed picking height (m) — target object height 에 맞게 조정
 
 # ── Initialize ────────────────────────────────────────────────────────────
-# Keep CPU-side libs single-threaded; heavy work runs on CUDA.
-cv2.setNumThreads(1)
-try:
-    import torch
-    torch.set_num_threads(1)
-except Exception:
-    pass
-
 bridge    = CvBridge()
 model     = YOLO(MODEL_PATH, task="detect")
 
@@ -169,6 +159,11 @@ def get_robust_depth(depth_img, u, v, radius=DEPTH_RADIUS):
 # ════════════════════════════════════════════════════════════════════════════
 
 def sync_callback(color_msg, depth_msg):
+    # ── Activation gate: skip inference when deactivated ──────────────
+    with _active_lock:
+        if not _active:
+            return
+
     if not intrinsic_ready:
         rospy.logwarn_throttle(5, "Camera intrinsics not yet received")
         return
@@ -310,7 +305,28 @@ if __name__ == '__main__':
     rospy.Subscriber('/camera/color/camera_info', CameraInfo, camera_info_cb)
 
     # 타겟 클래스 동적 설정
-    rospy.Subscriber('/yolo/class', String, class_cb)
+    # for yolo testing:
+    #rospy.Subscriber('/yolo/class', String, class_cb)
+    rospy.Subscriber('/target_item', String, class_cb)
+
+    # Activation gate (controlled by orchestrator)
+    rospy.Subscriber('/yolo_grab/activate', Bool, activate_cb)
+
+    # ── GPU warm-up ──────────────────────────────────────────────────────────
+    # The model is already resident on the GPU (loaded at import). Run ONE dummy
+    # inference now so the CUDA context, cuDNN/TensorRT kernels and workspace are
+    # built up-front — otherwise the first real frame after activation stalls for
+    # seconds. After this the node sits IDLE: sync_callback returns at the
+    # activation gate (before any cv_bridge conversion or inference) while
+    # _active is False, so it consumes effectively no CPU/GPU until the
+    # orchestrator flips /yolo_grab/activate to True.
+    try:
+        dummy = np.zeros((480, 640, 3), dtype=np.uint8)
+        model(dummy, conf=CONF_THRESH, device=0, verbose=False)
+        rospy.loginfo("[yolo_detector] GPU warm-up complete — model resident on "
+                      "GPU, node IDLE until /yolo_grab/activate is True.")
+    except Exception as e:
+        rospy.logwarn(f"[yolo_detector] GPU warm-up failed (continuing): {e}")
 
     # RGB + Depth 동기화 구독
     color_sub = message_filters.Subscriber('/camera/color/image_raw', Image)

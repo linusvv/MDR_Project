@@ -150,7 +150,7 @@ public:
 
         // 1. Obstacle too close crash-avoidance override / Emergency Brake
         // If an obstacle is closer than 0.35m (5cm from physical footprint edge of 0.30m), trigger automatic emergency stop
-        if (min_obstacle_dist < 0.35) {
+        if (min_obstacle_dist < 0.20) {
             ROS_WARN_THROTTLE(0.5, "EMERGENCY BRAKE: Obstacle too close (%.2fm). Stopping robot!", min_obstacle_dist);
             cmd_vel.linear.x = 0.0;
             cmd_vel.linear.y = 0.0;

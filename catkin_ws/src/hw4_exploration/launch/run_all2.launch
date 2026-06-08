@@ -136,12 +136,11 @@
         <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" unless="$(arg sim)" />
         <remap from="/camera/aligned_depth_to_color/image_raw_throttle" to="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
     </node>
-    
 
     <!-- ==================== PICK & DELIVERY PIPELINE ==================== -->
     <!-- NOTE: set pkg="..." below to the package that actually contains these
          scripts (the arm/grab package). They are kept running idle from start. -->
-    <arg name="pick_pkg" default="controller"/>
+
 
     <!-- 10.1 Grab YOLO detector — loads model on GPU, then idles until the
               orchestrator activates /yolo_grab/activate. -->

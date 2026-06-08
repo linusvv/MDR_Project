@@ -1113,18 +1113,22 @@ class RobotWebServer:
                     rospy.loginfo("[Approach Workflow] Performing active precision visual centering...")
                     self.center_on_shop(target_category, timeout=10.0)
                     _, _, final_yaw = self.get_current_robot_pose()
-                    facing_yaw = final_yaw
+                    
+                    # Compute relative yaw angle to the corridor axis baseline
+                    rel_yaw = (final_yaw - ref_yaw + math.pi) % (2 * math.pi) - math.pi
+                    rel_yaw_deg = math.degrees(rel_yaw)
+                    
+                    # Validate that the centered angle sits within the +80 to +100 or -80 to -100 window envelope
+                    if (80.0 <= rel_yaw_deg <= 100.0) or (-100.0 <= rel_yaw_deg <= -80.0):
+                        rospy.loginfo(f"[Approach Workflow] Shop centered successfully within valid angular envelope: {rel_yaw_deg:.1f}°")
+                        facing_yaw = final_yaw  # Fix orientation directly onto the real centered shop heading
+                    else:
+                        rospy.logwarn(f"[Approach Workflow] Shop centering heading ({rel_yaw_deg:.1f}°) outside valid envelope limits. Reverting to strict baseline.")
                 else:
                     rospy.logwarn("[Approach Workflow] Shop sign not seen at orthogonal steps. Falling back to estimated baseline facing vector.")
                 
-            # ================= ORTHOGONAL MAP AXIS SNAP =================
-            # Snap facing_yaw to the nearest true 90-degree vector increment (0, 90, 180, 270 deg)
-            facing_yaw = round(facing_yaw / (math.pi / 2.0)) * (math.pi / 2.0)
-            facing_yaw = (facing_yaw + math.pi) % (2 * math.pi) - math.pi
-            # ============================================================
-
-            # FINAL SQUARING UP — two-pass snap for deterministic shop-facing
-            rospy.loginfo(f"[Approach Workflow] Two-pass final orientation snap to {math.degrees(facing_yaw):.1f}°...")
+            # FINAL SQUARING UP — Execution tracking directly on centered target heading
+            rospy.loginfo(f"[Approach Workflow] Final orientation adjustment loop to target heading {math.degrees(facing_yaw):.1f}°...")
             self.cmd_vel_pub.publish(Twist())
             
             # Safe sleep window
@@ -1144,12 +1148,56 @@ class RobotWebServer:
                 rospy.sleep(0.1)
                 
             self.rotate_to_yaw(facing_yaw, p_gain=2.0, speed_limit=0.2, threshold=0.015)
-            self.cmd_vel_pub.publish(Twist()) # Ensure absolute stop
+            self.cmd_vel_pub.publish(Twist()) # Absolute stop before verification
             
-            # ================= NEW: 5-SECOND APPROACH COMPLETION WAIT =================
+            # PHASE 8: PRECISION CLOSING DISTANCE CHECK & CLOSED-LOOP NUDGE
+            if self.active_delivery_task:
+                wall_dist = self.get_distance_to_wall_ahead(max_dist=3.0)
+                if wall_dist is None:
+                    # Fallback to visual bounding box depth telemetry
+                    det_check = self.check_for_shop(target_category)
+                    wall_dist = det_check['depth'] if (det_check and 'depth' in det_check) else None
+                
+                if wall_dist is not None:
+                    rospy.loginfo(f"[Approach Workflow] Verified distance to storefront: {wall_dist:.2f}m")
+                    if wall_dist >= 0.80:
+                        # Store is farther than 80cm, execute a precision nudge forward
+                        nudge_distance = wall_dist - 0.65  # Target stopping around 65cm to remain safely under 80cm
+                        rospy.loginfo(f"[Approach Workflow] Distance exceeds 80cm limit. Initiating recovery nudge forward by {nudge_distance:.2f}m...")
+                        
+                        nudge_rate = rospy.Rate(10)
+                        start_nudge_t = rospy.Time.now()
+                        nx, ny, nyaw = self.get_current_robot_pose()
+                        target_x = nx + nudge_distance * math.cos(nyaw)
+                        target_y = ny + nudge_distance * math.sin(nyaw)
+                        
+                        cmd_nudge = Twist()
+                        cmd_nudge.linear.x = 0.05  # Slow precision crawl speed (5 cm/s)
+                        
+                        while not rospy.is_shutdown() and self.active_delivery_task:
+                            cx, cy, _ = self.get_current_robot_pose()
+                            remaining_segment = math.hypot(target_x - cx, target_y - cy)
+                            current_ray_reading = self.get_distance_to_wall_ahead(max_dist=2.0)
+                            
+                            # Safety brake: stop early if costmap laser scan detects a sudden proximity block
+                            if current_ray_reading is not None and current_ray_reading < 0.60:
+                                rospy.loginfo(f"[Approach Workflow] Nudge sequence exited early. Costmap threshold reached: {current_ray_reading:.2f}m")
+                                break
+                                
+                            if remaining_segment < 0.03 or (rospy.Time.now() - start_nudge_t).to_sec() > (nudge_distance / 0.05 + 2.0):
+                                break
+                                
+                            self.cmd_vel_pub.publish(cmd_nudge)
+                            nudge_rate.sleep()
+                        
+                        self.cmd_vel_pub.publish(Twist()) # Complete chassis stabilization
+                else:
+                    rospy.logwarn("[Approach Workflow] Unable to calculate proximity distance profile. Nudge verification skipped.")
+
+            # ================= 5-SECOND APPROACH COMPLETION WAIT =================
             rospy.loginfo("[Approach Workflow] Approach complete. Holding position for 5.0 seconds...")
-            hold_rate = rospy.Rate(10) # 10 Hz loop check
-            for _ in range(50):        # 50 ticks * 0.1s = 5 seconds
+            hold_rate = rospy.Rate(10)
+            for _ in range(50):        
                 if not self.active_delivery_task or rospy.is_shutdown():
                     break
                 hold_rate.sleep()

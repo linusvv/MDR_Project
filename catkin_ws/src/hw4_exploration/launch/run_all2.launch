@@ -102,6 +102,7 @@
     </group>
 
     <!-- ==================== COMMON SETUP ==================== -->
+    <arg name="pick_pkg" default="controller"/>
     <node name="yolo_detector" pkg="$(arg pick_pkg)" type="yolo_detector.py" output="screen" respawn="true" />
 
     <!-- 2. Start local costmap generator -->

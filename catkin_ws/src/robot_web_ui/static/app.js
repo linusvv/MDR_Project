@@ -442,6 +442,62 @@ document.addEventListener('DOMContentLoaded', () => {
         });
     }
 
+    // Approach Distance Apply Handler
+    const approachDistVal = document.getElementById('approach-dist-val');
+    const btnApplyApproachDist = document.getElementById('btn-apply-approach-dist');
+    if (btnApplyApproachDist && approachDistVal) {
+        btnApplyApproachDist.addEventListener('click', async () => {
+            const distValNum = parseFloat(approachDistVal.value) || 0;
+            try {
+                btnApplyApproachDist.disabled = true;
+                const response = await fetch('/api/set_approach_dist', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ approach_dist_cm: distValNum })
+                });
+                const resData = await response.json();
+                if (response.ok) {
+                    logConsole(`System: Approach distance set to ${distValNum} cm.`);
+                } else {
+                    logConsole(`Error: ${resData.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to apply approach distance", error);
+                logConsole("Error: Failed to connect to server.");
+            } finally {
+                btnApplyApproachDist.disabled = false;
+            }
+        });
+    }
+
+    // Tag Alignment Offset Apply Handler
+    const tagAlignOffsetVal = document.getElementById('tag-align-offset-val');
+    const btnApplyTagAlignOffset = document.getElementById('btn-apply-tag-align-offset');
+    if (btnApplyTagAlignOffset && tagAlignOffsetVal) {
+        btnApplyTagAlignOffset.addEventListener('click', async () => {
+            const offsetValNum = parseFloat(tagAlignOffsetVal.value) || 0;
+            try {
+                btnApplyTagAlignOffset.disabled = true;
+                const response = await fetch('/api/set_tag_align_offset', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ offset_deg: offsetValNum })
+                });
+                const resData = await response.json();
+                if (response.ok) {
+                    logConsole(`System: Tag align offset set to ${offsetValNum} degrees.`);
+                } else {
+                    logConsole(`Error: ${resData.message}`);
+                }
+            } catch (error) {
+                console.error("Failed to apply tag align offset", error);
+                logConsole("Error: Failed to connect to server.");
+            } finally {
+                btnApplyTagAlignOffset.disabled = false;
+            }
+        });
+    }
+
     // Clear Active Todo List Handler
     const btnClearTodo = document.getElementById('btn-clear-todo');
     if (btnClearTodo) {
@@ -1079,6 +1135,18 @@ document.addEventListener('DOMContentLoaded', () => {
             const overshootValEl = document.getElementById('overshoot-val');
             if (overshootValEl && data.overshoot_cm !== undefined && document.activeElement !== overshootValEl) {
                 overshootValEl.value = data.overshoot_cm;
+            }
+
+            // Dynamic Approach Distance UI updates
+            const approachDistValEl = document.getElementById('approach-dist-val');
+            if (approachDistValEl && data.approach_dist_cm !== undefined && document.activeElement !== approachDistValEl) {
+                approachDistValEl.value = data.approach_dist_cm;
+            }
+
+            // Dynamic Tag Alignment Offset UI updates
+            const tagAlignOffsetValEl = document.getElementById('tag-align-offset-val');
+            if (tagAlignOffsetValEl && data.tag_align_offset_deg !== undefined && document.activeElement !== tagAlignOffsetValEl) {
+                tagAlignOffsetValEl.value = data.tag_align_offset_deg;
             }
 
             // Sync Chat history

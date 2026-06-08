@@ -23,7 +23,7 @@ import tf.transformations
 import json
 from gpt_llm_client.srv import LLMQuery, LLMQueryRequest
 from std_srvs.srv import Empty as EmptySrv
-from std_msgs.msg import Bool, String, Int32
+from std_msgs.msg import Bool, String
 
 
 try:
@@ -97,7 +97,14 @@ class RobotWebServer:
 
         # Load AprilTag bundles configuration & Store coordinates
         rospack = rospkg.RosPack()
-        self.bundles = self.load_bundles(None)
+        try:
+            pkg_path = rospack.get_path('robot_web_ui')
+            mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
+            self.yaml_path = os.path.join(mdr_path, 'HW4', 'tags.yaml')
+        except Exception:
+            self.yaml_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/tags.yaml"
+
+        self.bundles = self.load_bundles(self.yaml_path)
         self.load_tag_true_poses()
         self.sign_database = self.load_sign_database()
         
@@ -128,7 +135,7 @@ class RobotWebServer:
         self._yolo_active = False
 
         # YOLO startup delay configuration (default 6.0 seconds, can be overridden via ROS parameter)
-        self.yolo_nav_delay_sec = rospy.get_param('~yolo_nav_delay_sec', 60.0)
+        self.yolo_nav_delay_sec = rospy.get_param('~yolo_nav_delay_sec', 0.0)
 
         # YOLO control & state tracking
         self.pub_nav = rospy.Publisher('/yolo_nav/activate', Bool, queue_size=1, latch=True)
@@ -158,17 +165,14 @@ class RobotWebServer:
 
         # ════════════════════════════════════════════════════════════════════
         # ── Mission Orchestrator handshake (ADDED) ──────────────────────────
-        # In the AprilTag hand-off design the NAV TEAMMATE is the navigator and
-        # mission_orchestrator is the BRAIN. web_server's only job in the mission
-        # is to turn the user's sentence (via the LLM) into per-item counts and
-        # publish them on /mission/item_counts.
-        #
-        # ~external_nav (default True): the nav teammate + orchestrator drive the
-        #   whole mission, so web_server does NOT run its own shopping navigation.
-        # ~use_orchestrator_pickup: kept for the legacy/standalone path where
-        #   web_server itself navigates and delegates picking (set external_nav
-        #   false to use it).
-        self.external_nav            = rospy.get_param('~external_nav', True)
+        # web_server stays the NAVIGATOR; mission_orchestrator is the BRAIN
+        # that owns item counts, YOLO switching, picking and counting.
+        #   - publish parsed item counts          -> /mission/item_counts
+        #   - announce arrival at a shop          -> /mission/shop_arrived
+        #   - wait for the orchestrator to finish -> /mission/pick_complete
+        #   - announce arrival at the pickup zone -> /mission/finished
+        # If no orchestrator is running, set ~use_orchestrator_pickup:=false to
+        # fall back to the original simulated pickup.
         self.use_orchestrator_pickup = rospy.get_param('~use_orchestrator_pickup', True)
         self.pub_item_counts      = rospy.Publisher('/mission/item_counts',  String, queue_size=1, latch=True)
         self.pub_shop_arrived     = rospy.Publisher('/mission/shop_arrived', String, queue_size=1)
@@ -177,17 +181,6 @@ class RobotWebServer:
         rospy.Subscriber('/mission/pick_complete', Bool, self._pick_complete_cb)
         # How long to wait for the orchestrator to finish picking at one shop.
         self.orchestrator_pick_timeout = rospy.get_param('~orchestrator_pick_timeout', 180.0)
-
-        # ── GOTO SIGNBOARD command (web_server is the navigator) ─────────────
-        # The orchestrator publishes a SIGNBOARD number on /mission/goto_signboard.
-        # web_server drives there using its EXISTING signboard navigation, and on
-        # arrival publishes /mission/shop_arrived itself — so this node issues the
-        # command AND sets the arrival flag. If the nav teammate detects arrival
-        # instead, they publish /mission/shop_arrived and you set
-        # ~publish_shop_arrived_on_arrival:=false to avoid a double flag.
-        self.publish_shop_arrived_on_arrival = rospy.get_param('~publish_shop_arrived_on_arrival', True)
-        self._goto_busy = False
-        rospy.Subscriber('/mission/goto_signboard', Int32, self._goto_signboard_cb)
 
 
         # Complex Action State
@@ -266,170 +259,33 @@ class RobotWebServer:
         if msg.data:
             self.pick_complete_event.set()
 
-    def _goto_signboard_cb(self, msg):
-        """Orchestrator commands navigation to SIGNBOARD number msg.data.
-        web_server drives there with its existing tag navigation and, on arrival,
-        publishes /mission/shop_arrived (the hand-back to the orchestrator)."""
-        n = int(msg.data)
-        tag_name = "SIGNBOARD%02d" % n
-        if self._goto_busy:
-            rospy.logwarn(f"[web_server] Already navigating; ignoring goto {tag_name}.")
-            return
-        threading.Thread(target=self._goto_and_flag, args=(tag_name,), daemon=True).start()
-
-    def _goto_and_flag(self, tag_name):
-        self._goto_busy = True
-        try:
-            self.load_tag_true_poses()
-            if tag_name not in self.tag_true_poses:
-                rospy.logerr(f"[web_server] {tag_name} not found in tag poses — cannot navigate.")
-                return
-            rospy.loginfo(f"[web_server] GOTO command: navigating to {tag_name} ...")
-            self.append_bot_chat_message(f"Heading to {tag_name}...")
-
-            # Use the existing signboard/landmark navigation.
-            self.start_navigation_to_tag(tag_name)
-            rospy.sleep(0.3)  # let the nav thread spin up
-            while not rospy.is_shutdown() and self.navigating_to_tag:
-                rospy.sleep(0.1)
-
-            rospy.loginfo(f"[web_server] Arrived at {tag_name}.")
-            # Hand control back to the orchestrator (unless the nav teammate does it).
-            if self.publish_shop_arrived_on_arrival:
-                self.pub_shop_arrived.publish(String(data=tag_name))
-        except Exception as e:
-            rospy.logerr(f"[web_server] GOTO {tag_name} failed: {e}")
-        finally:
-            self._goto_busy = False
-
-    # ════════════════════════════════════════════════════════════════════════
-    # ── COMPETITION ITEM VOCABULARY  (EDIT THIS right before the competition) ─
-    # ════════════════════════════════════════════════════════════════════════
-    # The problem statement names items WITHOUT aliasing. Map each official item
-    # name to its grab-YOLO class. The official names are not final yet — when
-    # they are announced, just edit the left-hand-side strings here. Everything
-    # else (LLM prompt + offline parser) is generated from this table.
-    #
-    #   official item name (as it appears in the sentence)  ->  YOLO class
-    REQUEST_ITEM_TO_CLASS = {
-        "hot coffee":    "mug",
-        "ice coffee":    "iceCoffee",
-        "first-aid kit": "drug",
-        "burger":        "hamburger",
-    }
-
-    def _empty_counts(self):
-        return {"drug": 0, "hamburger": 0, "iceCoffee": 0, "mug": 0}
+    # Maps free-text item names (from the LLM / user) to the four canonical
+    # pickable item types tracked by the orchestrator. Edit alongside the
+    # orchestrator's ITEM_TYPES / ITEM_TO_YOLO_CLASS if class names change.
+    ITEM_NAME_TO_TYPE = [
+        ("iceCoffee", ["ice coffee", "ice-coffee", "icecoffee", "iced coffee",
+                       "cold brew", "ice americano", "iced americano"]),
+        ("drug",      ["drug", "medicine", "medication", "pill", "aspirin",
+                       "band-aid", "bandaid", "cough"]),
+        ("hamburger", ["hamburger", "burger", "cheeseburger"]),
+        ("mug",       ["mug", "cup"]),
+    ]
 
     def compute_item_counts(self, tasks):
-        """Legacy helper: collapse 'tasks' (store + free-text items) into the
-        four canonical counts using the competition vocabulary."""
-        counts = self._empty_counts()
+        """Collapse the LLM 'tasks' (store + items list) into per-type counts
+        for the four canonical items the orchestrator understands."""
+        counts = {"drug": 0, "hamburger": 0, "iceCoffee": 0, "mug": 0}
         for t in tasks:
             for item in t.get("items", []):
                 name = str(item).lower().strip()
-                for req_name, cls in self.REQUEST_ITEM_TO_CLASS.items():
-                    if req_name.lower() in name:
-                        counts[cls] += 1
+                matched = None
+                for canonical, aliases in self.ITEM_NAME_TO_TYPE:
+                    if any(a in name for a in aliases):
+                        matched = canonical
                         break
+                if matched:
+                    counts[matched] += 1
         return counts
-
-    # ── Item -> the store the robot navigates to in order to pick it ─────────
-    # (Used only for navigation/UI grouping; the orchestrator's
-    #  ITEM_SHOP_CONSTRAINTS may allow more shops than this primary one.)
-    ITEM_PRIMARY_STORE = {
-        "drug":      "Pharmacy",
-        "hamburger": "Fast-food restaurant",
-        "iceCoffee": "Cafe",
-        "mug":       "Convenience store",
-    }
-    # Human-readable item names for chat replies / todo-list display.
-    ITEM_DISPLAY = {
-        "drug": "drug", "hamburger": "hamburger",
-        "iceCoffee": "ice coffee", "mug": "mug",
-    }
-    ITEM_ORDER = ["drug", "hamburger", "iceCoffee", "mug"]
-
-    def build_tasks_from_counts(self, counts):
-        """Deterministically group the four item counts into per-store tasks for
-        navigation, so the LLM never has to pick stores (removes a whole class of
-        misclassification). Each needed item is repeated 'count' times."""
-        store_items = {}
-        for item in self.ITEM_ORDER:
-            n = int(counts.get(item, 0))
-            if n <= 0:
-                continue
-            store = self.ITEM_PRIMARY_STORE[item]
-            store_items.setdefault(store, [])
-            store_items[store].extend([self.ITEM_DISPLAY[item]] * n)
-        return [{"target": s, "items": its} for s, its in store_items.items()]
-
-    def reply_from_counts(self, counts):
-        """Friendly fallback reply built from the four item counts."""
-        parts = []
-        for item in self.ITEM_ORDER:
-            n = int(counts.get(item, 0))
-            if n > 0:
-                name = self.ITEM_DISPLAY[item]
-                parts.append(f"{n} {name}" + ("s" if n > 1 else ""))
-        if not parts:
-            return ("I can only fetch drug, hamburger, ice coffee, or mug — "
-                    "please ask for one of those!")
-        return "Got it — I'll pick up: " + ", ".join(parts) + "."
-
-    def local_parse_counts(self, message):
-        """Offline parser producing the four item counts directly from the
-        competition vocabulary (REQUEST_ITEM_TO_CLASS). Used when the LLM
-        service is unavailable. Honors quantities like '2 burgers'."""
-        import re
-        m = " " + message.lower() + " "
-        words = {"a": 1, "an": 1, "one": 1, "two": 2, "three": 3, "four": 4,
-                 "five": 5, "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10}
-        counts = self._empty_counts()
-        # Match longer item names first so "ice coffee" wins over a bare "coffee".
-        for req_name in sorted(self.REQUEST_ITEM_TO_CLASS, key=len, reverse=True):
-            cls = self.REQUEST_ITEM_TO_CLASS[req_name]
-            best = 0
-            for mt in re.finditer(re.escape(req_name.lower()), m):
-                prefix = m[max(0, mt.start() - 12):mt.start()]
-                qty = 1
-                dm = re.search(r"(\d+)\s*$", prefix)
-                if dm:
-                    qty = int(dm.group(1))
-                else:
-                    wm = re.search(r"(\b\w+\b)\s*$", prefix)
-                    if wm and wm.group(1) in words:
-                        qty = words[wm.group(1)]
-                best = max(best, qty)
-            if best > 0:
-                counts[cls] += best
-        return counts
-
-    def build_llm_prompt(self, message):
-        """Build the LLM prompt from the editable competition vocabulary so the
-        model maps each official item name to its YOLO class and returns counts."""
-        name_lines = "\n".join(
-            f'  - "{name}" -> "{cls}"'
-            for name, cls in self.REQUEST_ITEM_TO_CLASS.items()
-        )
-        return (
-            "You are the order parser for a delivery robot. The robot can pick up "
-            "ONLY the items listed below. Each item name maps to a fixed class key:\n"
-            f"{name_lines}\n\n"
-            f"The user said: '{message}'.\n\n"
-            "Count how many of each CLASS the user wants. Quantities matter "
-            "(e.g. 'two burgers' -> the burger class = 2). If a class is not "
-            "requested its count is 0. Ignore anything not in the list above.\n\n"
-            "Return ONLY a raw JSON object (no markdown, no extra text) with exactly "
-            "two keys:\n"
-            "  1. \"counts\": an object with integer values for keys "
-            "\"drug\", \"hamburger\", \"iceCoffee\", \"mug\".\n"
-            "  2. \"reply\" : a short friendly sentence telling the user what you will fetch.\n\n"
-            "Example (item names may differ from the table above — always use the table):\n"
-            "User: 'two burgers and an ice coffee please' ->\n"
-            "{\"counts\": {\"drug\": 0, \"hamburger\": 2, \"iceCoffee\": 1, \"mug\": 0}, "
-            "\"reply\": \"Sure! Fetching 2 burgers and 1 ice coffee.\"}"
-        )
 
     def execute_store_pickup(self, target, target_norm, items):
         """Pick items at the current shop.
@@ -1254,51 +1110,6 @@ class RobotWebServer:
                 self.nudge_forward_and_recover(ref_yaw)
                 continue
                 
-            # Slowly rotate until we see the shop sign in view, then center on it to make sure we are perfectly perpendicular to the wall
-            if self.active_delivery_task:
-                rospy.loginfo("[Approach Workflow] Arrived near storefront. Searching for shop sign by rotating slowly...")
-                det_near = self.check_for_shop(target_category)
-                if not det_near:
-                    rate = rospy.Rate(10)
-                    
-                    # 1. Rotate CCW for 5 seconds
-                    cmd = Twist()
-                    cmd.angular.z = 0.12
-                    start_t = rospy.Time.now()
-                    while not rospy.is_shutdown() and self.active_delivery_task:
-                        if (rospy.Time.now() - start_t).toSec() > 5.0:
-                            break
-                        det_near = self.check_for_shop(target_category)
-                        if det_near:
-                            break
-                        self.cmd_vel_pub.publish(cmd)
-                        rate.sleep()
-                    
-                    self.cmd_vel_pub.publish(Twist())
-                    rospy.sleep(0.3)
-                    
-                    # 2. If still not found, rotate CW for 10 seconds
-                    if not det_near and self.active_delivery_task:
-                        cmd.angular.z = -0.12
-                        start_t = rospy.Time.now()
-                        while not rospy.is_shutdown() and self.active_delivery_task:
-                            if (rospy.Time.now() - start_t).toSec() > 10.0:
-                                break
-                            det_near = self.check_for_shop(target_category)
-                            if det_near:
-                                break
-                            self.cmd_vel_pub.publish(cmd)
-                            rate.sleep()
-                            
-                    self.cmd_vel_pub.publish(Twist())
-                    rospy.sleep(0.3)
-                
-                if det_near:
-                    rospy.loginfo("[Approach Workflow] Found shop sign. Performing precision centering...")
-                    self.center_on_shop(target_category, timeout=5.0)
-                    _, _, final_yaw = self.get_current_robot_pose()
-                    target_yaw = final_yaw
-
             # FINAL SQUARING UP
             rospy.loginfo("[Approach Workflow] Executing final exact rotation snap to 90 degrees...")
             self.rotate_to_yaw(target_yaw, threshold=0.015)
@@ -1531,10 +1342,6 @@ class RobotWebServer:
                             
                             # Wait for arrival
                             pose_info = self.tag_true_poses[resolved_tag]
-                            psi_deg = pose_info[2]
-                            psi_rad = math.radians(psi_deg)
-                            approach_dist = getattr(self, 'approach_dist_m', 0.60)
-                            
                             if "STORE_" in resolved_tag:
                                 gx, gy = pose_info[0], pose_info[1]
                             else:
@@ -1543,13 +1350,9 @@ class RobotWebServer:
                                     T = self.T.copy()
                                 tag_map = np.dot(R, np.array([pose_info[0], pose_info[1]])) + T
                                 gx, gy = tag_map[0], tag_map[1]
-                            
-                            # Calculate offset target pose
-                            tx = gx + approach_dist * math.cos(psi_rad)
-                            ty = gy + approach_dist * math.sin(psi_rad)
-                            
+                                
                             rx, ry, _ = self.get_current_robot_pose()
-                            success = (math.hypot(rx - tx, ry - ty) < 0.35) and (self.active_delivery_task is not None)
+                            success = (math.hypot(rx - gx, ry - gy) < 0.35) and (self.active_delivery_task is not None)
                         else:
                             rospy.logerr(f"[Shopping List] Could not resolve target for: {target_upper}")
                             break # Break retry loop if category is completely unresolvable
@@ -1640,13 +1443,8 @@ class RobotWebServer:
                             # Wait for arrival...
                             pose_info = self.tag_true_poses[resolved_tag]
                             gx, gy = pose_info[0], pose_info[1]
-                            psi_deg = pose_info[2]
-                            psi_rad = math.radians(psi_deg)
-                            approach_dist = getattr(self, 'approach_dist_m', 0.60)
-                            tx = gx + approach_dist * math.cos(psi_rad)
-                            ty = gy + approach_dist * math.sin(psi_rad)
                             rx, ry, _ = self.get_current_robot_pose()
-                            success = (math.hypot(rx - tx, ry - ty) < 0.35) and (self.active_delivery_task is not None)
+                            success = (math.hypot(rx - gx, ry - gy) < 0.35) and (self.active_delivery_task is not None)
                 if success:
                     break
             
@@ -1695,12 +1493,9 @@ class RobotWebServer:
         psi_rad = math.radians(psi_deg)
         
         # All signboard and landmark coordinates are defined directly in the 'map' frame
-        # Apply approach distance offset to stand in front of the tag
-        approach_dist = getattr(self, 'approach_dist_m', 0.60)
-        gx = tag_pt[0] + approach_dist * math.cos(psi_rad)
-        gy = tag_pt[1] + approach_dist * math.sin(psi_rad)
-        gyaw = psi_rad + math.pi
-        gyaw = (gyaw + math.pi) % (2 * math.pi) - math.pi  # Normalize to [-pi, pi]
+        gx = tag_pt[0]
+        gy = tag_pt[1]
+        gyaw = psi_rad
         
         rospy.loginfo(f"[Tag Nav] Target Pose in Map: ({gx:.2f}, {gy:.2f}, heading: {math.degrees(gyaw):.1f}°)")
         
@@ -1716,7 +1511,7 @@ class RobotWebServer:
             # Distance to the target position
             dist = math.hypot(rx - gx, ry - gy)
             
-            # Check if arrived at position (offset in front of signboard)
+            # Check if arrived at position (under signboard)
             if dist < 0.25:
                 rospy.loginfo("[Tag Nav] Arrived at target signboard position successfully.")
                 break
@@ -1819,85 +1614,47 @@ class RobotWebServer:
 
 
     def load_bundles(self, yaml_path):
-        rospack = rospkg.RosPack()
+        # Resolve path using rospkg
         try:
-            pkg_path = rospack.get_path('robot_web_ui')
+            pkg_path = rospkg.RosPack().get_path('robot_web_ui')
             mdr_path = os.path.dirname(os.path.dirname(os.path.dirname(pkg_path)))
-            signboards_path = os.path.join(mdr_path, 'HW4', 'signboards.yaml')
+            hw4_path = os.path.join(mdr_path, 'HW4', 'tags.yaml')
         except Exception:
-            signboards_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/signboards.yaml"
+            hw4_path = "/home/ee478_team1/catkin_ws/src/MDR_Project/HW4/tags.yaml"
 
-        tag_config = rospy.get_param('/hw4/apriltag_localization_node/tag_config_name', None)
-        if tag_config is None:
-            tag_config = rospy.get_param('/apriltag_localization_node/tag_config_name', '2026/ee478_n1_room113')
-        if not tag_config.endswith('.yaml'):
-            tag_config += '.yaml'
         try:
-            apriltag_path = rospack.get_path('apriltag_localization')
-            active_yaml = os.path.join(apriltag_path, 'config', tag_config)
+            apriltag_path = os.path.join(rospkg.RosPack().get_path('apriltag_localization'), 'tags.yaml')
         except Exception:
-            active_yaml = os.path.join(os.path.dirname(__file__), '../../AprilTagLocalization/config', tag_config)
+            apriltag_path = os.path.join(os.path.dirname(__file__), '../../AprilTagLocalization/tags.yaml')
 
-        bundles = {}
-        try:
-            # 1. Load sizes from active_yaml (ee478_n1_room113.yaml)
-            signboard_sizes = {}
-            if os.path.exists(active_yaml):
-                with open(active_yaml, 'r') as f:
-                    room_config = yaml.safe_load(f)
-                if room_config and 'TAG_TRUE_RT' in room_config and 'TAGS' in room_config['TAG_TRUE_RT']:
-                    for tag_def in room_config['TAG_TRUE_RT']['TAGS']:
-                        name = tag_def[0]
-                        size = float(tag_def[1])
-                        signboard_sizes[name] = size
-
-            # 2. Load signboards.yaml and build bundles
-            if os.path.exists(signboards_path):
-                with open(signboards_path, 'r') as f:
-                    signboards = yaml.safe_load(f)
-                if signboards:
-                    for board_name, tags in signboards.items():
-                        if not isinstance(tags, dict):
-                            continue
-                        size = signboard_sizes.get(board_name, 0.02)
-                        layout = []
-                        for tag_str, data in tags.items():
-                            try:
-                                tag_id = int(tag_str)
-                            except ValueError:
-                                continue
-                            
-                            dir_str = data.get('direction', 'Up').strip().lower()
-                            if dir_str == 'left':
-                                x_offset = -0.0655
-                            elif dir_str == 'right':
-                                x_offset = 0.0879
-                            else:
-                                x_offset = 0.0112
-                                
-                            layout.append({
-                                'id': tag_id,
-                                'size': size,
-                                'x': x_offset,
-                                'y': 0.0,
-                                'z': 0.0,
-                                'qw': 1.0,
-                                'qx': 0.0,
-                                'qy': 0.0,
-                                'qz': 0.0
-                            })
-                        if layout:
+        # Try multiple potential paths
+        paths = [
+            yaml_path,
+            hw4_path,
+            apriltag_path
+        ]
+        
+        for path in paths:
+            if os.path.exists(path):
+                try:
+                    with open(path, 'r') as f:
+                        config = yaml.safe_load(f)
+                    bundles = {}
+                    if config and 'tag_bundles' in config:
+                        for bundle in config['tag_bundles']:
+                            name = bundle.get('name', '')
+                            layout = bundle.get('layout', [])
+                            # Create a sorted tuple of tag IDs in this bundle
                             ids = tuple(sorted([item['id'] for item in layout]))
                             bundles[ids] = {
-                                'name': board_name,
+                                'name': name,
                                 'layout': {item['id']: item for item in layout}
                             }
-                    rospy.loginfo(f"Successfully generated {len(bundles)} AprilTag bundles dynamically from {signboards_path} and {active_yaml}")
-                    return bundles
-        except Exception as e:
-            rospy.logwarn(f"Failed to generate AprilTag bundles dynamically: {e}")
-            
-        rospy.logwarn("Could not dynamically load AprilTag bundles. Falling back to empty bundles.")
+                        rospy.loginfo(f"Successfully loaded {len(bundles)} AprilTag bundles from {path}")
+                        return bundles
+                except Exception as e:
+                    rospy.logwarn(f"Failed to load yaml from {path}: {e}")
+        rospy.logwarn("Could not load AprilTag bundles config. Falling back to standalone tags only.")
         return {}
 
     def draw_tags(self, img):
@@ -2920,71 +2677,122 @@ def delivery_send():
         return jsonify({"reply": "I did not receive a message. Please say something!"})
         
     server.append_user_chat_message(message)
-
-    # The robot can pick up ONLY four items. The LLM's single job is to map the
-    # user's sentence to a COUNT of each of these four (quantities matter). The
-    # store-to-visit grouping is then derived deterministically in code, so the
-    # LLM can never mis-assign stores.
-    counts = {"drug": 0, "hamburger": 0, "iceCoffee": 0, "mug": 0}
+    
+    tasks = []
     reply = ""
-
+    
     use_local = rospy.get_param("/use_local_ai", True)
-
+    
     if not use_local:
+        # Call the /llm_query service of the stateless client to parse the user's intent!
         try:
             rospy.wait_for_service("llm_query", timeout=2.0)
             llm_query_srv = rospy.ServiceProxy("llm_query", LLMQuery)
-
-            # Prompt is generated from the editable competition vocabulary
-            # (RobotWebServer.REQUEST_ITEM_TO_CLASS).
-            prompt = server.build_llm_prompt(message)
-
+            
+            prompt = (
+                f"The user wants to get some items. They said: '{message}'.\n"
+                f"Please match the items they requested to one of our 5 store categories:\n"
+                f"- 'Cafe' (for coffee, ice coffee, tea, latte, cappuccino, espresso, drinks, etc.)\n"
+                f"- 'Convenience store' (for onigiri, banana, snacks, chips, tissue, water, general shop items, etc.)\n"
+                f"- 'Fast-food restaurant' (for burger, fries, hamburger, food, pizza, chicken nuggets, etc.)\n"
+                f"- 'Pharmacy' (for medicine, aspirin, cough drop, band-aid, pills, etc.)\n"
+                f"- 'Pickup Point' (for packages, parcels, etc.)\n\n"
+                f"If there are items, group them by category.\n"
+                f"Return ONLY a raw JSON object with two keys:\n"
+                f"1. 'tasks': A list of objects, where each object has:\n"
+                f"   - 'target': The exact category string ('Cafe', 'Convenience store', 'Fast-food restaurant', 'Pharmacy', or 'Pickup Point')\n"
+                f"   - 'items': A list of strings containing the items matched to this category.\n"
+                f"2. 'reply': A polite conversational response to display to the user, listing the items and where you will pick them up (e.g., 'sounds good, here is where I will go to get your items: Cafe for coffee and ice coffee, Convenience store for onigiri and banana, Fast-food restaurant for burger and fries.').\n\n"
+                f"Example JSON output:\n"
+                f"{{\n"
+                f"  \"tasks\": [\n"
+                f"    {{\"target\": \"Cafe\", \"items\": [\"coffee\", \"ice coffee\"]}},\n"
+                f"    {{\"target\": \"Convenience store\", \"items\": [\"onigiri\", \"banana\"]}},\n"
+                f"    {{\"target\": \"Fast-food restaurant\", \"items\": [\"burger\", \"fries\"]}}\n"
+                f"  ],\n"
+                f"  \"reply\": \"sounds good, here is where I will go to get your items: Cafe for coffee and ice coffee, Convenience store for onigiri and banana, Fast-food restaurant for burger and fries.\"\n"
+                f"}}"
+            )
+            
             llm_req = LLMQueryRequest()
             llm_req.prompt = prompt
             llm_res = llm_query_srv(llm_req)
-
+            
+            # Parse reply safely
             cleaned_resp = llm_res.response.strip()
             if cleaned_resp.startswith("```json"):
                 cleaned_resp = cleaned_resp[7:]
-            if cleaned_resp.startswith("```"):
-                cleaned_resp = cleaned_resp[3:]
             if cleaned_resp.endswith("```"):
                 cleaned_resp = cleaned_resp[:-3]
             cleaned_resp = cleaned_resp.strip()
-
+            
             parsed = json.loads(cleaned_resp)
-            raw_counts = parsed.get("counts", {}) or {}
-            for k in counts:
-                try:
-                    counts[k] = int(raw_counts.get(k, 0) or 0)
-                except (ValueError, TypeError):
-                    counts[k] = 0
-            reply = parsed.get("reply", "") or ""
-
+            tasks = parsed.get("tasks", [])
+            reply = parsed.get("reply", "Understood! Executing tasks.")
+            
         except Exception as e:
             rospy.logwarn(f"LLM Query failed or timed out: {e}. Falling back to offline parser.")
             use_local = True
-
+            
     if use_local:
-        counts = server.local_parse_counts(message)
-        reply = server.reply_from_counts(counts)
-
-    # Sanitize: non-negative integers only.
-    counts = {k: max(0, int(v)) for k, v in counts.items()}
-    if not reply:
-        reply = server.reply_from_counts(counts)
-    total = sum(counts.values())
-
+        # Standard local backup parser for simple keywords
+        m = message.lower()
+        tasks = []
+        cafe_items = []
+        conv_items = []
+        burger_items = []
+        pharm_items = []
+        
+        # Simple local keywords mapping
+        if "coffee" in m or "cafe" in m or "drink" in m or "tea" in m:
+            items = []
+            if "ice coffee" in m or "ice-coffee" in m:
+                items.append("ice coffee")
+            if "coffee" in m and "ice coffee" not in m:
+                items.append("coffee")
+            if not items:
+                items.append("coffee")
+            cafe_items.extend(items)
+            
+        if "onigiri" in m or "banana" in m or "convenience" in m or "store" in m or "shop" in m:
+            items = []
+            if "onigiri" in m: items.append("onigiri")
+            if "banana" in m: items.append("banana")
+            if not items: items.append("general item")
+            conv_items.extend(items)
+            
+        if "burger" in m or "fries" in m or "food" in m or "restaurant" in m or "hamburger" in m:
+            items = []
+            if "burger" in m or "hamburger" in m: items.append("burger")
+            if "fries" in m: items.append("fries")
+            if not items: items.append("burger")
+            burger_items.extend(items)
+            
+        if "med" in m or "pharm" in m or "pill" in m or "sick" in m or "drug" in m:
+            pharm_items.append("medicine")
+            
+        if cafe_items:
+            tasks.append({"target": "Cafe", "items": cafe_items})
+        if conv_items:
+            tasks.append({"target": "Convenience store", "items": conv_items})
+        if burger_items:
+            tasks.append({"target": "Fast-food restaurant", "items": burger_items})
+        if pharm_items:
+            tasks.append({"target": "Pharmacy", "items": pharm_items})
+            
+        if tasks:
+            reply = "sounds good, here is where I will go to get your items: "
+            parts = []
+            for t in tasks:
+                parts.append(f"{t['target']} for {', '.join(t['items'])}")
+            reply += ", ".join(parts) + "."
+        else:
+            reply = "I'm not sure which storefront matches that request. Try asking for coffee, a burger, medicine, or convenience store items!"
+            
     server.append_bot_chat_message(reply)
-
-    if total > 0:
-        # (1) Publish the authoritative item counts -> orchestrator global state.
-        #     This is the LLM bridge: the orchestrator owns counting & dispatch.
-        rospy.loginfo(f"[web_server] Publishing item counts to orchestrator: {counts}")
-        server.pub_item_counts.publish(String(data=json.dumps(counts)))
-
-        # Build a per-store todo-list for the web UI only.
-        tasks = server.build_tasks_from_counts(counts)
+    
+    if tasks:
+        # Build active_todo_list
         server.active_todo_list = {
             "status": "in_progress",
             "stores": [
@@ -2995,17 +2803,20 @@ def delivery_send():
                 } for t in tasks
             ]
         }
-
-        # In the AprilTag hand-off design the nav teammate + orchestrator drive
-        # the mission, so web_server does NOT run its own navigation. Only the
-        # legacy/standalone path (external_nav false) navigates here.
-        if not getattr(server, 'external_nav', True):
-            server.start_shopping_list_workflow(tasks)
+        # (1) Publish per-item counts so the orchestrator stores them as the
+        #     authoritative global state and starts the mission.
+        if getattr(server, 'use_orchestrator_pickup', False):
+            counts = server.compute_item_counts(tasks)
+            rospy.loginfo(f"[web_server] Publishing item counts to orchestrator: {counts}")
+            server.pub_item_counts.publish(String(data=json.dumps(counts)))
+        server.start_shopping_list_workflow(tasks)
     else:
-        tasks = []
-        server.active_todo_list = {"status": "idle", "stores": []}
-
-    return jsonify({"reply": reply, "counts": counts, "tasks": tasks})
+        server.active_todo_list = {
+            "status": "idle",
+            "stores": []
+        }
+        
+    return jsonify({"reply": reply, "tasks": tasks})
 
 @app.route('/api/map_info')
 def api_map_info():

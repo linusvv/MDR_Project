@@ -61,7 +61,7 @@ PITCH          = -110        # End-effector pitch angle (deg) — near-horizonta
 PITCH_MIN      = -150       # IK search lower bound
 PITCH_MAX      = -70        # IK search upper bound (= PITCH; fully horizontal)
 
-HOME           = (0.00, 0.15, 0.06)    # Home position
+HOME           = (0.00, 0.15, 0.10)    # Home position
 GRASP_OFFSET_X = 0.000                 # Lateral offset correction (m) — tune if gripper misses left/right
 GRASP_OFFSET_Y = 0.000                 # Forward offset correction (m) — tune if gripper misses front/back
 
@@ -508,7 +508,7 @@ def pick_and_place(px, py, pz):
     # 8. Back up chassis before final placement
     rospy.loginfo('[pick_arm] Step 8: backing up chassis...')
     chassis_cmd(velocity=60, direction=270, angular=0)   # 270 deg = backward
-    rospy.sleep(2.0)
+    rospy.sleep(1.0)
     chassis_stop()
 
     # ── PLACE PHASE ───────────────────────────────────────────────────────

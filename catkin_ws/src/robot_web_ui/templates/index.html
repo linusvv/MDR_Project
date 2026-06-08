@@ -251,11 +251,30 @@
                     </div>
 
                     <!-- Approach Tuning -->
-                    <div style="margin-bottom: 1rem; background: rgba(255, 255, 255, 0.03); padding: 0.8rem; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.05); display: flex; flex-direction: column; gap: 0.5rem;">
-                        <label for="overshoot-val" style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.7); display: block;">Overshoot Value (cm):</label>
-                        <div style="display: flex; gap: 0.5rem;">
-                            <input type="number" id="overshoot-val" value="0" style="flex: 1; background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 0.5rem; color: #fff; font-size: 0.85rem; outline: none;">
-                            <button class="btn-primary" id="btn-apply-overshoot" style="font-size: 0.85rem; padding: 0.5rem 1rem;">Apply</button>
+                    <div style="margin-bottom: 1rem; background: rgba(255, 255, 255, 0.03); padding: 0.8rem; border-radius: 8px; border: 1px solid rgba(255, 255, 255, 0.05); display: flex; flex-direction: column; gap: 0.75rem;">
+                        <!-- Overshoot -->
+                        <div>
+                            <label for="overshoot-val" style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.7); display: block; margin-bottom: 0.25rem;">Overshoot Value (cm):</label>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <input type="number" id="overshoot-val" value="0" style="flex: 1; background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 0.5rem; color: #fff; font-size: 0.85rem; outline: none;">
+                                <button class="btn-primary" id="btn-apply-overshoot" style="font-size: 0.85rem; padding: 0.5rem 1rem;">Apply</button>
+                            </div>
+                        </div>
+                        <!-- Approach Distance -->
+                        <div>
+                            <label for="approach-dist-val" style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.7); display: block; margin-bottom: 0.25rem;">Approach Distance (cm):</label>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <input type="number" id="approach-dist-val" value="60" style="flex: 1; background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 0.5rem; color: #fff; font-size: 0.85rem; outline: none;">
+                                <button class="btn-primary" id="btn-apply-approach-dist" style="font-size: 0.85rem; padding: 0.5rem 1rem;">Apply</button>
+                            </div>
+                        </div>
+                        <!-- Tag Alignment Offset -->
+                        <div>
+                            <label for="tag-align-offset-val" style="font-size: 0.85rem; color: rgba(255, 255, 255, 0.7); display: block; margin-bottom: 0.25rem;">Tag Align Offset (deg):</label>
+                            <div style="display: flex; gap: 0.5rem;">
+                                <input type="number" id="tag-align-offset-val" value="0" style="flex: 1; background: rgba(0, 0, 0, 0.2); border: 1px solid rgba(255, 255, 255, 0.1); border-radius: 6px; padding: 0.5rem; color: #fff; font-size: 0.85rem; outline: none;">
+                                <button class="btn-primary" id="btn-apply-tag-align-offset" style="font-size: 0.85rem; padding: 0.5rem 1rem;">Apply</button>
+                            </div>
                         </div>
                     </div>
                     

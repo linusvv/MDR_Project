@@ -148,21 +148,49 @@ public:
 
         geometry_msgs::Twist cmd_vel;
 
+        // 0. Active 90-degree turn recovery phase (bypasses emergency brake check)
+        if (recovery_state_ == 3) {
+            double current_yaw = getYaw(robot_pose_map.pose.orientation);
+            double diff = std::abs(angleDiff(current_yaw, recovery_start_yaw_));
+            if (diff < 3.141592653589793 / 2.0) {
+                cmd_vel.linear.x = 0.0;
+                cmd_vel.linear.y = 0.0;
+                cmd_vel.angular.z = 0.3; // Turn at 0.3 rad/s
+                pubCommand.publish(cmd_vel);
+                return;
+            } else {
+                cmd_vel.linear.x = 0.0;
+                cmd_vel.linear.y = 0.0;
+                cmd_vel.angular.z = 0.0;
+                pubCommand.publish(cmd_vel);
+
+                teb_planner_.reset(new teb_local_planner::TebLocalPlannerROS());
+                teb_planner_->initialize("TebLocalPlannerROS", &tf_buffer_, costmap_ros_.get());
+
+                recovery_state_ = 0;
+                consecutive_failures_ = 0;
+                ROS_INFO("90-degree recovery turn complete. TEB reset. Retrying...");
+            }
+        }
+
         // 1. Obstacle too close crash-avoidance override / Emergency Brake
-        // If an obstacle is closer than 0.35m (5cm from physical footprint edge of 0.30m), trigger automatic emergency stop
-        if (min_obstacle_dist < 0.20) {
+        // If an obstacle is closer than 0.31m (1cm from physical footprint edge of 0.30m), trigger automatic emergency stop
+        if (min_obstacle_dist < 0.31) {
             ROS_WARN_THROTTLE(0.5, "EMERGENCY BRAKE: Obstacle too close (%.2fm). Stopping robot!", min_obstacle_dist);
             cmd_vel.linear.x = 0.0;
             cmd_vel.linear.y = 0.0;
             cmd_vel.angular.z = 0.0;
             pubCommand.publish(cmd_vel);
 
-            // Trigger global emergency stop
-            nh_.setParam("/exploration_paused", true);
-            nh_.setParam("/exploration_state", "STOP");
+            // Reset TEB and start 90-degree recovery turn instead of pausing
+            ROS_WARN("Initiating 90-degree recovery turn...");
+            recovery_state_ = 3;
+            recovery_start_yaw_ = getYaw(robot_pose_map.pose.orientation);
+
+            teb_planner_.reset(new teb_local_planner::TebLocalPlannerROS());
+            teb_planner_->initialize("TebLocalPlannerROS", &tf_buffer_, costmap_ros_.get());
 
             consecutive_failures_ = 0;
-            recovery_state_ = 0;
             return;
         }
 
@@ -236,6 +264,12 @@ public:
                 p.header.stamp = ros::Time(0); // Use latest available transforms
                 transformed_plan.push_back(p);
             }
+        }
+
+        // Overwrite the final goal's orientation to match the robot's current orientation
+        // so that TEB does not try to enforce any goal angle constraint (angle doesn't matter).
+        if (!transformed_plan.empty()) {
+            transformed_plan.back().pose.orientation = robot_pose_map.pose.orientation;
         }
 
         if (!teb_planner_->setPlan(transformed_plan)) {
@@ -313,8 +347,20 @@ private:
     int last_closest_idx_ = 0;
 
     int consecutive_failures_ = 0;
-    int recovery_state_ = 0; // 0: None, 1: Backup, 2: Spin
+    int recovery_state_ = 0; // 0: None, 1: Backup, 2: Spin, 3: Turn 90
     ros::Time recovery_start_time_;
+    double recovery_start_yaw_ = 0.0;
+
+    double getYaw(const geometry_msgs::Quaternion& q) {
+        return atan2(2.0 * (q.w * q.z + q.x * q.y), 1.0 - 2.0 * (q.y * q.y + q.z * q.z));
+    }
+
+    double angleDiff(double a, double b) {
+        double diff = a - b;
+        while (diff > 3.141592653589793) diff -= 2.0 * 3.141592653589793;
+        while (diff < -3.141592653589793) diff += 2.0 * 3.141592653589793;
+        return diff;
+    }
 
     // Calculate minimum distance to obstacles using costmap
     double getMinObstacleDistance(double robot_x, double robot_y) {

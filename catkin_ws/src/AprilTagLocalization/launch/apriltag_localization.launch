@@ -16,19 +16,22 @@
     <arg name="broadcast_world2cam_tf" default="true"/>
 
 
+    <!-- Run dynamic tags.yaml generator using parameters from signboards.yaml and ee478_n1_room113.yaml -->
+    <param name="dynamic_tags_generator" command="python3 $(find apriltag_localization)/scripts/generate_tags_yaml.py" />
+
     <group if="$(arg with_apriltag_ros)">
-        <!-- Override standard launch to pass custom tags.yaml -->
+        <!-- Override standard launch to pass dynamically generated tags -->
         <rosparam command="load" file="$(find apriltag_ros)/config/settings.yaml" ns="apriltag_ros_continuous_node" />
-        <rosparam command="load" file="$(find apriltag_localization)/../../../HW4/tags.yaml" ns="apriltag_ros_continuous_node" />
+        <rosparam command="load" file="$(find apriltag_localization)/config/2026/generated_tags.yaml" ns="apriltag_ros_continuous_node" />
         
-        <node pkg="apriltag_ros" type="apriltag_ros_continuous_node" name="apriltag_ros_continuous_node" clear_params="true" output="screen">
+        <node pkg="apriltag_ros" type="apriltag_ros_continuous_node" name="apriltag_ros_continuous_node" clear_params="true" output="screen" respawn="true">
             <remap from="image_rect" to="$(arg camera_name)/$(arg image_topic)" />
             <remap from="camera_info" to="$(arg camera_name)/camera_info" />
             <param name="publish_tag_detections_image" type="bool" value="true" />
         </node>
     </group>
 
-    <node name="apriltag_localization_node" pkg="apriltag_localization" type="apriltag_localization_node" output="screen">
+    <node name="apriltag_localization_node" pkg="apriltag_localization" type="apriltag_localization_node" output="screen" respawn="true">
         <param name="tag_config_name" value="$(arg tag_file_name)"/>
         <param name="world_frame_name" value="$(arg world_frame_name)"/>
         <param name="camera_frame_name" value="$(arg camera_frame_name)"/>

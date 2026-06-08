@@ -1,0 +1,286 @@
+standalone_tags: []
+tag_bundles:
+- layout:
+  - id: 1
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD01
+- layout:
+  - id: 2
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0112
+    y: 0.0
+    z: 0.0
+  - id: 3
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD02
+- layout:
+  - id: 4
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  - id: 5
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0112
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD03
+- layout:
+  - id: 6
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD04
+- layout:
+  - id: 7
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  - id: 8
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD05
+- layout:
+  - id: 9
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  - id: 10
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0112
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD06
+- layout:
+  - id: 11
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0112
+    y: 0.0
+    z: 0.0
+  - id: 12
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD07
+- layout:
+  - id: 13
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  - id: 14
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD08
+- layout:
+  - id: 15
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  - id: 16
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD09
+- layout:
+  - id: 17
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0112
+    y: 0.0
+    z: 0.0
+  - id: 18
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD10
+- layout:
+  - id: 19
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  - id: 20
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0112
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD11
+- layout:
+  - id: 21
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD12
+- layout:
+  - id: 22
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  - id: 23
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD13
+- layout:
+  - id: 24
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD14
+- layout:
+  - id: 25
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: -0.0655
+    y: 0.0
+    z: 0.0
+  - id: 26
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0112
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD15
+- layout:
+  - id: 27
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0112
+    y: 0.0
+    z: 0.0
+  - id: 28
+    qw: 1.0
+    qx: 0.0
+    qy: 0.0
+    qz: 0.0
+    size: 0.02
+    x: 0.0879
+    y: 0.0
+    z: 0.0
+  name: SIGNBOARD16

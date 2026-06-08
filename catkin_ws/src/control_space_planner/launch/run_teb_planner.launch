@@ -55,15 +55,15 @@
                 max_global_plan_lookahead_dist: 1.5 # Reduced lookahead for much faster planning
                 global_plan_viapoint_sep: 0.15 # Dense via-points keep the robot glued to the straight global plan
                 weight_kinematics_nh: 1000.0 # Reverted: Ackermann forward driving only
-                weight_kinematics_forward_drive: 1000.0 # Strongly penalize backing up to force pivoting
-                weight_kinematics_turning_radius: 0.1 # Extemely low penalty so it gladly pivots in tight spaces
+                weight_kinematics_forward_drive: 5000.0 # Strongly penalize backing up to force pivoting
+                weight_kinematics_turning_radius: 0.01 # Extemely low penalty so it gladly pivots in tight spaces
                 weight_optimaltime: 2.0 # Slightly higher so the path is driven efficiently without micro-oscillations
                 max_vel_x: 0.05 # Halved from 0.10
-                max_vel_x_backwards: 0.025 # Halved from 0.05
+                max_vel_x_backwards: 0.0 # Halved from 0.05
                 max_vel_y: 0.0     # Sideways movement disabled for front-sensor setup
-                max_vel_theta: 0.125 # Halved from 0.25
+                max_vel_theta: 0.25 # Halved from 0.25
                 acc_lim_x: 0.1 # Halved from 0.2
-                acc_lim_y: 0.0      # Sideways movement disabled
+                acc_lim_y: 0.0     # Sideways movement disabled
                 acc_lim_theta: 0.2 # Halved from 0.4
                 min_turning_radius: 0.0
                 wheelbase: 0.26
@@ -73,8 +73,8 @@
                     radius: 0.30    # Reverted to physical robot radius to fit inside corridors/hallways
  
                 # Goal Tolerance
-                xy_goal_tolerance: 0.10
-                yaw_goal_tolerance: 0.10
+                xy_goal_tolerance: 0.20
+                yaw_goal_tolerance: 0.20
                 free_goal_vel: True
  
                 # Obstacles
@@ -94,7 +94,7 @@
                 no_outer_iterations: 2 # Reduced for 50Hz loop speed
                 penalty_epsilon: 0.01  # Must stay below min speed (0.02 m/s); was 0.1 causing negative bound warnings
                 weight_obstacle: 150.0 # Increased from 50 to strongly avoid walls
-                weight_viopoint: 50.0 # Increased significantly so it actively tracks the global route
+                weight_viapoint: 50.0 # Increased significantly so it actively tracks the global route
                 weight_adapt_factor: 2.0
         </rosparam>
     </node>

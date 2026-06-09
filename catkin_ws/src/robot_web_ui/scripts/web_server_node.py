@@ -24,7 +24,7 @@ import json
 import subprocess
 from gpt_llm_client.srv import LLMQuery, LLMQueryRequest
 from std_srvs.srv import Empty as EmptySrv
-from std_msgs.msg import Bool
+from std_msgs.msg import Bool, String
 
 
 try:
@@ -147,6 +147,11 @@ class RobotWebServer:
         # YOLO control & state tracking
         self.pub_nav = rospy.Publisher('/yolo_nav/activate', Bool, queue_size=1, latch=True)
         self.pub_grab = rospy.Publisher('/yolo_grab/activate', Bool, queue_size=1, latch=True)
+        self.pub_target = rospy.Publisher('/target_item', String, queue_size=1, latch=True)
+
+        self.pick_arm_status = "idle"
+        self.pick_arm_success_flag = False
+        rospy.Subscriber('/pick_arm_heartbeat', String, self.pick_arm_heartbeat_cb)
 
         self.yolo_nav_state = True   # starts active
         self.yolo_grab_state = False # starts inactive
@@ -216,6 +221,7 @@ class RobotWebServer:
 
         self.planner_process = None
         self.costmap_process = None
+        self.start_planners()
         rospy.loginfo("Web Server Node initialized.")
 
     def _yolo_nav_state_cb(self, msg):
@@ -226,6 +232,14 @@ class RobotWebServer:
     def _yolo_grab_state_cb(self, msg):
         self.yolo_grab_state = msg.data
         rospy.loginfo(f"[web_server] Grabbing YOLO activation changed to {msg.data}")
+
+    def pick_arm_heartbeat_cb(self, msg):
+        status = msg.data.lower().strip()
+        with self.lock:
+            self.pick_arm_status = status
+            if "picked up object" in status:
+                self.pick_arm_success_flag = True
+        rospy.loginfo(f"[web_server] pick_arm_heartbeat: {status}")
 
     def toggle_yolo_light_switch(self):
         if not (self.yolo_nav_enabled and self.yolo_grab_enabled):
@@ -1365,6 +1379,23 @@ class RobotWebServer:
             items = task.get("items", [])
             target_upper = target.upper().strip()
             target_norm = self.normalize_category(target)
+
+            # Check if all items for this store are already completed (e.g. picked up opportunistically at another store)
+            all_done = True
+            with self.lock:
+                if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                    for s in self.active_todo_list["stores"]:
+                        if self.normalize_category(s["category"]) == target_norm:
+                            for it in s["items"]:
+                                if it["status"] not in ["completed", "failed"]:
+                                    all_done = False
+                else:
+                    all_done = False
+                    
+            if all_done and len(items) > 0:
+                rospy.loginfo(f"[Shopping List] Skipping {target_upper} because all items for it were already picked up.")
+                self.append_bot_chat_message(f"Skipping the {target} since all items from it are already loaded!")
+                continue
             
             rospy.loginfo(f"[Shopping List] Moving to next target: {target_upper} to pick up: {items}")
             self.append_bot_chat_message(f"Headed to the {target}...")
@@ -1450,7 +1481,7 @@ class RobotWebServer:
                     break
                         
             if success and self.active_delivery_task:
-                rospy.loginfo(f"[Shopping List] Successfully arrived at {target_upper}. Simulating pick up.")
+                rospy.loginfo(f"[Shopping List] Successfully arrived at {target_upper}. Commencing physical pickup sequence.")
                 self.append_bot_chat_message(f"Arrived at the {target}. Commencing item pick up.")
                 
                 with self.lock:
@@ -1459,27 +1490,174 @@ class RobotWebServer:
                             if self.normalize_category(s["category"]) == target_norm:
                                 s["status"] = "arrived"
                                 
+                # Determine what items are sold at the current store
+                if target_norm == "convenience store":
+                    sold_here = ["first-aid-kit", "burgers", "ice coffee", "mug"]
+                elif target_norm == "cafe":
+                    sold_here = ["ice coffee", "mug"]
+                elif target_norm == "pharmacy":
+                    sold_here = ["first-aid-kit"]
+                elif target_norm == "fast-food restaurant":
+                    sold_here = ["burgers"]
+                else:
+                    sold_here = []
+
+                # Find any other pending items on the list that are sold here (opportunistic pickup)
+                additional_items = []
+                with self.lock:
+                    if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                        for s in self.active_todo_list["stores"]:
+                            if self.normalize_category(s["category"]) == target_norm:
+                                continue
+                            for it in s["items"]:
+                                if it["status"] == "pending" and it["name"] in sold_here:
+                                    additional_items.append((s["category"], it["name"]))
+
+                if additional_items:
+                    rospy.loginfo(f"[Shopping List] Opportunistic pickup! Current store {target} can fulfill: {additional_items}")
+                    self.append_bot_chat_message(f"Since I am at the {target}, I will also pick up: {', '.join(name for _, name in additional_items)} here to save visits.")
+                    
+                    # Mark them as picking_up
+                    with self.lock:
+                        if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                            for cat, name in additional_items:
+                                for s in self.active_todo_list["stores"]:
+                                    if s["category"] == cat:
+                                        for it in s["items"]:
+                                            if it["name"] == name:
+                                                it["status"] = "picking_up"
+                                                
+                    # Add them to the items to pick up at this storefront!
+                    items = list(items)  # make a copy
+                    for _, name in additional_items:
+                        if name not in items:
+                            items.append(name)
+
+                # Map items and categories to YOLO classes
+                item_to_class = {
+                    "coffee": "iceCoffee",
+                    "ice coffee": "iceCoffee",
+                    "burger": "hamburger",
+                    "burgers": "hamburger",
+                    "hamburger": "hamburger",
+                    "fries": "hamburger",
+                    "medicine": "drug",
+                    "first-aid-kit": "drug",
+                    "onigiri": "mug",
+                    "banana": "mug",
+                    "mug": "mug",
+                    "general item": "mug"
+                }
+                category_to_class = {
+                    "cafe": "iceCoffee",
+                    "fast-food restaurant": "hamburger",
+                    "pharmacy": "drug",
+                    "convenience store": "mug"
+                }
+
+                # Save resources: turn off navigation YOLO and C++ motion planners
+                rospy.loginfo("[web_server] Deactivating navigation YOLO and stopping motion planners for CPU/GPU optimization...")
+                self._yolo_active = False
+                self.stop_planners()
+
                 for item in items:
                     if not self.active_delivery_task:
                         break
                     with self.lock:
                         if hasattr(self, 'active_todo_list') and self.active_todo_list:
                             for s in self.active_todo_list["stores"]:
-                                if self.normalize_category(s["category"]) == target_norm:
-                                    for it in s["items"]:
-                                        if it["name"] == item:
-                                            it["status"] = "picking_up"
+                                for it in s["items"]:
+                                    if it["name"] == item:
+                                        it["status"] = "picking_up"
+                                            
                     self.append_bot_chat_message(f"Picking up {item}...")
-                    rospy.sleep(2.0)
+
+                    # Resolve target class name for yolo_detector
+                    item_key = item.lower().strip()
+                    target_class = item_to_class.get(item_key)
+                    if not target_class:
+                        target_class = category_to_class.get(target_norm)
+                    if not target_class:
+                        target_class = item_key # fallback
+                    
+                    rospy.loginfo(f"[web_server] Starting physical pickup sequence for item '{item}' mapped to class '{target_class}'")
+                    
+                    # Reset pick_arm status & success flag
                     with self.lock:
-                        if hasattr(self, 'active_todo_list') and self.active_todo_list:
-                            for s in self.active_todo_list["stores"]:
-                                if self.normalize_category(s["category"]) == target_norm:
+                        self.pick_arm_status = "idle"
+                        self.pick_arm_success_flag = False
+                    
+                    # Publish target item and activate grabbing YOLO
+                    self.pub_target.publish(String(target_class))
+                    rospy.sleep(0.5)
+                    self.pub_grab.publish(Bool(True))
+
+                    # Monitor the heartbeat.
+                    # Wait for detect / approach / pick phases
+                    # Timeout if we don't start seeing the object or starting approach within 12 seconds,
+                    # or if the entire pickup takes more than 50 seconds.
+                    start_time = rospy.Time.now()
+                    grab_begun = False
+                    grab_timeout = 50.0
+                    detection_timeout = 12.0
+                    
+                    while not rospy.is_shutdown() and self.active_delivery_task:
+                        with self.lock:
+                            current_status = self.pick_arm_status
+                            success_flag = self.pick_arm_success_flag
+                        
+                        elapsed = (rospy.Time.now() - start_time).to_sec()
+                        
+                        if success_flag:
+                            rospy.loginfo("[web_server] Grabbing sequence reported success!")
+                            break
+                            
+                        # If we have not started the grab sequence, check for detection timeout
+                        if not grab_begun:
+                            if current_status in ["detecting object", "approaching object", "picking up object"]:
+                                grab_begun = True
+                                rospy.loginfo("[web_server] Grab sequence initiated by pick_arm_node.")
+                            elif elapsed > detection_timeout:
+                                rospy.logwarn("[web_server] Target detection timeout. pick_arm_node could not locate target.")
+                                self.append_bot_chat_message(f"Could not locate the {item} in camera view.")
+                                break
+                        
+                        if elapsed > grab_timeout:
+                            rospy.logwarn("[web_server] Grabbing sequence timed out.")
+                            self.append_bot_chat_message(f"Pickup for {item} timed out.")
+                            break
+                            
+                        rospy.sleep(0.5)
+
+                    # Deactivate grabbing YOLO and target
+                    self.pub_grab.publish(Bool(False))
+                    self.pub_target.publish(String("None"))
+
+                    with self.lock:
+                        item_succeeded = self.pick_arm_success_flag
+
+                    if item_succeeded:
+                        with self.lock:
+                            if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                                for s in self.active_todo_list["stores"]:
                                     for it in s["items"]:
                                         if it["name"] == item:
                                             it["status"] = "completed"
-                    self.append_bot_chat_message(f"Loaded {item}!")
-                    self.tasks_fulfilled += 1
+                        self.append_bot_chat_message(f"Loaded {item}!")
+                        self.tasks_fulfilled += 1
+                    else:
+                        with self.lock:
+                            if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                                for s in self.active_todo_list["stores"]:
+                                    for it in s["items"]:
+                                        if it["name"] == item:
+                                            it["status"] = "failed"
+                        self.append_bot_chat_message(f"Failed to pick up {item}.")
+
+                # Reactivate resources for next destination navigation
+                rospy.loginfo("[web_server] Grasping phase complete. Restoring motion planners and navigation YOLO...")
+                self._yolo_active = True
+                self.start_planners()
                     
                 with self.lock:
                     if hasattr(self, 'active_todo_list') and self.active_todo_list:
@@ -2774,6 +2952,29 @@ def delivery_clear():
     server.stop_robot()
     return jsonify({"status": "success", "message": "Delivery plan cleared."})
 
+def normalize_item_name(item_name):
+    name = item_name.lower().strip()
+    if any(x in name for x in ["burger", "hamburger", "fries", "fast food", "food"]):
+        return "burgers"
+    if any(x in name for x in ["med", "pharm", "pill", "sick", "drug", "first aid", "first-aid", "aspirin", "band-aid", "kit"]):
+        return "first-aid-kit"
+    if any(x in name for x in ["coffee", "drink", "tea", "latte", "cappuccino", "espresso"]):
+        return "ice coffee"
+    if any(x in name for x in ["mug", "cup"]):
+        return "mug"
+    return None
+
+def plan_shopping_list(requested_items):
+    if not requested_items:
+        return []
+    if all(item in ["ice coffee", "mug"] for item in requested_items):
+        return [{"target": "Cafe", "items": list(requested_items)}]
+    if all(item == "first-aid-kit" for item in requested_items):
+        return [{"target": "Pharmacy", "items": list(requested_items)}]
+    if all(item == "burgers" for item in requested_items):
+        return [{"target": "Fast-food restaurant", "items": list(requested_items)}]
+    return [{"target": "Convenience store", "items": list(requested_items)}]
+
 @app.route('/api/delivery/send', methods=['POST'])
 def delivery_send():
     data = request.json
@@ -2791,33 +2992,36 @@ def delivery_send():
     use_local = rospy.get_param("/use_local_ai", True)
     
     if not use_local:
-        # Call the /llm_query service of the stateless client to parse the user's intent!
         try:
             rospy.wait_for_service("llm_query", timeout=2.0)
             llm_query_srv = rospy.ServiceProxy("llm_query", LLMQuery)
             
             prompt = (
                 f"The user wants to get some items. They said: '{message}'.\n"
-                f"Please match the items they requested to one of our 5 store categories:\n"
-                f"- 'Cafe' (for coffee, ice coffee, tea, latte, cappuccino, espresso, drinks, etc.)\n"
-                f"- 'Convenience store' (for onigiri, banana, snacks, chips, tissue, water, general shop items, etc.)\n"
-                f"- 'Fast-food restaurant' (for burger, fries, hamburger, food, pizza, chicken nuggets, etc.)\n"
-                f"- 'Pharmacy' (for medicine, aspirin, cough drop, band-aid, pills, etc.)\n"
-                f"- 'Pickup Point' (for packages, parcels, etc.)\n\n"
-                f"If there are items, group them by category.\n"
+                f"Please match the items they requested to one of our 4 canonical items and group them to minimize the number of shop visits.\n"
+                f"Our canonical items are: 'first-aid-kit', 'burgers', 'ice coffee', 'mug'.\n"
+                f"Synonym mapping rules:\n"
+                f"- Map medicine, drugs, pills, sick, band-aid, aspirin, first aid to 'first-aid-kit'.\n"
+                f"- Map burger, burgers, hamburger, fries, fast food, food to 'burgers'.\n"
+                f"- Map coffee, ice coffee, tea, latte, drink, drinks to 'ice coffee'.\n"
+                f"- Map mug, cup to 'mug'.\n\n"
+                f"Store availability:\n"
+                f"- 'Cafe' sells: 'ice coffee', 'mug'\n"
+                f"- 'Pharmacy' sells: 'first-aid-kit'\n"
+                f"- 'Fast-food restaurant' sells: 'burgers'\n"
+                f"- 'Convenience store' sells all items ('first-aid-kit', 'burgers', 'ice coffee', 'mug')\n\n"
+                f"Optimization Rule: ALWAYS minimize the number of shop visits. If the items belong to different stores (e.g., first-aid-kit and burgers), consolidate them into a single visit to 'Convenience store' instead of visiting multiple shops.\n\n"
                 f"Return ONLY a raw JSON object with two keys:\n"
                 f"1. 'tasks': A list of objects, where each object has:\n"
-                f"   - 'target': The exact category string ('Cafe', 'Convenience store', 'Fast-food restaurant', 'Pharmacy', or 'Pickup Point')\n"
-                f"   - 'items': A list of strings containing the items matched to this category.\n"
-                f"2. 'reply': A polite conversational response to display to the user, listing the items and where you will pick them up (e.g., 'sounds good, here is where I will go to get your items: Cafe for coffee and ice coffee, Convenience store for onigiri and banana, Fast-food restaurant for burger and fries.').\n\n"
+                f"   - 'target': The exact category string ('Cafe', 'Convenience store', 'Fast-food restaurant', or 'Pharmacy')\n"
+                f"   - 'items': A list of strings containing the matched canonical items.\n"
+                f"2. 'reply': A polite conversational response listing where the robot will go to get the items.\n\n"
                 f"Example JSON output:\n"
                 f"{{\n"
                 f"  \"tasks\": [\n"
-                f"    {{\"target\": \"Cafe\", \"items\": [\"coffee\", \"ice coffee\"]}},\n"
-                f"    {{\"target\": \"Convenience store\", \"items\": [\"onigiri\", \"banana\"]}},\n"
-                f"    {{\"target\": \"Fast-food restaurant\", \"items\": [\"burger\", \"fries\"]}}\n"
+                f"    {{\"target\": \"Convenience store\", \"items\": [\"first-aid-kit\", \"burgers\"]}}\n"
                 f"  ],\n"
-                f"  \"reply\": \"sounds good, here is where I will go to get your items: Cafe for coffee and ice coffee, Convenience store for onigiri and banana, Fast-food restaurant for burger and fries.\"\n"
+                f"  \"reply\": \"Sure thing! I will go to the Convenience store to get you a first-aid-kit and burgers.\"\n"
                 f"}}"
             )
             
@@ -2825,7 +3029,6 @@ def delivery_send():
             llm_req.prompt = prompt
             llm_res = llm_query_srv(llm_req)
             
-            # Parse reply safely
             cleaned_resp = llm_res.response.strip()
             if cleaned_resp.startswith("```json"):
                 cleaned_resp = cleaned_resp[7:]
@@ -2834,59 +3037,44 @@ def delivery_send():
             cleaned_resp = cleaned_resp.strip()
             
             parsed = json.loads(cleaned_resp)
-            tasks = parsed.get("tasks", [])
-            reply = parsed.get("reply", "Understood! Executing tasks.")
+            raw_tasks = parsed.get("tasks", [])
+            
+            # Map/normalize raw items and re-plan optimally to guarantee minimum visits
+            all_requested = set()
+            for t in raw_tasks:
+                for item in t.get("items", []):
+                    normalized = normalize_item_name(item)
+                    if normalized:
+                        all_requested.add(normalized)
+                        
+            tasks = plan_shopping_list(all_requested)
+            
+            if tasks:
+                reply = "sounds good, here is where I will go to get your items: "
+                parts = []
+                for t in tasks:
+                    parts.append(f"{t['target']} for {', '.join(t['items'])}")
+                reply += ", ".join(parts) + "."
+            else:
+                reply = parsed.get("reply", "Understood! Executing tasks.")
             
         except Exception as e:
             rospy.logwarn(f"LLM Query failed or timed out: {e}. Falling back to offline parser.")
             use_local = True
             
     if use_local:
-        # Standard local backup parser for simple keywords
         m = message.lower()
-        tasks = []
-        cafe_items = []
-        conv_items = []
-        burger_items = []
-        pharm_items = []
-        
-        # Simple local keywords mapping
-        if "coffee" in m or "cafe" in m or "drink" in m or "tea" in m:
-            items = []
-            if "ice coffee" in m or "ice-coffee" in m:
-                items.append("ice coffee")
-            if "coffee" in m and "ice coffee" not in m:
-                items.append("coffee")
-            if not items:
-                items.append("coffee")
-            cafe_items.extend(items)
+        all_requested = set()
+        if any(x in m for x in ["burger", "hamburger", "fries", "fast food", "food"]):
+            all_requested.add("burgers")
+        if any(x in m for x in ["med", "pharm", "pill", "sick", "drug", "first aid", "first-aid", "aspirin", "band-aid", "kit"]):
+            all_requested.add("first-aid-kit")
+        if any(x in m for x in ["coffee", "drink", "tea", "latte", "cappuccino", "espresso"]):
+            all_requested.add("ice coffee")
+        if any(x in m for x in ["mug", "cup"]):
+            all_requested.add("mug")
             
-        if "onigiri" in m or "banana" in m or "convenience" in m or "store" in m or "shop" in m:
-            items = []
-            if "onigiri" in m: items.append("onigiri")
-            if "banana" in m: items.append("banana")
-            if not items: items.append("general item")
-            conv_items.extend(items)
-            
-        if "burger" in m or "fries" in m or "food" in m or "restaurant" in m or "hamburger" in m:
-            items = []
-            if "burger" in m or "hamburger" in m: items.append("burger")
-            if "fries" in m: items.append("fries")
-            if not items: items.append("burger")
-            burger_items.extend(items)
-            
-        if "med" in m or "pharm" in m or "pill" in m or "sick" in m or "drug" in m:
-            pharm_items.append("medicine")
-            
-        if cafe_items:
-            tasks.append({"target": "Cafe", "items": cafe_items})
-        if conv_items:
-            tasks.append({"target": "Convenience store", "items": conv_items})
-        if burger_items:
-            tasks.append({"target": "Fast-food restaurant", "items": burger_items})
-        if pharm_items:
-            tasks.append({"target": "Pharmacy", "items": pharm_items})
-            
+        tasks = plan_shopping_list(all_requested)
         if tasks:
             reply = "sounds good, here is where I will go to get your items: "
             parts = []
@@ -2894,12 +3082,11 @@ def delivery_send():
                 parts.append(f"{t['target']} for {', '.join(t['items'])}")
             reply += ", ".join(parts) + "."
         else:
-            reply = "I'm not sure which storefront matches that request. Try asking for coffee, a burger, medicine, or convenience store items!"
+            reply = "I'm not sure which storefront matches that request. Try asking for burgers, a first-aid-kit, ice coffee, or a mug!"
             
     server.append_bot_chat_message(reply)
     
     if tasks:
-        # Build active_todo_list
         server.active_todo_list = {
             "status": "in_progress",
             "stores": [

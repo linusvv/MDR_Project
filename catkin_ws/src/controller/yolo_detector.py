@@ -66,6 +66,8 @@ MIN_DEPTH    = 0.05       # Ignore detections closer than this distance (meters)
 # /yolo/arm_point immediately, making pick_arm grab objects with no LLM command.
 _active      = False
 _active_lock = threading.Lock()
+_last_inference_time = 0.0
+_inference_interval = 0.15   # cap inference rate to ~6.7 Hz to prevent CPU spikes
 
 def activate_cb(msg):
     global _active
@@ -124,16 +126,28 @@ def camera_info_cb(msg):
 
 def class_cb(msg):
     """
-    Receives /yolo/class (std_msgs/String).
+    Receives /yolo/class or /target_item (std_msgs/String).
     Updates the target class at runtime.
     Empty string -> allow all classes.
     """
     global _target_class
-    new_class = msg.data.strip()
+    raw_class = msg.data.strip()
+    new_class = raw_class
+    c = raw_class.lower()
+    if c:
+        if any(x in c for x in ["burger", "hamburger", "fries", "fast food", "food"]):
+            new_class = "hamburger"
+        elif any(x in c for x in ["med", "pharm", "pill", "sick", "drug", "first aid", "first-aid", "aspirin", "band-aid", "kit"]):
+            new_class = "drug"
+        elif any(x in c for x in ["coffee", "drink", "tea", "latte", "cappuccino", "espresso"]):
+            new_class = "iceCoffee"
+        elif any(x in c for x in ["mug", "cup"]):
+            new_class = "mug"
+            
     with _target_class_lock:
         _target_class = new_class
-    if new_class:
-        rospy.loginfo(f"[yolo] Target class set: '{new_class}'")
+    if raw_class:
+        rospy.loginfo(f"[yolo] Target class set: '{new_class}' (raw input: '{raw_class}')")
     else:
         rospy.loginfo("[yolo] Target class cleared (all classes allowed)")
 
@@ -183,12 +197,20 @@ def get_robust_depth(depth_img, u, v, radius=DEPTH_RADIUS):
 # ════════════════════════════════════════════════════════════════════════════
 
 def sync_callback(color_msg, depth_msg):
+    global _last_inference_time
     # ── Activation gate: do nothing until the orchestrator switches to grab ──
     # Returns BEFORE any cv_bridge conversion or inference, so an inactive node
     # costs almost no CPU/GPU and never drives the arm.
     with _active_lock:
         if not _active:
             return
+
+    # ── Rate Limiter ──
+    # Limit inference rate to prevent overloading the system
+    now = rospy.Time.now().to_sec()
+    if now - _last_inference_time < _inference_interval:
+        return
+    _last_inference_time = now
 
     if not intrinsic_ready:
         rospy.logwarn_throttle(5, "Camera intrinsics not yet received")

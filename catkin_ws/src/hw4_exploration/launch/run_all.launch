@@ -103,14 +103,14 @@
 
     <!-- ==================== COMMON SETUP ==================== -->
 
-    <!-- 2. Start local costmap generator -->
-    <include file="$(find local_costmap_generator)/launch/run.launch" />
+    <!-- 2. Start local costmap generator (now managed dynamically by web_server_node to save CPU) -->
+    <!-- <include file="$(find local_costmap_generator)/launch/run.launch" /> -->
 
     <!-- 3.7 Start the Map Odom Publisher -->
     <node name="map_odom_publisher" pkg="hw4_exploration" type="map_odom_publisher.py" output="screen" />
 
-    <!-- 5. Start the existing Python Motion Primitives Planner -->
-    <include file="$(find control_space_planner)/launch/run.launch" />
+    <!-- 5. Start the existing Python Motion Primitives Planner (now managed dynamically by web_server_node to save CPU) -->
+    <!-- <include file="$(find control_space_planner)/launch/run.launch" /> -->
 
     <!-- 6. Start LLM Client Node (Crash-free Startup) -->
     <node name="simple_llm_client" pkg="gpt_llm_client" type="simple_llm_client.py" output="screen" />
@@ -146,4 +146,14 @@
     <group if="$(arg use_rviz)">
         <node pkg="rviz" type="rviz" name="rviz_display" args="-d $(find hw4_exploration)/rviz/ee478_rtabmap.rviz" output="screen" />
     </group>
+
+    <!-- 12. Start YOLO Detector for Grab Target (Remap depth topic in simulation) -->
+    <node name="yolo_detector" pkg="controller" type="yolo_detector.py" output="screen" respawn="true">
+        <remap from="/camera/aligned_depth_to_color/image_raw" to="/camera/depth/image_raw" if="$(arg sim)" />
+    </node>
+
+    <!-- 13. Start Pick Arm Controller (Remap depth topic in simulation) -->
+    <node name="pick_arm_node" pkg="controller" type="pick_arm_node.py" output="screen" respawn="true">
+        <remap from="/camera/aligned_depth_to_color/image_raw" to="/camera/depth/image_raw" if="$(arg sim)" />
+    </node>
 </launch>

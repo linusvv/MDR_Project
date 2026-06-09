@@ -114,34 +114,7 @@ class RobotWebServer:
         self.last_yolo_viz_results = []
         self.last_yolo_viz_time = 0
 
-        # YOLO initialization — prefer TensorRT .engine over PyTorch .pt
-        try:
-            pkg_path = rospack.get_path('robot_web_ui')
-            model_dir = os.path.join(pkg_path, 'yolo_models')
-        except Exception:
-            model_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'yolo_models')
-
-        engine_path = os.path.join(model_dir, 'shops.engine')
-        pt_path     = os.path.join(model_dir, 'shops.pt')
-        model_path  = engine_path if os.path.exists(engine_path) else pt_path
-
         self.yolo_model = None
-        if YOLO and os.path.exists(model_path):
-            self.yolo_model = YOLO(model_path, task="detect")
-            rospy.loginfo(f"YOLO model loaded from {model_path}")
-            
-            # --- GPU WARMUP TO ELIMINATE THE CONTEXT GENERATION FREEZE ---
-            try:
-                rospy.loginfo("[web_server] Priming CUDA context for YOLO tracking pipeline...")
-                dummy_img = np.zeros((480, 640, 3), dtype=np.uint8)
-                _ = self.yolo_model.predict(dummy_img, conf=0.25, verbose=False, device='cuda')
-                rospy.loginfo("[web_server] YOLO pipeline warmed up and live.")
-            except Exception as e:
-                rospy.logwarn(f"[web_server] YOLO context warmup failed: {e}")
-        else:
-            rospy.logwarn(f"YOLO model not found at {model_path} or ultralytics not installed.")
-
-        # YOLO Activation Gate — set to active immediately on startup to prevent intermediate toggles
         self._yolo_active = True
         
         # YOLO control & state tracking
@@ -218,10 +191,15 @@ class RobotWebServer:
         # YOLO activation gate
         rospy.Subscriber('/yolo_nav/activate', Bool, self._yolo_nav_state_cb)
         rospy.Subscriber('/yolo_grab/activate', Bool, self._yolo_grab_state_cb)
+        rospy.Subscriber('/yolo/nav_detections', String, self.nav_detections_cb)
 
         self.planner_process = None
         self.costmap_process = None
+        self.nav_yolo_process = None
+        self.grab_yolo_process = None
+        self.start_nav_yolo()
         self.start_planners()
+        rospy.on_shutdown(self.shutdown)
         rospy.loginfo("Web Server Node initialized.")
 
     def _yolo_nav_state_cb(self, msg):
@@ -271,6 +249,81 @@ class RobotWebServer:
             self.delivery_chat_history.append({"sender": "user", "text": text})
             if len(self.delivery_chat_history) > 100:
                 self.delivery_chat_history.pop(0)
+
+    def start_nav_yolo(self):
+        """Starts the navigation YOLO node as a subprocess."""
+        with self.lock:
+            if getattr(self, 'nav_yolo_process', None) is None:
+                rospy.loginfo("[web_server] Starting Navigation YOLO node...")
+                try:
+                    self.nav_yolo_process = subprocess.Popen(
+                        ["python3", "/home/ee478_team1/catkin_ws/src/MDR_Project/catkin_ws/src/controller/yolo_detector.py", "_model_type:=nav"]
+                    )
+                    rospy.loginfo("[web_server] Navigation YOLO node started.")
+                except Exception as e:
+                    rospy.logerr(f"[web_server] Failed to start Navigation YOLO node: {e}")
+
+    def stop_nav_yolo(self):
+        """Completely kills the navigation YOLO node to free resources."""
+        with self.lock:
+            if getattr(self, 'nav_yolo_process', None) is not None:
+                rospy.loginfo("[web_server] Stopping Navigation YOLO node...")
+                try:
+                    self.nav_yolo_process.terminate()
+                    self.nav_yolo_process.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        self.nav_yolo_process.kill()
+                    except Exception:
+                        pass
+                self.nav_yolo_process = None
+                rospy.loginfo("[web_server] Navigation YOLO node stopped and killed.")
+
+    def start_grab_yolo(self):
+        """Starts the grabbing YOLO node as a subprocess."""
+        with self.lock:
+            if getattr(self, 'grab_yolo_process', None) is None:
+                rospy.loginfo("[web_server] Starting Grabbing YOLO node...")
+                try:
+                    self.grab_yolo_process = subprocess.Popen(
+                        ["python3", "/home/ee478_team1/catkin_ws/src/MDR_Project/catkin_ws/src/controller/yolo_detector.py", "_model_type:=grab"]
+                    )
+                    rospy.loginfo("[web_server] Grabbing YOLO node started.")
+                except Exception as e:
+                    rospy.logerr(f"[web_server] Failed to start Grabbing YOLO node: {e}")
+
+    def stop_grab_yolo(self):
+        """Completely kills the grabbing YOLO node to free resources."""
+        with self.lock:
+            if getattr(self, 'grab_yolo_process', None) is not None:
+                rospy.loginfo("[web_server] Stopping Grabbing YOLO node...")
+                try:
+                    self.grab_yolo_process.terminate()
+                    self.grab_yolo_process.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        self.grab_yolo_process.kill()
+                    except Exception:
+                        pass
+                self.grab_yolo_process = None
+                rospy.loginfo("[web_server] Grabbing YOLO node stopped and killed.")
+
+    def shutdown(self):
+        """Terminates all running dynamic processes on shutdown."""
+        rospy.loginfo("[web_server] Shutting down, stopping all dynamic processes...")
+        self.stop_planners()
+        self.stop_nav_yolo()
+        self.stop_grab_yolo()
+
+    def nav_detections_cb(self, msg):
+        """Caches navigation YOLO detections received via topic."""
+        try:
+            import json
+            detections = json.loads(msg.data)
+            with self.lock:
+                self.last_yolo_viz_results = detections
+        except Exception as e:
+            rospy.logwarn(f"[web_server] Error parsing nav detections: {e}")
 
     def start_planners(self):
         """Starts the motion planner nodes (TEB planner, costmap, etc.) if they are not already running."""
@@ -345,8 +398,11 @@ class RobotWebServer:
         stop_cmd = Twist()
         self.cmd_vel_pub.publish(stop_cmd)
         
-        # Kill the planners on stop
+        # Kill the planners and ensure grab YOLO is stopped while nav YOLO and planners are running
         self.stop_planners()
+        self.stop_grab_yolo()
+        self.start_nav_yolo()
+        self.start_planners()
         
         rospy.logwarn("[EMERGENCY STOP] Robot and planners stopped.")
 
@@ -356,23 +412,8 @@ class RobotWebServer:
             
             if self.enable_camera_viz:
                 # Run YOLO prediction outside the lock
-                now = time.time()
-                yolo_results = None
-                
-                # Retrieve parameters outside the lock to minimize contention
-                yolo_model = self.yolo_model
-                viz_yolo = self.viz_yolo
-                yolo_active = self._yolo_active
-                
-                if yolo_model is not None and viz_yolo and yolo_active:
-                    if now - self.last_yolo_viz_time > 0.5:
-                        yolo_results = yolo_model.predict(cv_image, conf=0.25, verbose=False, device='cuda')
-                
                 # Draw overlays and update state under the lock
                 with self.lock:
-                    if yolo_results is not None:
-                        self.last_yolo_viz_results = yolo_results
-                        self.last_yolo_viz_time = now
                         
                     if self.camera_info is not None:
                         cv_image = self.draw_tags(cv_image)
@@ -855,53 +896,52 @@ class RobotWebServer:
         with self.lock:
             img = self.color_image.copy() if self.color_image is not None else None
             depth_raw = getattr(self, 'depth_raw', None)
+            detections = list(self.last_yolo_viz_results)
             
         if img is not None:
-            # Lowered confidence check restriction to 0.25 to align with general frame captures
-            results = self.yolo_model.predict(img, conf=0.25, verbose=False, device='cuda')
-            for res in results:
-                for box in res.boxes:
-                    cls_val = int(box.cls[0].cpu().item())
-                    label = res.names[cls_val].upper()
-                    clean_label = label.replace("STORE_", "").replace("_", " ")
-                    label_norm = self.normalize_category(label)
-                    
-                    is_cafe = "CAF" in target_norm and ("CAF" in label or "CAF" in clean_label)
-                    is_hamb = ("HAMB" in target_norm or "BURG" in target_norm) and ("HAMB" in label or "BURG" in label)
-                    is_pharm = "PHARM" in target_norm and ("PHARM" in label or "PHARM" in clean_label)
-                    is_store = "CONV" in target_norm and "CONV" in label
-                    is_pickup = ("PICK" in target_norm or "POINT" in target_norm) and ("PICK" in label or "POINT" in label)
-                    
-                    match = (target_norm in ["ANY", "ALL"]) or \
-                            (target_norm == label_norm or target_norm == label or target_norm == clean_label) or \
-                            is_cafe or is_hamb or is_pharm or is_store or is_pickup
+            for det in detections:
+                label = det.get("label", "").upper()
+                conf = det.get("conf", 0.0)
+                xyxy = det.get("xyxy", [0,0,0,0])
+                
+                clean_label = label.replace("STORE_", "").replace("_", " ")
+                label_norm = self.normalize_category(label)
+                
+                is_cafe = "CAF" in target_norm and ("CAF" in label or "CAF" in clean_label)
+                is_hamb = ("HAMB" in target_norm or "BURG" in target_norm) and ("HAMB" in label or "BURG" in label)
+                is_pharm = "PHARM" in target_norm and ("PHARM" in label or "PHARM" in clean_label)
+                is_store = "CONV" in target_norm and "CONV" in label
+                is_pickup = ("PICK" in target_norm or "POINT" in target_norm) and ("PICK" in label or "POINT" in label)
+                
+                match = (target_norm in ["ANY", "ALL"]) or \
+                        (target_norm == label_norm or target_norm == label or target_norm == clean_label) or \
+                        is_cafe or is_hamb or is_pharm or is_store or is_pickup
 
-                    if match:
-                        xyxy = box.xyxy[0].cpu().tolist()
-                        shop_img_x = (xyxy[0] + xyxy[2]) / 2.0
-                        y1, x1, y2, x2 = int(xyxy[1]), int(xyxy[0]), int(xyxy[2]), int(xyxy[3])
-                        
-                        depth_val = 0.0
-                        if depth_raw is not None:
-                            h, w = depth_raw.shape
-                            roi = depth_raw[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
-                            valid_depths = roi[roi > 0.1]
-                            if valid_depths.size > 0:
-                                # Use 15th percentile to ensure we are looking at the 'front-most' edge
-                                dist_to_shop = np.percentile(valid_depths, 15)
-                                if dist_to_shop > 50.0: dist_to_shop /= 1000.0
-                                depth_val = dist_to_shop
-                        
-                        if depth_val == 0.0: depth_val = 1.8 
-                        if depth_val > 6.0: continue
+                if match:
+                    shop_img_x = (xyxy[0] + xyxy[2]) / 2.0
+                    y1, x1, y2, x2 = int(xyxy[1]), int(xyxy[0]), int(xyxy[2]), int(xyxy[3])
+                    
+                    depth_val = 0.0
+                    if depth_raw is not None:
+                        h, w = depth_raw.shape
+                        roi = depth_raw[max(0, y1):min(h, y2), max(0, x1):min(w, x2)]
+                        valid_depths = roi[roi > 0.1]
+                        if valid_depths.size > 0:
+                            # Use 15th percentile to ensure we are looking at the 'front-most' edge
+                            dist_to_shop = np.percentile(valid_depths, 15)
+                            if dist_to_shop > 50.0: dist_to_shop /= 1000.0
+                            depth_val = dist_to_shop
+                    
+                    if depth_val == 0.0: depth_val = 1.8 
+                    if depth_val > 6.0: continue
 
-                        return {
-                            'label': label,
-                            'depth': depth_val,
-                            'img_x': shop_img_x,
-                            'img_w': float(img.shape[1]),
-                            'pose': self.get_current_robot_pose()
-                        }
+                    return {
+                        'label': label,
+                        'depth': depth_val,
+                        'img_x': shop_img_x,
+                        'img_w': float(img.shape[1]),
+                        'pose': self.get_current_robot_pose()
+                    }
         return None
 
     def center_on_shop(self, target_category, timeout=12.0):
@@ -944,10 +984,8 @@ class RobotWebServer:
         Supports retry with forward nudge on focus failure (centering timeout) or local costmap blockage.
         """
         self.start_planners()
-        if not self.yolo_model:
-            return False
-
-        rospy.loginfo(f"[Radical Overhaul] Commencing precision approach for {target_category}")
+        target_norm = self.normalize_category(target_category)
+        rospy.loginfo(f"[Radical Overhaul] Commencing precision approach for {target_category} (normalized: {target_norm})")
         _, _, start_yaw = self.get_current_robot_pose()
         ref_yaw = corridor_yaw if corridor_yaw is not None else start_yaw
         
@@ -1148,12 +1186,13 @@ class RobotWebServer:
                     rel_yaw = (final_yaw - ref_yaw + math.pi) % (2 * math.pi) - math.pi
                     rel_yaw_deg = math.degrees(rel_yaw)
                     
-                    # Validate that the centered angle sits within the +80 to +100 or -80 to -100 window envelope
-                    if (80.0 <= rel_yaw_deg <= 100.0) or (-100.0 <= rel_yaw_deg <= -80.0):
+                    # Validate that the centered angle sits within the extended +50 to +130 or -130 to -50 window envelope
+                    if (50.0 <= rel_yaw_deg <= 130.0) or (-130.0 <= rel_yaw_deg <= -50.0):
                         rospy.loginfo(f"[Approach Workflow] Shop centered successfully within valid angular envelope: {rel_yaw_deg:.1f}°")
                         facing_yaw = final_yaw  # Fix orientation directly onto the real centered shop heading
                     else:
-                        rospy.logwarn(f"[Approach Workflow] Shop centering heading ({rel_yaw_deg:.1f}°) outside valid envelope limits. Reverting to strict baseline.")
+                        rospy.logwarn(f"[Approach Workflow] Shop centering heading ({rel_yaw_deg:.1f}°) outside extended envelope limits (50-130°). Reverting to visual centered heading anyway for direct facing visual alignment.")
+                        facing_yaw = final_yaw
                 else:
                     rospy.logwarn("[Approach Workflow] Shop sign not seen at orthogonal steps. Falling back to estimated baseline facing vector.")
                 
@@ -1179,50 +1218,6 @@ class RobotWebServer:
                 
             self.rotate_to_yaw(facing_yaw, p_gain=2.0, speed_limit=0.2, threshold=0.015)
             self.cmd_vel_pub.publish(Twist()) # Absolute stop before verification
-            
-            # PHASE 8: PRECISION CLOSING DISTANCE CHECK & CLOSED-LOOP NUDGE
-            if self.active_delivery_task:
-                wall_dist = self.get_distance_to_wall_ahead(max_dist=3.0)
-                if wall_dist is None:
-                    # Fallback to visual bounding box depth telemetry
-                    det_check = self.check_for_shop(target_category)
-                    wall_dist = det_check['depth'] if (det_check and 'depth' in det_check) else None
-                
-                if wall_dist is not None:
-                    rospy.loginfo(f"[Approach Workflow] Verified distance to storefront: {wall_dist:.2f}m")
-                    if wall_dist >= 0.80:
-                        # Store is farther than 80cm, execute a precision nudge forward
-                        nudge_distance = wall_dist - 0.65  # Target stopping around 65cm to remain safely under 80cm
-                        rospy.loginfo(f"[Approach Workflow] Distance exceeds 80cm limit. Initiating recovery nudge forward by {nudge_distance:.2f}m...")
-                        
-                        nudge_rate = rospy.Rate(10)
-                        start_nudge_t = rospy.Time.now()
-                        nx, ny, nyaw = self.get_current_robot_pose()
-                        target_x = nx + nudge_distance * math.cos(nyaw)
-                        target_y = ny + nudge_distance * math.sin(nyaw)
-                        
-                        cmd_nudge = Twist()
-                        cmd_nudge.linear.x = 0.05  # Slow precision crawl speed (5 cm/s)
-                        
-                        while not rospy.is_shutdown() and self.active_delivery_task:
-                            cx, cy, _ = self.get_current_robot_pose()
-                            remaining_segment = math.hypot(target_x - cx, target_y - cy)
-                            current_ray_reading = self.get_distance_to_wall_ahead(max_dist=2.0)
-                            
-                            # Safety brake: stop early if costmap laser scan detects a sudden proximity block
-                            if current_ray_reading is not None and current_ray_reading < 0.60:
-                                rospy.loginfo(f"[Approach Workflow] Nudge sequence exited early. Costmap threshold reached: {current_ray_reading:.2f}m")
-                                break
-                                
-                            if remaining_segment < 0.03 or (rospy.Time.now() - start_nudge_t).to_sec() > (nudge_distance / 0.05 + 2.0):
-                                break
-                                
-                            self.cmd_vel_pub.publish(cmd_nudge)
-                            nudge_rate.sleep()
-                        
-                        self.cmd_vel_pub.publish(Twist()) # Complete chassis stabilization
-                else:
-                    rospy.logwarn("[Approach Workflow] Unable to calculate proximity distance profile. Nudge verification skipped.")
 
             # ================= 5-SECOND APPROACH COMPLETION WAIT =================
             rospy.loginfo("[Approach Workflow] Approach complete. Holding position for 5.0 seconds...")
@@ -1582,6 +1577,8 @@ class RobotWebServer:
                 rospy.loginfo("[web_server] Deactivating navigation YOLO and stopping motion planners for CPU/GPU optimization...")
                 self._yolo_active = False
                 self.stop_planners()
+                
+                # Keep navigation YOLO model in memory to avoid reload latency and Orin crashes
 
                 for item in items:
                     if not self.active_delivery_task:
@@ -1609,6 +1606,23 @@ class RobotWebServer:
                     with self.lock:
                         self.pick_arm_status = "idle"
                         self.pick_arm_success_flag = False
+                    
+                    # 1. Kill all pathplanner nodes first to lower CPU/GPU load
+                    self.stop_planners()
+                    
+                    # 2. Completely kill the navigation YOLO node
+                    self.stop_nav_yolo()
+                    
+                    # 3. Wait 5 seconds for OS/CUDA to clean up VRAM
+                    rospy.loginfo("[web_server] Waiting 5 seconds for VRAM to clear...")
+                    rospy.sleep(5.0)
+                    
+                    # 4. Start the grabbing YOLO node from scratch
+                    self.start_grab_yolo()
+                    
+                    # 5. Wait 6 seconds for grabbing YOLO node to load and warm up
+                    rospy.loginfo("[web_server] Waiting 6 seconds for Grabbing YOLO node to load/warmup...")
+                    rospy.sleep(6.0)
                     
                     # Publish target item and activate grabbing YOLO
                     self.pub_target.publish(String(target_class))
@@ -1681,6 +1695,22 @@ class RobotWebServer:
 
                 # Reactivate resources for next destination navigation
                 rospy.loginfo("[web_server] Grasping phase complete. Restoring motion planners and navigation YOLO...")
+                
+                # 1. Completely kill the grabbing YOLO node
+                self.stop_grab_yolo()
+                
+                # 2. Wait 5 seconds for OS/CUDA to clean up VRAM
+                rospy.loginfo("[web_server] Waiting 5 seconds for VRAM to clear...")
+                rospy.sleep(5.0)
+                
+                # 3. Start the navigation YOLO node from scratch
+                self.start_nav_yolo()
+                
+                # 4. Wait 6 seconds for navigation YOLO node to load and warm up
+                rospy.loginfo("[web_server] Waiting 6 seconds for Navigation YOLO node to load/warmup...")
+                rospy.sleep(6.0)
+                
+                # 5. Restart the TEB planner and costmap generator
                 self._yolo_active = True
                 self.start_planners()
                     
@@ -2018,16 +2048,15 @@ class RobotWebServer:
         dist_coeffs = np.zeros((4,1)) # Assume rectified image
         
         # --- Optimized YOLO Detections for Visualization ---
-        # Draw cached YOLO results (prediction was already done outside the lock)
-        for res in self.last_yolo_viz_results:
-            for box in res.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0].cpu().tolist())
-                cls = int(box.cls[0].cpu().item())
-                label = res.names[cls]
-                conf = float(box.conf[0].cpu().item())
-                cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
-                cv2.putText(img, f"{label} {conf:.2f}", (x1, y1 - 10), 
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        # Draw cached YOLO results received via topic
+        for det in self.last_yolo_viz_results:
+            xyxy = det.get("xyxy", [0, 0, 0, 0])
+            label = det.get("label", "Unknown")
+            conf = det.get("conf", 0.0)
+            x1, y1, x2, y2 = map(int, xyxy)
+            cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+            cv2.putText(img, f"{label} {conf:.2f}", (x1, y1 - 10), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
         
         def draw_single_tag(img, tag_id, size, rvec, tvec):
             if not self.viz_apriltag:
@@ -3046,7 +3075,7 @@ def normalize_item_name(item_name):
         return "burgers"
     if any(x in name for x in ["med", "pharm", "pill", "sick", "drug", "first aid", "first-aid", "aspirin", "band-aid", "kit"]):
         return "first-aid-kit"
-    if any(x in name for x in ["coffee", "drink", "tea", "latte", "cappuccino", "espresso"]):
+    if any(x in name for x in ["coffee", "coffe", "drink", "tea", "latte", "cappuccino", "espresso"]):
         return "ice coffee"
     if any(x in name for x in ["mug", "cup"]):
         return "mug"
@@ -3059,7 +3088,7 @@ def parse_requested_items_with_counts(message):
     keywords_mapping = {
         "burgers": ["burger", "hamburger", "fries", "fast food", "food"],
         "first-aid-kit": ["med", "pharm", "pill", "sick", "drug", "first aid", "first-aid", "aspirin", "band-aid", "kit"],
-        "ice coffee": ["coffee", "drink", "tea", "latte", "cappuccino", "espresso"],
+        "ice coffee": ["coffee", "coffe", "drink", "tea", "latte", "cappuccino", "espresso"],
         "mug": ["mug", "cup"]
     }
     
@@ -3070,28 +3099,46 @@ def parse_requested_items_with_counts(message):
     }
     
     tokens = re.findall(r'[a-z0-9\-]+', m)
+    matched_indices = set()
     
+    flat_syns = []
     for canonical_name, syns in keywords_mapping.items():
         for syn in syns:
-            syn_words = syn.split()
-            for i in range(len(tokens) - len(syn_words) + 1):
-                match = False
-                if len(syn_words) == 1:
-                    if syn_words[0] in tokens[i]:
-                        match = True
-                else:
-                    if tokens[i:i+len(syn_words)] == syn_words:
-                        match = True
-                        
-                if match:
-                    count = 1
-                    if i > 0:
-                        prev_token = tokens[i-1]
-                        if prev_token.isdigit():
-                            count = int(prev_token)
-                        elif prev_token in word_to_num:
-                            count = word_to_num[prev_token]
-                    counts[canonical_name] = max(counts.get(canonical_name, 0), count)
+            flat_syns.append((canonical_name, syn, len(syn.split())))
+    flat_syns.sort(key=lambda x: x[2], reverse=True)
+    
+    for canonical_name, syn, syn_len in flat_syns:
+        syn_words = syn.split()
+        for i in range(len(tokens) - syn_len + 1):
+            if any((i + k) in matched_indices for k in range(syn_len)):
+                continue
+                
+            match = False
+            if syn_len == 1:
+                if syn_words[0] in tokens[i]:
+                    match = True
+            else:
+                if tokens[i:i+syn_len] == syn_words:
+                    match = True
+                    
+            if match:
+                count = 1
+                for offset in [1, 2]:
+                    if i - offset >= 0:
+                        t_prev = tokens[i - offset]
+                        if t_prev.isdigit():
+                            count = int(t_prev)
+                            break
+                        elif t_prev in word_to_num:
+                            count = word_to_num[t_prev]
+                            break
+                        elif t_prev in ["ice", "fast"]:
+                            continue
+                        else:
+                            break
+                counts[canonical_name] = counts.get(canonical_name, 0) + count
+                for k in range(syn_len):
+                    matched_indices.add(i + k)
                     
     return counts
 
@@ -3216,9 +3263,9 @@ def delivery_send():
                 f"Synonym mapping rules:\n"
                 f"- Map medicine, drugs, pills, sick, band-aid, aspirin, first aid to 'first-aid-kit'.\n"
                 f"- Map burger, burgers, hamburger, fries, fast food, food to 'burgers'.\n"
-                f"- Map coffee, ice coffee, tea, latte, drink, drinks to 'ice coffee'.\n"
+                f"- Map coffee, coffes, ice coffee, tea, latte, drink, drinks to 'ice coffee'.\n"
                 f"- Map mug, cup to 'mug'.\n\n"
-                f"Quantity Rule: If the user asks for a quantity of an item (e.g. 5 coffee, 3 burgers, 1 drug), duplicate that item in the 'items' list that many times.\n"
+                f"Quantity Rule: If the user asks for a quantity of an item (e.g. 2 coffes, 5 coffee, 3 burgers, 1 drug), duplicate that item in the 'items' list that many times.\n"
                 f"Example: if the user asks for 5 coffee, the list should contain 5 instances of 'ice coffee'.\n\n"
                 f"Optimization Rule: ALWAYS minimize the number of shop visits. However, for any category where the user needs MORE THAN 1 item, it is smarter/required to go to that category's specialized store than the convenience store.\n"
                 f"Store availability:\n"

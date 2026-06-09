@@ -103,7 +103,7 @@
 
     <!-- ==================== COMMON SETUP ==================== -->
     <arg name="pick_pkg" default="controller"/>
-    <node name="yolo_detector" pkg="$(arg pick_pkg)" type="yolo_detector.py" output="screen" respawn="true" />
+    <node name="yolo_detector" pkg="$(arg pick_pkg)" type="yolo_detector3.py" output="screen" respawn="true" />
 
     <!-- 2. Start local costmap generator -->
     <include file="$(find local_costmap_generator)/launch/run.launch" />
@@ -133,6 +133,8 @@
         <param name="depth_topic" value="/camera/depth/image_raw" if="$(arg sim)" />
         <param name="depth_topic" value="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
         <param name="enable_camera_viz" value="false" />
+        <param name="waypoint_arrival_tol" value="0.15" />
+        <param name="approach_dist_m" value="0.0" />
         <remap from="/camera/color/image_raw_throttle" to="/camera/color/image_raw" unless="$(arg sim)" />
         <remap from="/camera/aligned_depth_to_color/image_raw_throttle" to="/camera/aligned_depth_to_color/image_raw" unless="$(arg sim)" />
     </node>
@@ -146,7 +148,7 @@
               orchestrator activates /yolo_grab/activate. -->
 
     <!-- 10.2 Pick arm node — stays up, picks whatever /yolo/arm_point reports. -->
-    <node name="pick_arm_node" pkg="$(arg pick_pkg)" type="pick_arm_node.py" output="screen" respawn="true" />
+    <node name="pick_arm_node" pkg="$(arg pick_pkg)" type="pick_arm_node3.py" output="screen" respawn="true" />
 
     <!-- 10.3 Mission Orchestrator — owns global state, switches nav<->grab YOLO,
               runs the per-shop pick loop and counts items. -->

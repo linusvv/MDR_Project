@@ -7,6 +7,7 @@
 #include <teb_local_planner/teb_local_planner_ros.h>
 #include <memory>
 #include <cmath>
+#include <std_msgs/Empty.h> // <-- ADD THIS LINE
 
 class TebPlannerNode {
 public:
@@ -25,6 +26,27 @@ public:
         subGoalPoint = nh_.subscribe("/graph_planner/path/global_path", 1, &TebPlannerNode::CallbackGoalPoint, this);
         pubCommand = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1, false); // DO NOT LATCH cmd_vel
         pubLocalPlan = nh_.advertise<nav_msgs::Path>("/teb_local_plan", 1);
+        subGoalPoint = nh_.subscribe("/graph_planner/path/global_path", 1, &TebPlannerNode::CallbackGoalPoint, this);
+        pubCommand = nh_.advertise<geometry_msgs::Twist>("/cmd_vel", 1, false); 
+        pubLocalPlan = nh_.advertise<nav_msgs::Path>("/teb_local_plan", 1);
+        
+        // ADD THIS: Listen for the reset command from Python
+        subReset = nh_.subscribe("/teb_reset", 1, &TebPlannerNode::CallbackReset, this);
+    }
+
+    // ADD THIS ENTIRE FUNCTION: The wipe-and-restart logic
+    void CallbackReset(const std_msgs::Empty& msg) {
+        ROS_INFO("Manual reset of TEB Planner requested. Flushing local costmaps...");
+        if (costmap_ros_) {
+            costmap_ros_->resetLayers(); // Clears hallucinated obstacles
+        }
+        // Destroy the old planner and build a fresh one
+        teb_planner_.reset(new teb_local_planner::TebLocalPlannerROS());
+        teb_planner_->initialize("TebLocalPlannerROS", &tf_buffer_, costmap_ros_.get());
+        
+        // Reset safety states
+        recovery_state_ = 0;
+        consecutive_failures_ = 0;
     }
 
     void CallbackGoalPoint(const nav_msgs::Path& msg) {
@@ -337,6 +359,7 @@ private:
     std::shared_ptr<teb_local_planner::TebLocalPlannerROS> teb_planner_;
 
     ros::Subscriber subGoalPoint;
+    ros::Subscriber subReset;
     ros::Publisher pubCommand;
     ros::Publisher pubLocalPlan;
 

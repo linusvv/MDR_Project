@@ -325,14 +325,16 @@ def verify_grasp_depth():
     # Sample patch around expected gripper pixel
     u0, u1 = max(0, u - VERIFY_RADIUS), min(w, u + VERIFY_RADIUS + 1)
     v0, v1 = max(0, v - VERIFY_RADIUS), min(h, v + VERIFY_RADIUS + 1)
-    patch  = depth[v0:v1, u0:u1].astype(np.float32) * 0.001   # mm -> m
+    patch  = depth[v0:v1, u0:u1].astype(np.float32)
     valid  = patch[patch > 0]
 
     if len(valid) == 0:
         rospy.logwarn('[pick_arm] Grasp verify: no valid depth pixels in patch — assuming PASS')
         return True
 
-    min_depth = float(np.min(valid))
+    # Auto-detect scale: 1.0 for float32 depth (meters, e.g. simulation), 0.001 for uint16 (mm, real robot)
+    scale = 1.0 if depth.dtype == np.float32 else 0.001
+    min_depth = float(np.min(valid)) * scale
     rospy.loginfo(
         f'[pick_arm] Grasp verify: min_depth={min_depth*100:.1f} cm  '
         f'threshold={GRASP_DEPTH_THRES*100:.0f} cm')

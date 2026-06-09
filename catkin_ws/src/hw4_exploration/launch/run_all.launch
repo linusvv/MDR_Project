@@ -147,10 +147,12 @@
         <node pkg="rviz" type="rviz" name="rviz_display" args="-d $(find hw4_exploration)/rviz/ee478_rtabmap.rviz" output="screen" />
     </group>
 
-    <!-- 12. Start YOLO Detector for Grab Target (Remap depth topic in simulation) -->
+    <!-- 12. Start YOLO Detector for Grab Target (Remap depth topic in simulation) - commented out to be managed dynamically by web_server_node.py -->
+    <!--
     <node name="yolo_detector" pkg="controller" type="yolo_detector.py" output="screen" respawn="true">
         <remap from="/camera/aligned_depth_to_color/image_raw" to="/camera/depth/image_raw" if="$(arg sim)" />
     </node>
+    -->
 
     <!-- 13. Start Pick Arm Controller (Remap depth topic in simulation) -->
     <node name="pick_arm_node" pkg="controller" type="pick_arm_node.py" output="screen" respawn="true">

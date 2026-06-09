@@ -64,7 +64,7 @@
                 max_vel_theta: 0.17 # Halved from 0.25
                 acc_lim_x: 0.2 # Restored to default for faster speed tracking
                 acc_lim_y: 0.01     # Sideways movement disabled
-                acc_lim_theta: 0.8 # Restored for quick heading correction to prevent sinus oscillations
+                acc_lim_theta: 1.0 # Restored for quick heading correction to prevent sinus oscillations
                 min_turning_radius: 0.0
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  

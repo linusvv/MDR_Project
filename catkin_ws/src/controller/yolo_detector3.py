@@ -247,10 +247,14 @@ def sync_callback(color_msg, depth_msg):
         conf     = float(box.conf)
 
         # ── Class filter ──────────────────────────────────────────────────
-        # If current_target is empty or "None", we allow all/no classes
+        # No target set (empty "" or "none") -> select NOTHING and publish
+        # nothing. (Previously an empty target meant "best of ALL classes",
+        # which made pick_arm lock onto random objects and never let go when the
+        # orchestrator cleared the target between picks. The mission needs an
+        # explicit target before pick_arm is allowed to grab anything.)
         is_target = False
         if not current_target or current_target.lower() == "none":
-            is_target = (not current_target)
+            is_target = False
         else:
             ct = current_target.lower()
             cn = cls_name.lower()

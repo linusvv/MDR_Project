@@ -57,7 +57,6 @@ import threading
 import rospy
 import rospkg
 import yaml
-import tf
 from std_msgs.msg import String, Bool, Int32
 
 
@@ -83,7 +82,7 @@ ITEM_TO_YOLO_CLASS = {
 # case-insensitively against the yaml 'store_type' values.
 ITEM_SHOP_CONSTRAINTS = {
     "drug":      ["Pharmacy",  "Convenience Store"],
-    "hamburger": ["Hamburger", "Convenience Store"],
+    "hamburger": ["Convenience Store", "Hamburger"],
     "iceCoffee": ["Cafe",      "Convenience Store"],
     "mug":       ["Cafe",      "Convenience Store"],
     # Each list is ordered by preference: the primary store type first, then the
@@ -100,13 +99,10 @@ PICKUP_LOCATION = None
 
 # How far (m) in front of a store the robot parks before picking. The robot
 # approaches along the signboard->store line (corridor side) and faces the store.
-STORE_APPROACH_DIST = 0.45
+STORE_APPROACH_DIST = 0.30
 
 # ── Timing / tolerances ─────────────────────────────────────────────────────
 PRESENCE_TIMEOUT   = 6.0    # s to wait for grab-YOLO to confirm an item is here
-                            # (applies to the first check on arrival AND to the
-                            #  re-check after a pick/back-up; if nothing shows up
-                            #  in this time we give up on this item and move on)
 PICK_CYCLE_TIMEOUT = 60.0   # s to wait for one pick_arm pick-and-place cycle
 SETTLE_AFTER_PICK  = 1.5    # s to let the scene settle after pick_arm backs up
 DISAPPEAR_CONFIRM  = 1.0    # s the target must stay invisible to count as gone
@@ -134,9 +130,6 @@ class MissionOrchestrator(object):
         self.arrived_topic  = rospy.get_param("~arrived_topic", "/mission/shop_arrived")
         self.counts_topic   = rospy.get_param("~counts_topic",  "/mission/item_counts")
         self.finished_topic = rospy.get_param("~finished_topic","/mission/finished")
-
-        # TF, to measure which store is nearest to the robot right now.
-        self.tf_listener = tf.TransformListener()
 
         # ── GLOBAL STATE ────────────────────────────────────────────────────
         self.lock          = threading.Lock()
@@ -436,59 +429,34 @@ class MissionOrchestrator(object):
                       f"{store_type}@({loc[0]:.2f},{loc[1]:.2f}) "
                       f"yaw={tgt['corridor_yaw']:.0f}°. Remaining: {self.remaining}")
 
-    def _robot_xy(self):
-        """Robot position in the map frame, or (None, None) if TF isn't ready."""
-        try:
-            if self.tf_listener.canTransform('map', 'base_footprint', rospy.Time(0)):
-                (trans, _) = self.tf_listener.lookupTransform(
-                    'map', 'base_footprint', rospy.Time(0))
-                return trans[0], trans[1]
-        except Exception:
-            pass
-        return None, None
-
     def _choose_target(self):
-        """Return (store_type, target) for the NEAREST un-serviced store that can
-        supply any still-needed item — measured from the robot's current
-        position. No primary/fallback preference: just go to whatever is closest.
-        Already-visited stores (self._tried_stores) are skipped."""
-        rx, ry = self._robot_xy()
-
-        with self.lock:
-            remaining = dict(self.remaining)
-
-        candidates = []          # (distance, store_type, target)
-        seen_store = set()       # dedupe by physical store location
+        """Return (store_type, target) for the next needed item — the nearest
+        un-serviced store of an allowed type. Target carries location + heading."""
         for item in ITEM_ORDER:
-            if remaining.get(item, 0) <= 0:
-                continue
+            with self.lock:
+                if self.remaining.get(item, 0) <= 0:
+                    continue
             for st in ITEM_SHOP_CONSTRAINTS.get(item, []):
+                # Unique un-serviced stores of this type; for each store pick the
+                # signboard closest to it (shortest, safest approach leg).
+                best_per_store = {}
                 for tgt in self.storetype_targets.get(st.lower(), []):
                     loc = tgt.get("location")
                     if not loc:
                         continue
                     key = (round(loc[0], 2), round(loc[1], 2))
-                    if key in self._tried_stores or key in seen_store:
+                    if key in self._tried_stores:
                         continue
-                    seen_store.add(key)
-                    if rx is not None:
-                        # nearest to the robot right now
-                        d = math.hypot(rx - loc[0], ry - loc[1])
-                    else:
-                        # TF not ready -> fall back to the signboard->store leg
-                        sbxy = self.signboard_xy.get(tgt["sb"])
-                        d = (math.hypot(sbxy[0] - loc[0], sbxy[1] - loc[1])
-                             if sbxy else 0.0)
-                    candidates.append((d, st, tgt))
-
-        if not candidates:
-            return None
-        candidates.sort(key=lambda c: c[0])
-        d, st, tgt = candidates[0]
-        rospy.loginfo(f"[orchestrator] Nearest un-visited store: {st} "
-                      f"@({tgt['location'][0]:.2f},{tgt['location'][1]:.2f}) "
-                      f"dist={d:.2f}m")
-        return st, tgt
+                    sbxy = self.signboard_xy.get(tgt["sb"])
+                    d = (math.hypot(sbxy[0] - loc[0], sbxy[1] - loc[1])
+                         if sbxy else 0.0)
+                    if key not in best_per_store or d < best_per_store[key][0]:
+                        best_per_store[key] = (d, tgt)
+                if best_per_store:
+                    # nearest store overall (by signboard-store leg length)
+                    _, tgt = min(best_per_store.values(), key=lambda v: v[0])
+                    return st, tgt
+        return None
 
     def _dispatch_pickup(self):
         """Send the pickup zone and raise the finish flag."""
@@ -532,41 +500,15 @@ class MissionOrchestrator(object):
         rospy.loginfo(f"[orchestrator] === At {store_type} store (signboard {sb}) ===")
         try:
             self._grab_on()
-            # Give the grab YOLO a moment to populate detections after the robot
-            # settled / backed up, so the first visibility check isn't premature.
-            rospy.sleep(SETTLE_AFTER_PICK)
-
-            # Steps 5-7: stay at THIS store and keep picking while it can still
-            # supply a needed item. We do NOT hand control back until nothing
-            # needed is pickable here anymore. pick_arm autonomously re-approaches
-            # (it backs up to hand the object over, then drives forward to the
-            # next visible one), and we just count + decide whether to continue.
+            # Which still-needed items are sold at this store's type?
+            candidates = self._candidates_for(storetypes)
+            if not candidates:
+                rospy.loginfo(f"[orchestrator] No needed item belongs at {storetypes}.")
             picks = 0
-            while not rospy.is_shutdown():
-                candidates = self._candidates_for(storetypes)
-                if not candidates:
-                    rospy.loginfo(f"[orchestrator] No needed item belongs at {storetypes}.")
-                    break
-
-                progressed = False
-                for item in candidates:
-                    n = self._pick_item_repeatedly(item, sb, picks)
-                    picks += n
-                    if n > 0:
-                        progressed = True
-                    if self._total_remaining() == 0:
-                        break
-
+            for item in candidates:
+                picks += self._pick_item_repeatedly(item, sb, picks)
                 if self._total_remaining() == 0:
                     break
-                # A full pass picked nothing here -> the needed items are not
-                # present at this store. Stop and hand control back (step 7).
-                if not progressed:
-                    rospy.loginfo(f"[orchestrator] Nothing more to pick at signboard {sb}; "
-                                  f"handing control back.")
-                    break
-                # Otherwise something was picked: re-check in case picking it
-                # revealed another needed item here (step 6).
         except Exception as e:
             rospy.logerr(f"[orchestrator] Error servicing signboard {sb}: {e}")
         finally:

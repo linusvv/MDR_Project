@@ -3,7 +3,7 @@
 
     <arg name="camera_name" default="camera"/>
     <arg name="image_topic" default="color/image_raw"/>
-    <arg name="threshold_dist2tag" default="2.0"/>
+    <arg name="threshold_dist2tag" default="5.0"/>
 
     <arg name="world_frame_name" default="map"/>
     <arg name="camera_frame_name" default="camera_link"/>

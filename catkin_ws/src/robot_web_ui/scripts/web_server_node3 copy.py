@@ -70,7 +70,6 @@ class RobotWebServer:
         self.tasks_fulfilled = 0
         self.overshoot_m = 0.0
         self.approach_dist_m = 0.60
-        self.tag_approach_dist_m = rospy.get_param('~tag_approach_dist_m', 0.0)
         self.tag_align_offset_deg = 0.0
 
         # ── Shop-detection alignment override ───────────────────────────────
@@ -191,14 +190,6 @@ class RobotWebServer:
         self.pub_mission_finished = rospy.Publisher('/mission/finished',     Bool,   queue_size=1, latch=True)
         self.pick_complete_event  = threading.Event()
         rospy.Subscriber('/mission/pick_complete', Bool, self._pick_complete_cb)
-        # Track whether a pick actually happened at the shop we just left. pick_arm
-        # backs the CHASSIS up during a pick, which leaves a stale local costmap;
-        # we only need the costmap-clearing recovery before the next leg in that
-        # case. Without a pick (e.g. the item wasn't there) we must NOT recover —
-        # the extra rotation can make the next nav's costmap precheck fail and the
-        # robot just sits there.
-        self._chassis_backed_up = False
-        rospy.Subscriber('/pick_arm_heartbeat', String, self._pick_heartbeat_cb)
         # How long to wait for the orchestrator to finish picking at one shop.
         self.orchestrator_pick_timeout = rospy.get_param('~orchestrator_pick_timeout', 180.0)
 
@@ -243,8 +234,8 @@ class RobotWebServer:
         # ROS Publishers
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size=10)
         self.path_pub = rospy.Publisher('/graph_planner/path/global_path', Path, queue_size=5)
-
         self.pub_teb_reset = rospy.Publisher('/teb_reset', Empty, queue_size=1)
+        
         if self.enable_camera_viz:
             self.annotated_color_pub = rospy.Publisher('/camera/color/image_annotated', Image, queue_size=2)
             self.depth_color_pub = rospy.Publisher('/camera/depth/image_color', Image, queue_size=2)
@@ -298,12 +289,6 @@ class RobotWebServer:
         if msg.data:
             self.pick_complete_event.set()
 
-    def _pick_heartbeat_cb(self, msg):
-        """pick_arm reports a completed pick -> the chassis was backed up, so the
-        next leg needs a costmap-clearing recovery first."""
-        if msg.data == "picked up object":
-            self._chassis_backed_up = True
-
     # ── Plan-B two-leg navigation: AprilTag -> store location ───────────────
     def _goto_cb(self, msg):
         """Rich goto from the orchestrator on /mission/goto (JSON)."""
@@ -315,9 +300,6 @@ class RobotWebServer:
         if self._goto_busy:
             rospy.logwarn("[web_server] Already navigating; ignoring goto.")
             return
-        
-        # LOCK ENGAGED HERE: Prevents multiple threads from launching
-        self._goto_busy = True 
         threading.Thread(target=self._goto_rich, args=(g,), daemon=True).start()
 
     def _goto_rich(self, g):
@@ -325,7 +307,10 @@ class RobotWebServer:
         # Keep an active task so the tag-nav / rotate helpers run.
         self.active_delivery_task = "GOTO_STORE"
         try:
-            # Cleanly wipe TEB's memory to avoid hallucinated obstacles
+            # The previous shop's pick left the robot backed up against the
+            # storefront with a stale local costmap, so the planner can think it
+            # is boxed in and freeze ("정신 못 차림"). Clear the costmap with an
+            # in-place rotation before driving to the next store.
             rospy.loginfo("[web_server] Post-pick recovery: clearing costmap before next leg.")
             self.recover_robot()
 
@@ -334,12 +319,6 @@ class RobotWebServer:
             sx, sy = g.get("store_x", None), g.get("store_y", None)
             wx, wy = g.get("waypoint_x", None), g.get("waypoint_y", None)
             store_type = g.get("store_type", "")
-
-            # Fallback for PICKUP POINT: if orchestrator didn't give a waypoint but gave store coords
-            if wx is None and wy is None and sx is not None and sy is not None:
-                if "PICK" in store_type.upper():
-                    wx, wy = float(sx), float(sy)
-                    rospy.loginfo("[web_server] Derived waypoint from store coordinates for PICKUP POINT.")
 
             # ── Leg 1: nearest AprilTag (localization + reach the crossroad) ──
             if tag_name:
@@ -361,22 +340,20 @@ class RobotWebServer:
                 rospy.loginfo(f"[web_server] Leg2: -> waypoint ({wx:.2f},{wy:.2f}) "
                               f"for {store_type} store")
                 self.append_bot_chat_message(f"Approaching the {store_type}...")
-                
                 # Loose approach: stop as soon as we are roughly at the waypoint.
                 # We do NOT try to nail the exact spot — pick_arm does its own
                 # fine approach/creep toward the object once we hand off. The
                 # tolerance is a param so it can be tuned at the competition.
-                arrival_tol = rospy.get_param('~waypoint_arrival_tol', 0.15)
+                arrival_tol = rospy.get_param('~waypoint_arrival_tol', 0.45)
                 self.navigate_to_pose(wx, wy, 0.0, ignore_yaw=True,
                                       dist_tol=arrival_tol, cost_thresh=98)
-                                      
                 # Turn to look straight at the storefront.
-                if sx is not None and sy is not None and self.active_delivery_task and "PICK" not in store_type.upper():
+                if sx is not None and sy is not None and self.active_delivery_task:
                     rx, ry, _ = self.get_current_robot_pose()
                     face = math.atan2(float(sy) - ry, float(sx) - rx)
                     self.rotate_to_yaw(face, p_gain=1.5, speed_limit=0.5, threshold=0.04)
 
-            rospy.loginfo("[web_server] At waypoint, facing target; handing control back.")
+            rospy.loginfo("[web_server] At waypoint, facing store; handing control back.")
             if self.publish_shop_arrived_on_arrival:
                 self.pub_shop_arrived.publish(String(data=store_type))
         except Exception as e:
@@ -612,13 +589,7 @@ class RobotWebServer:
                                 if it["name"] == item:
                                     it["status"] = "picking_up"
             self.append_bot_chat_message(f"Picking up {item}...")
-            
-            # Replace blocking sleep with a breakable check loop
-            for _ in range(20):
-                if not self.active_delivery_task:
-                    break
-                rospy.sleep(0.1)
-                
+            rospy.sleep(2.0)
             with self.lock:
                 if getattr(self, 'active_todo_list', None):
                     for s in self.active_todo_list["stores"]:
@@ -634,6 +605,7 @@ class RobotWebServer:
                     if self.normalize_category(s["category"]) == target_norm:
                         s["status"] = "completed"
         self.append_bot_chat_message(f"Finished loading items from the {target}.")
+
 
     def toggle_yolo_light_switch(self):
         if not (self.yolo_nav_enabled and self.yolo_grab_enabled):
@@ -674,6 +646,7 @@ class RobotWebServer:
         """No-op because planners are launched from the beginning by the launch file."""
         pass
 
+
     def stop_robot(self):
         """Immediately stops all autonomous navigation and the robot movement."""
         with self.lock:
@@ -683,7 +656,7 @@ class RobotWebServer:
         self.navigating_to_pose_active = False
         self.active_delivery_task = None
         
-        # Instantly wake up the orchestrator pickup wait thread
+        # NEW: Instantly wake up the orchestrator pickup wait thread
         self.pick_complete_event.set()
         
         # 1. Stop the global/graph planner
@@ -1147,17 +1120,8 @@ class RobotWebServer:
         rate = rospy.Rate(10)
         start_time = rospy.Time.now()
         arrived = False
-        last_costmap_check = 0.0
         
         while not rospy.is_shutdown() and self.navigating_to_pose_active:
-            # Re-verify the goal is still reachable every 1.5 seconds to prevent getting stuck infinitely on dynamic obstacles
-            current_time = rospy.Time.now().to_sec()
-            if current_time - last_costmap_check > 1.5:
-                if not self.is_pose_reachable(x, y, threshold=cost_thresh):
-                    rospy.logerr(f"[Navigation] Goal ({x:.2f}, {y:.2f}) became dynamically blocked! Aborting to trigger fallback.")
-                    break
-                last_costmap_check = current_time
-
             rx, ry, ryaw = self.get_current_robot_pose()
             dist = math.hypot(rx - x, ry - y)
             
@@ -1652,6 +1616,8 @@ class RobotWebServer:
             
             self.cmd_vel_pub.publish(Twist())
 
+
+
     def _wait_for_tag_navigation(self):
         """Wait for nav_to_tag_thread to finish. Returns True if active_delivery_task survives."""
         rospy.sleep(0.3)  # allow thread to start
@@ -1667,7 +1633,7 @@ class RobotWebServer:
         gx, gy = pose_info[0], pose_info[1]
         psi_deg = pose_info[2]
         psi_rad = math.radians(psi_deg)
-        approach_dist = getattr(self, 'tag_approach_dist_m', 0.0)
+        approach_dist = getattr(self, 'approach_dist_m', 0.60)
         tx = gx + approach_dist * math.cos(psi_rad)
         ty = gy + approach_dist * math.sin(psi_rad)
 
@@ -1733,53 +1699,80 @@ class RobotWebServer:
                 
                 if target_norm == "PICKUP POINT":
                     # Special Pickup Point direct navigation
-                    rospy.loginfo(f"[Delivery Task] Special logic for PICKUP POINT: Navigating to sign {best_tag} then proceeding to pickup location...")
-                    
-                    # 1. Navigate to the sign first
-                    nav_to_sign_ok = self._navigate_to_tag_with_retry(best_tag, max_tries=2)
-                    if not nav_to_sign_ok:
-                        continue
-                        
-                    if not self.active_delivery_task:
-                        return False
-                        
-                    # 2. Drive to the actual location using the sign's direction
+                    rospy.loginfo(f"[Delivery Task] Special logic for PICKUP POINT: Navigating straight to offset of {best_tag}...")
                     pose_info = self.tag_true_poses.get(best_tag)
                     if pose_info is None:
                         rospy.logerr(f"[Delivery Task] Critical error: {best_tag} missing from tag_true_poses")
                         continue
-                        
+                    
                     gx, gy = pose_info[0], pose_info[1]
                     tag_true_yaw_deg = pose_info[2]
                     
-                    raw_target = math.radians(tag_true_yaw_deg) + math.radians(target_dir) + math.radians(self.tag_align_offset_deg)
-                    target_yaw = (raw_target + math.pi) % (2 * math.pi) - math.pi
+                    approach_dist = getattr(self, 'approach_dist_m', 0.60)
+                    tag_yaw = math.radians(tag_true_yaw_deg)
+                    tx = gx + approach_dist * math.cos(tag_yaw)
+                    ty = gy + approach_dist * math.sin(tag_yaw)
+                    facing_yaw = (tag_yaw + math.pi)
+                    facing_yaw = (facing_yaw + math.pi) % (2 * math.pi) - math.pi  # normalize to [-pi, pi]
                     
-                    # Drive 1.0m into the pickup area
-                    drive_dist = 1.0
-                    tx = gx + drive_dist * math.cos(target_yaw)
-                    ty = gy + drive_dist * math.sin(target_yaw)
+                    rospy.loginfo(f"[Delivery Task] Target offset pose: ({tx:.2f}, {ty:.2f}) facing {math.degrees(facing_yaw):.1f}°")
                     
-                    rospy.loginfo(f"[Delivery Task] Navigating to actual Pickup Location at ({tx:.2f}, {ty:.2f})")
-                    
-                    success_nav = False
+                    nav_ok = False
                     for attempt in range(2):
                         if not self.active_delivery_task:
                             return False
-                        rospy.loginfo(f"[Pickup Nav Retry] Attempt {attempt + 1}/2 to reach pickup location")
-                        success_nav = self.navigate_to_pose(tx, ty, target_yaw, ignore_yaw=False, dist_tol=0.20, cost_thresh=98)
-                        if success_nav:
-                            break
-                        rospy.sleep(1.0)
+                        rospy.loginfo(f"[Pickup Nav Retry] Attempt {attempt + 1}/2 to reach offset of {best_tag}")
                         
-                    if success_nav:
+                        success_nav = self.navigate_to_pose(tx, ty, facing_yaw, ignore_yaw=False, dist_tol=0.20, cost_thresh=98)
+                        if not self.active_delivery_task:
+                            return False
+                            
+                        # Double check how close we got
+                        rx, ry, ryaw = self.get_current_robot_pose()
+                        dist = math.hypot(rx - tx, ry - ty)
+                        angle_diff = (facing_yaw - ryaw + math.pi) % (2 * math.pi) - math.pi
+                        
+                        if success_nav or (dist < 0.25 and abs(angle_diff) < 0.25):
+                            rospy.loginfo(f"[Pickup Nav Retry] Successfully reached pickup offset at {best_tag}!")
+                            
+                            # Final snapping to orientation
+                            self.cmd_vel_pub.publish(Twist())
+                            
+                            for _ in range(3):
+                                if not self.active_delivery_task:
+                                    break
+                                rospy.sleep(0.1)
+                                
+                            if not self.active_delivery_task:
+                                return False
+                                
+                            self.rotate_to_yaw(facing_yaw, p_gain=1.5, speed_limit=0.4, threshold=0.03)
+                            
+                            for _ in range(3):
+                                if not self.active_delivery_task:
+                                    break
+                                rospy.sleep(0.1)
+                                
+                            if not self.active_delivery_task:
+                                return False
+                                
+                            self.rotate_to_yaw(facing_yaw, p_gain=2.0, speed_limit=0.2, threshold=0.015)
+                            
+                            nav_ok = True
+                            break
+                        
+                        rospy.logwarn(f"[Pickup Nav Retry] Failed to reach offset of {best_tag} (dist: {dist:.2f}m, angle: {math.degrees(angle_diff):.1f}°). Retrying...")
+                        if attempt < 1:
+                            rospy.sleep(1.0)
+                            
+                    if nav_ok:
                         rospy.loginfo(f"[Delivery Task] SUCCESS: Arrived at PICKUP POINT at {best_tag}!")
                         success = True
-                        break
+                        break  # done — do not try other candidates
                     else:
-                        rospy.logwarn("Failed to reach actual pickup location. Trying next candidate...")
-                        continue
-
+                        rospy.logwarn(f"[Delivery Task] Failed to reach PICKUP POINT candidate {best_tag} after retries. "
+                                      + (f"Trying next candidate..." if cand_idx + 1 < len(candidates) else "No more candidates."))
+                        continue  # try next candidate
                 else:
                     # --- Step 2a: NAVIGATE TO SIGN (with retry) ---
                     rospy.loginfo(f"[Delivery Task] Step 1: Navigating to {best_tag}")
@@ -2022,15 +2015,9 @@ class RobotWebServer:
                             if self.normalize_category(s["category"]) == target_norm:
                                 s["status"] = "completed"
                 self.append_bot_chat_message(f"Finished loading items from the {target}.")
-                
-                # =================================================================
-                # Post-pickup: Flush the TEB planner before moving to the next store
-                # =================================================================
                 rospy.loginfo("[Shopping List] Post-pickup: Flushing TEB local costmaps...")
-                if hasattr(self, 'pub_teb_reset'):
-                    self.pub_teb_reset.publish(Empty())
+                self.pub_teb_reset.publish(Empty())
                 rospy.sleep(0.5) # Give the C++ node a moment to process the wipe
-
             else:
                 rospy.logwarn(f"[Shopping List] Failed to arrive at target category {target_upper}.")
                 self.append_bot_chat_message(f"Failed to navigate to the {target}. Skipping items: {', '.join(items)}.")
@@ -2164,7 +2151,7 @@ class RobotWebServer:
         
         # All signboard and landmark coordinates are defined directly in the 'map' frame
         # Apply approach distance offset to stand in front of the tag
-        approach_dist = getattr(self, 'tag_approach_dist_m', 0.0)
+        approach_dist = getattr(self, 'approach_dist_m', 0.60)
         gx = tag_pt[0] + approach_dist * math.cos(psi_rad)
         gy = tag_pt[1] + approach_dist * math.sin(psi_rad)
         gyaw = psi_rad + math.pi
@@ -2271,19 +2258,32 @@ class RobotWebServer:
         self.cmd_vel_pub.publish(Twist())
 
     def recover_robot(self):
-        """Costmap clearing recovery by publishing TEB reset. No physical rotation."""
+        """Costmap clearing recovery by rotating in place."""
         if not self.active_delivery_task:
             return
-            
-        rospy.loginfo("[Recovery] Costmap clearing recovery requested. Publishing /teb_reset.")
-        if hasattr(self, 'pub_teb_reset'):
-            self.pub_teb_reset.publish(Empty())
+        rospy.loginfo("[Recovery] Attempting costmap clearing recovery by rotating in place.")
+        cmd = Twist()
+        cmd.angular.z = 0.5
         
-        # Safe sleep checking for cancellation while C++ node flushes layers
-        for _ in range(5):
+        # Publish continuously to prevent cmd_vel_to_chassis watchdog timeout
+        rate = rospy.Rate(10)
+        for _ in range(15):  # 1.5 seconds at 10Hz
+            if not self.active_delivery_task:
+                cmd.angular.z = 0.0
+                self.cmd_vel_pub.publish(cmd)
+                return
+            self.cmd_vel_pub.publish(cmd)
+            rate.sleep()
+            
+        cmd.angular.z = 0.0
+        self.cmd_vel_pub.publish(cmd)
+        
+        # Safe sleep checking for cancellation
+        for _ in range(10):
             if not self.active_delivery_task:
                 break
             rospy.sleep(0.1)
+
 
     def load_bundles(self, yaml_path):
         rospack = rospkg.RosPack()

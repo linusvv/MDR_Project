@@ -129,15 +129,12 @@ http://localhost:5000/
 
 ### Coordinate Chain
 The coordinate transformations flow as:
-$$\text{map} \xrightarrow{\text{map\_odom\_publisher}} \text{rtabmap\_map} \xrightarrow{\text{rtabmap}} \text{odom} \xrightarrow{\text{wheel/visual odometry}} \text{base\_footprint}$$
+$$\text{map} \xrightarrow{\text{map-odom-publisher}} \text{rtabmap-map} \xrightarrow{\text{rtabmap}} \text{odom} \xrightarrow{\text{wheel/visual-odometry}} \text{base-footprint}$$
 
 ### YOLO Target to Arm Coordinates Mapping
 Target objects are extracted from pixel depth maps and mapped to the physical arm workspace using a calibrated linear regression model:
-$$\text{arm\_x} = 1.445 \cdot X_{\text{cam}} - 0.350 \cdot Z_{\text{cam}} + 0.035$$
-$$\text{arm\_y} = 0.015 \cdot X_{\text{cam}} - 0.316 \cdot Z_{\text{cam}} + 0.299$$
-$$\text{arm\_z} = -0.015\text{ m (Fixed Grasping Height)}$$
+$$\text{arm}_x = 1.445 \cdot X_{\text{cam}} - 0.350 \cdot Z_{\text{cam}} + 0.035$$
+$$\text{arm}_y = 0.015 \cdot X_{\text{cam}} - 0.316 \cdot Z_{\text{cam}} + 0.299$$
+$$\text{arm}_z = -0.015\text{ m (Fixed Grasping Height)}$$
 
 ---
-
-## 🔒 License
-This project is licensed under the Modified BSD Software License.

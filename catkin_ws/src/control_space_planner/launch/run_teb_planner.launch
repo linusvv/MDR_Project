@@ -50,7 +50,7 @@
                 dt_hysteresis: 0.05
                 max_samples: 50
                 global_plan_overwrite_orientation: True
-                allow_init_with_backwards_motion: True
+                allow_init_with_backwards_motion: False
                 enable_homotopy_class_planning: False
                 max_global_plan_lookahead_dist: 1.5 # Reduced lookahead for much faster planning
                 global_plan_viapoint_sep: 0.15 # Dense via-points keep the robot glued to the straight global plan
@@ -61,10 +61,10 @@
                 max_vel_x: 0.07 # Halved from 0.10
                 max_vel_x_backwards: 0.035 # Halved from 0.05
                 max_vel_y: 0.01     # Sideways movement disabled for front-sensor setup
-                max_vel_theta: 0.20 # Halved from 0.25
-                acc_lim_x: 0.1 # Halved from 0.2
+                max_vel_theta: 0.17 # Halved from 0.25
+                acc_lim_x: 0.2 # Restored to default for faster speed tracking
                 acc_lim_y: 0.01     # Sideways movement disabled
-                acc_lim_theta: 0.05 # Halved from 0.4
+                acc_lim_theta: 0.8 # Restored for quick heading correction to prevent sinus oscillations
                 min_turning_radius: 0.0
                 wheelbase: 0.26
                 cmd_angle_instead_rotvel: False  
@@ -90,11 +90,11 @@
                 obstacle_poses_affected: 20 # Reduced from 30 to speed up 50Hz planning
                 
                 # Optimization
-                no_inner_iterations: 3 # Reduced for 50Hz loop speed
-                no_outer_iterations: 2 # Reduced for 50Hz loop speed
+                no_inner_iterations: 5 # Restored default for smoother optimization convergence
+                no_outer_iterations: 4 # Restored default for smoother optimization convergence
                 penalty_epsilon: 0.01  # Must stay below min speed (0.02 m/s); was 0.1 causing negative bound warnings
                 weight_obstacle: 150.0 # Increased from 50 to strongly avoid walls
-                weight_viapoint: 50.0 # Increased significantly so it actively tracks the global route
+                weight_viapoint: 5.0 # Decreased to prevent fighting viapoints aggressively and oscillating
                 weight_adapt_factor: 2.0
         </rosparam>
     </node>

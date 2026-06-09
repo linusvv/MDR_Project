@@ -239,7 +239,7 @@ class RobotWebServer:
             self.pick_arm_status = status
             if "picked up object" in status:
                 self.pick_arm_success_flag = True
-        rospy.loginfo(f"[web_server] pick_arm_heartbeat: {status}")
+        rospy.logdebug(f"[web_server] pick_arm_heartbeat: {status}")
 
     def toggle_yolo_light_switch(self):
         if not (self.yolo_nav_enabled and self.yolo_grab_enabled):
@@ -650,6 +650,7 @@ class RobotWebServer:
         return getattr(self, 'robot_x', 0.0), getattr(self, 'robot_y', 0.0), getattr(self, 'robot_yaw', 0.0)
 
     def find_tag_thread(self):
+        self.start_planners()
         rospy.loginfo("[Find Tag] Starting tag search process...")
         rate = rospy.Rate(10)
         scan_duration = 15.8
@@ -780,6 +781,7 @@ class RobotWebServer:
 
     def navigate_to_pose(self, x, y, yaw, ignore_yaw=False, dist_tol=0.2, cost_thresh=70):
         """Standard method to navigate to a specific map pose using the global planner."""
+        self.start_planners()
         # 0. Safety Pre-check
         if not self.is_pose_reachable(x, y, threshold=cost_thresh):
             rospy.logerr(f"[Navigation] Goal ({x:.2f}, {y:.2f}) is blocked in local costmap. Aborting.")
@@ -867,11 +869,12 @@ class RobotWebServer:
                     is_cafe = "CAF" in target_norm and ("CAF" in label or "CAF" in clean_label)
                     is_hamb = ("HAMB" in target_norm or "BURG" in target_norm) and ("HAMB" in label or "BURG" in label)
                     is_pharm = "PHARM" in target_norm and ("PHARM" in label or "PHARM" in clean_label)
-                    is_store = "STORE" in target_norm and "STORE" in label and not ("CAF" in label or "PHARM" in label or "BURG" in label or "HAMB" in label)
+                    is_store = "CONV" in target_norm and "CONV" in label
+                    is_pickup = ("PICK" in target_norm or "POINT" in target_norm) and ("PICK" in label or "POINT" in label)
                     
                     match = (target_norm in ["ANY", "ALL"]) or \
                             (target_norm == label_norm or target_norm == label or target_norm == clean_label) or \
-                            is_cafe or is_hamb or is_pharm or is_store
+                            is_cafe or is_hamb or is_pharm or is_store or is_pickup
 
                     if match:
                         xyxy = box.xyxy[0].cpu().tolist()
@@ -940,6 +943,7 @@ class RobotWebServer:
         """RADICALLY NEW STRATEGY: Discover -> Visual Center -> Raycast -> TEB -> Align.
         Supports retry with forward nudge on focus failure (centering timeout) or local costmap blockage.
         """
+        self.start_planners()
         if not self.yolo_model:
             return False
 
@@ -1027,25 +1031,37 @@ class RobotWebServer:
             shop_x = rx + wall_dist * math.cos(ryaw)
             shop_y = ry + wall_dist * math.sin(ryaw)
             
-            # PHASE 4: CALCULATE 90-DEGREE WAYPOINT
-            n1 = (ref_yaw + math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
-            n2 = (ref_yaw - math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
+            # PHASE 4: CALCULATE APPROACH WAYPOINT
+            is_straight_ahead = target_norm == "PICKUP POINT"
             
-            vec_to_robot = np.array([rx - shop_x, ry - shop_y])
-            vec_n1 = np.array([math.cos(n1), math.sin(n1)])
-            vec_n2 = np.array([math.cos(n2), math.sin(n2)])
-            
-            outward_normal = n1 if np.dot(vec_to_robot, vec_n1) > np.dot(vec_to_robot, vec_n2) else n2
-            
-            target_dist = getattr(self, 'approach_dist_m', 0.60)
-            target_x = shop_x + target_dist * math.cos(outward_normal)
-            target_y = shop_y + target_dist * math.sin(outward_normal)
-            
-            overshoot_m = getattr(self, 'overshoot_m', 0.0)
-            target_x += overshoot_m * math.cos(ref_yaw)
-            target_y += overshoot_m * math.sin(ref_yaw)
-            
-            facing_yaw = (outward_normal + math.pi) % (2*math.pi) - math.pi
+            if is_straight_ahead:
+                # The sign is straight ahead, not on a left/right side wall.
+                # Stop 50 cm away from the sign along the line of sight.
+                target_dist = 0.50
+                outward_normal = (ryaw + math.pi) % (2 * math.pi) - math.pi
+                target_x = shop_x + target_dist * math.cos(outward_normal)
+                target_y = shop_y + target_dist * math.sin(outward_normal)
+                facing_yaw = ryaw
+            else:
+                # Standard 90-degree side-wall approach
+                n1 = (ref_yaw + math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
+                n2 = (ref_yaw - math.pi/2.0 + math.pi) % (2*math.pi) - math.pi
+                
+                vec_to_robot = np.array([rx - shop_x, ry - shop_y])
+                vec_n1 = np.array([math.cos(n1), math.sin(n1)])
+                vec_n2 = np.array([math.cos(n2), math.sin(n2)])
+                
+                outward_normal = n1 if np.dot(vec_to_robot, vec_n1) > np.dot(vec_to_robot, vec_n2) else n2
+                
+                target_dist = getattr(self, 'approach_dist_m', 0.60)
+                target_x = shop_x + target_dist * math.cos(outward_normal)
+                target_y = shop_y + target_dist * math.sin(outward_normal)
+                
+                overshoot_m = getattr(self, 'overshoot_m', 0.0)
+                target_x += overshoot_m * math.cos(ref_yaw)
+                target_y += overshoot_m * math.sin(ref_yaw)
+                
+                facing_yaw = (outward_normal + math.pi) % (2*math.pi) - math.pi
             
             rospy.loginfo(f"[Approach Workflow] Target Pose: ({target_x:.2f}, {target_y:.2f}) facing {math.degrees(facing_yaw):.1f}° (outward)")
             
@@ -1369,12 +1385,18 @@ class RobotWebServer:
         rospy.loginfo(f"[Shopping List] Commencing execution of {len(tasks)} tasks sequentially.")
         overshoot_m = getattr(self, 'overshoot_m', 0.0)
         self.tasks_fulfilled = 0 # Ensure counter resets on a fresh run
+        failed_attempts = {} # maps item -> set of normalized categories already attempted and failed
         
-        for task in tasks:
+        tasks_list = list(tasks)
+        task_idx = 0
+        while task_idx < len(tasks_list):
             if not self.active_delivery_task:
                 rospy.logwarn("[Shopping List] Task execution halted (cancelled).")
                 break
                 
+            task = tasks_list[task_idx]
+            task_idx += 1
+            
             target = task.get("target", "")
             items = task.get("items", [])
             target_upper = target.upper().strip()
@@ -1480,6 +1502,7 @@ class RobotWebServer:
                 if success:
                     break
                         
+            failed_items = []
             if success and self.active_delivery_task:
                 rospy.loginfo(f"[Shopping List] Successfully arrived at {target_upper}. Commencing physical pickup sequence.")
                 self.append_bot_chat_message(f"Arrived at the {target}. Commencing item pick up.")
@@ -1653,6 +1676,8 @@ class RobotWebServer:
                                         if it["name"] == item:
                                             it["status"] = "failed"
                         self.append_bot_chat_message(f"Failed to pick up {item}.")
+                        failed_items.append(item)
+                        failed_attempts.setdefault(item, set()).add(target_norm)
 
                 # Reactivate resources for next destination navigation
                 rospy.loginfo("[web_server] Grasping phase complete. Restoring motion planners and navigation YOLO...")
@@ -1673,6 +1698,41 @@ class RobotWebServer:
                         for s in self.active_todo_list["stores"]:
                             if self.normalize_category(s["category"]) == target_norm:
                                 s["status"] = "failed"
+                for item in items:
+                    already_done = False
+                    with self.lock:
+                        if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                            for s in self.active_todo_list["stores"]:
+                                for it in s["items"]:
+                                    if it["name"] == item and it["status"] == "completed":
+                                        already_done = True
+                                        break
+                    if not already_done:
+                        failed_items.append(item)
+                        failed_attempts.setdefault(item, set()).add(target_norm)
+                        
+            # After the navigation block ends: check and schedule fallbacks
+            if self.active_delivery_task and failed_items:
+                fallback_groups = {}
+                for item in failed_items:
+                    fallback_cat = self.get_fallback_shop_category(target_norm, item, failed_attempts)
+                    if fallback_cat:
+                        fallback_groups.setdefault(fallback_cat, []).append(item)
+                
+                if fallback_groups:
+                    rospy.loginfo(f"[Shopping List] Found alternative shops for failed items: {fallback_groups}")
+                    for fallback_target, fallback_items in fallback_groups.items():
+                        new_task = {"target": fallback_target, "items": fallback_items}
+                        tasks_list.append(new_task)
+                        
+                        self.append_bot_chat_message(f"Rerouting to {fallback_target} to attempt picking up: {', '.join(fallback_items)}.")
+                        with self.lock:
+                            if hasattr(self, 'active_todo_list') and self.active_todo_list:
+                                self.active_todo_list["stores"].append({
+                                    "category": fallback_target,
+                                    "items": [{"name": it, "status": "pending"} for it in fallback_items],
+                                    "status": "pending"
+                                })
                                         
         # FINAL STEP: Navigate to Pickup Point — WITH FAILURE GATE
         if self.active_delivery_task:
@@ -1706,7 +1766,7 @@ class RobotWebServer:
                         axis_x = -math.sin(syaw)
                         axis_y = math.cos(syaw)
                         
-                        rx, ry = self.get_current_robot_pose()
+                        rx, ry, _ = self.get_current_robot_pose()
                         dx = resolved_shop['x'] - rx
                         dy = resolved_shop['y'] - ry
                         projection = dx * axis_x + dy * axis_y
@@ -1730,7 +1790,7 @@ class RobotWebServer:
                                 self.nav_to_tag_thread(resolved_tag)
                                 pose_info = self.tag_true_poses[resolved_tag]
                                 gx, gy = pose_info[0], pose_info[1]
-                                rx, ry = self.get_current_robot_pose()
+                                rx, ry, _ = self.get_current_robot_pose()
                                 success = (math.hypot(rx - gx, ry - gy) < 0.35) and (self.active_delivery_task is not None)
                     if success:
                         break
@@ -1770,6 +1830,7 @@ class RobotWebServer:
         self.cmd_vel_pub.publish(Twist()) # Stop
 
     def nav_to_tag_thread(self, tag_name):
+        self.start_planners()
         self.load_tag_true_poses()
         rospy.loginfo(f"[Tag Nav] Starting navigation to landmark {tag_name}...")
         
@@ -2105,6 +2166,8 @@ class RobotWebServer:
         if not cat:
             return ""
         c = cat.upper().strip()
+        if "PICK" in c or "POINT" in c:
+            return "PICKUP POINT"
         if "BURG" in c or "FAST" in c or "RESTAURANT" in c or "HAMB" in c:
             return "HAMBURGER"
         if "CAF" in c or "COFFEE" in c:
@@ -2113,9 +2176,34 @@ class RobotWebServer:
             return "PHARMACY"
         if "CONV" in c or "STORE" in c or "SHOP" in c:
             return "CONVENIENCE STORE"
-        if "PICK" in c or "POINT" in c:
-            return "PICKUP POINT"
         return c
+
+    def get_fallback_shop_category(self, current_shop_category, item_name, failed_attempts):
+        c = current_shop_category.upper().strip()
+        candidates = []
+        if item_name == "ice coffee" or item_name == "mug":
+            candidates = ["Cafe", "Convenience store"]
+        elif item_name == "first-aid-kit":
+            candidates = ["Pharmacy", "Convenience store"]
+        elif item_name == "burgers":
+            candidates = ["Fast-food restaurant", "Convenience store"]
+            
+        attempts = failed_attempts.get(item_name, set())
+        valid_candidates = [cand for cand in candidates if self.normalize_category(cand) not in attempts]
+        
+        is_conv = "CONV" in c or "STORE" in c or "SHOP" in c and not ("CAF" in c or "PHARM" in c or "BURG" in c or "HAMB" in c)
+        if is_conv:
+            specialized_cands = [cand for cand in valid_candidates if cand != "Convenience store"]
+            if specialized_cands:
+                return specialized_cands[0]
+        else:
+            conv_cands = [cand for cand in valid_candidates if cand == "Convenience store"]
+            if conv_cands:
+                return conv_cands[0]
+                
+        if valid_candidates:
+            return valid_candidates[0]
+        return None
 
     def load_sign_database(self):
         db = []
@@ -2964,16 +3052,141 @@ def normalize_item_name(item_name):
         return "mug"
     return None
 
-def plan_shopping_list(requested_items):
-    if not requested_items:
+def parse_requested_items_with_counts(message):
+    import re
+    m = message.lower()
+    
+    keywords_mapping = {
+        "burgers": ["burger", "hamburger", "fries", "fast food", "food"],
+        "first-aid-kit": ["med", "pharm", "pill", "sick", "drug", "first aid", "first-aid", "aspirin", "band-aid", "kit"],
+        "ice coffee": ["coffee", "drink", "tea", "latte", "cappuccino", "espresso"],
+        "mug": ["mug", "cup"]
+    }
+    
+    counts = {}
+    word_to_num = {
+        "one": 1, "a": 1, "an": 1, "two": 2, "three": 3, "four": 4, "five": 5,
+        "six": 6, "seven": 7, "eight": 8, "nine": 9, "ten": 10
+    }
+    
+    tokens = re.findall(r'[a-z0-9\-]+', m)
+    
+    for canonical_name, syns in keywords_mapping.items():
+        for syn in syns:
+            syn_words = syn.split()
+            for i in range(len(tokens) - len(syn_words) + 1):
+                match = False
+                if len(syn_words) == 1:
+                    if syn_words[0] in tokens[i]:
+                        match = True
+                else:
+                    if tokens[i:i+len(syn_words)] == syn_words:
+                        match = True
+                        
+                if match:
+                    count = 1
+                    if i > 0:
+                        prev_token = tokens[i-1]
+                        if prev_token.isdigit():
+                            count = int(prev_token)
+                        elif prev_token in word_to_num:
+                            count = word_to_num[prev_token]
+                    counts[canonical_name] = max(counts.get(canonical_name, 0), count)
+                    
+    return counts
+
+def plan_shopping_list(requested_items_counts):
+    if not requested_items_counts:
         return []
-    if all(item in ["ice coffee", "mug"] for item in requested_items):
-        return [{"target": "Cafe", "items": list(requested_items)}]
-    if all(item == "first-aid-kit" for item in requested_items):
-        return [{"target": "Pharmacy", "items": list(requested_items)}]
-    if all(item == "burgers" for item in requested_items):
-        return [{"target": "Fast-food restaurant", "items": list(requested_items)}]
-    return [{"target": "Convenience store", "items": list(requested_items)}]
+        
+    cafe_items = {"ice coffee", "mug"}
+    pharmacy_items = {"first-aid-kit"}
+    fastfood_items = {"burgers"}
+    
+    # 1. Identify "Must visit specialized" stores due to item count > 1
+    must_visit_specialized = set()
+    cafe_count = sum(requested_items_counts.get(it, 0) for it in cafe_items)
+    pharmacy_count = sum(requested_items_counts.get(it, 0) for it in pharmacy_items)
+    fastfood_count = sum(requested_items_counts.get(it, 0) for it in fastfood_items)
+    
+    if cafe_count > 1:
+        must_visit_specialized.add("Cafe")
+    if pharmacy_count > 1:
+        must_visit_specialized.add("Pharmacy")
+    if fastfood_count > 1:
+        must_visit_specialized.add("Fast-food restaurant")
+        
+    # 2. Assign items to must visit specialized stores
+    specialized_assignments = {}
+    remaining_items_counts = dict(requested_items_counts)
+    
+    if "Cafe" in must_visit_specialized:
+        specialized_assignments["Cafe"] = []
+        for it in cafe_items:
+            if it in remaining_items_counts:
+                specialized_assignments["Cafe"].extend([it] * remaining_items_counts[it])
+                del remaining_items_counts[it]
+                
+    if "Pharmacy" in must_visit_specialized:
+        specialized_assignments["Pharmacy"] = []
+        for it in pharmacy_items:
+            if it in remaining_items_counts:
+                specialized_assignments["Pharmacy"].extend([it] * remaining_items_counts[it])
+                del remaining_items_counts[it]
+                
+    if "Fast-food restaurant" in must_visit_specialized:
+        specialized_assignments["Fast-food restaurant"] = []
+        for it in fastfood_items:
+            if it in remaining_items_counts:
+                specialized_assignments["Fast-food restaurant"].extend([it] * remaining_items_counts[it])
+                del remaining_items_counts[it]
+                
+    # 3. Fulfill what we can at already-visited must_visit_specialized stores
+    for store in list(specialized_assignments.keys()):
+        if store == "Cafe":
+            for it in list(remaining_items_counts.keys()):
+                if it in cafe_items:
+                    specialized_assignments["Cafe"].extend([it] * remaining_items_counts[it])
+                    del remaining_items_counts[it]
+        elif store == "Pharmacy":
+            for it in list(remaining_items_counts.keys()):
+                if it in pharmacy_items:
+                    specialized_assignments["Pharmacy"].extend([it] * remaining_items_counts[it])
+                    del remaining_items_counts[it]
+        elif store == "Fast-food restaurant":
+            for it in list(remaining_items_counts.keys()):
+                if it in fastfood_items:
+                    specialized_assignments["Fast-food restaurant"].extend([it] * remaining_items_counts[it])
+                    del remaining_items_counts[it]
+                    
+    # 4. Handle remaining items (count <= 1)
+    if remaining_items_counts:
+        if len(remaining_items_counts) == 1:
+            item = list(remaining_items_counts.keys())[0]
+            count = remaining_items_counts[item]
+            if item in cafe_items:
+                store = "Cafe"
+            elif item in pharmacy_items:
+                store = "Pharmacy"
+            else:
+                store = "Fast-food restaurant"
+                
+            if store in specialized_assignments:
+                specialized_assignments[store].extend([item] * count)
+            else:
+                specialized_assignments[store] = [item] * count
+        else:
+            # More than 1 different items remain, go to Convenience store to cover them in 1 visit
+            specialized_assignments["Convenience store"] = []
+            for item, count in remaining_items_counts.items():
+                specialized_assignments["Convenience store"].extend([item] * count)
+                
+    # Format assignments into task list
+    tasks = []
+    for store, items in specialized_assignments.items():
+        if items:
+            tasks.append({"target": store, "items": items})
+    return tasks
 
 @app.route('/api/delivery/send', methods=['POST'])
 def delivery_send():
@@ -3005,23 +3218,27 @@ def delivery_send():
                 f"- Map burger, burgers, hamburger, fries, fast food, food to 'burgers'.\n"
                 f"- Map coffee, ice coffee, tea, latte, drink, drinks to 'ice coffee'.\n"
                 f"- Map mug, cup to 'mug'.\n\n"
+                f"Quantity Rule: If the user asks for a quantity of an item (e.g. 5 coffee, 3 burgers, 1 drug), duplicate that item in the 'items' list that many times.\n"
+                f"Example: if the user asks for 5 coffee, the list should contain 5 instances of 'ice coffee'.\n\n"
+                f"Optimization Rule: ALWAYS minimize the number of shop visits. However, for any category where the user needs MORE THAN 1 item, it is smarter/required to go to that category's specialized store than the convenience store.\n"
                 f"Store availability:\n"
                 f"- 'Cafe' sells: 'ice coffee', 'mug'\n"
                 f"- 'Pharmacy' sells: 'first-aid-kit'\n"
                 f"- 'Fast-food restaurant' sells: 'burgers'\n"
                 f"- 'Convenience store' sells all items ('first-aid-kit', 'burgers', 'ice coffee', 'mug')\n\n"
-                f"Optimization Rule: ALWAYS minimize the number of shop visits. If the items belong to different stores (e.g., first-aid-kit and burgers), consolidate them into a single visit to 'Convenience store' instead of visiting multiple shops.\n\n"
                 f"Return ONLY a raw JSON object with two keys:\n"
                 f"1. 'tasks': A list of objects, where each object has:\n"
                 f"   - 'target': The exact category string ('Cafe', 'Convenience store', 'Fast-food restaurant', or 'Pharmacy')\n"
-                f"   - 'items': A list of strings containing the matched canonical items.\n"
+                f"   - 'items': A list of strings containing the matched canonical items (duplicated for quantity).\n"
                 f"2. 'reply': A polite conversational response listing where the robot will go to get the items.\n\n"
-                f"Example JSON output:\n"
+                f"Example JSON output for '5 coffee, 3 burgers, 1 drug':\n"
                 f"{{\n"
                 f"  \"tasks\": [\n"
-                f"    {{\"target\": \"Convenience store\", \"items\": [\"first-aid-kit\", \"burgers\"]}}\n"
+                f"    {{\"target\": \"Cafe\", \"items\": [\"ice coffee\", \"ice coffee\", \"ice coffee\", \"ice coffee\", \"ice coffee\"]}},\n"
+                f"    {{\"target\": \"Fast-food restaurant\", \"items\": [\"burgers\", \"burgers\", \"burgers\"]}},\n"
+                f"    {{\"target\": \"Pharmacy\", \"items\": [\"first-aid-kit\"]}}\n"
                 f"  ],\n"
-                f"  \"reply\": \"Sure thing! I will go to the Convenience store to get you a first-aid-kit and burgers.\"\n"
+                f"  \"reply\": \"Sure thing! I will visit the Cafe for 5 coffee, the Fast-food restaurant for 3 burgers, and the Pharmacy for 1 first-aid-kit.\"\n"
                 f"}}"
             )
             
@@ -3040,14 +3257,14 @@ def delivery_send():
             raw_tasks = parsed.get("tasks", [])
             
             # Map/normalize raw items and re-plan optimally to guarantee minimum visits
-            all_requested = set()
+            all_requested_counts = {}
             for t in raw_tasks:
                 for item in t.get("items", []):
                     normalized = normalize_item_name(item)
                     if normalized:
-                        all_requested.add(normalized)
+                        all_requested_counts[normalized] = all_requested_counts.get(normalized, 0) + 1
                         
-            tasks = plan_shopping_list(all_requested)
+            tasks = plan_shopping_list(all_requested_counts)
             
             if tasks:
                 reply = "sounds good, here is where I will go to get your items: "
@@ -3063,18 +3280,8 @@ def delivery_send():
             use_local = True
             
     if use_local:
-        m = message.lower()
-        all_requested = set()
-        if any(x in m for x in ["burger", "hamburger", "fries", "fast food", "food"]):
-            all_requested.add("burgers")
-        if any(x in m for x in ["med", "pharm", "pill", "sick", "drug", "first aid", "first-aid", "aspirin", "band-aid", "kit"]):
-            all_requested.add("first-aid-kit")
-        if any(x in m for x in ["coffee", "drink", "tea", "latte", "cappuccino", "espresso"]):
-            all_requested.add("ice coffee")
-        if any(x in m for x in ["mug", "cup"]):
-            all_requested.add("mug")
-            
-        tasks = plan_shopping_list(all_requested)
+        requested_counts = parse_requested_items_with_counts(message)
+        tasks = plan_shopping_list(requested_counts)
         if tasks:
             reply = "sounds good, here is where I will go to get your items: "
             parts = []

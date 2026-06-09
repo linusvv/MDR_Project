@@ -795,6 +795,18 @@ document.addEventListener('DOMContentLoaded', () => {
     // Keyboard support for WASD / Arrows / QE strafe
     document.addEventListener('keydown', (e) => {
         if (e.repeat) return;
+        
+        // Ignore keydowns if user is typing in form inputs/elements
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT' || e.target.isContentEditable) {
+            return;
+        }
+
+        // Only allow manual key control when the "Remote Control" tab is active and visible
+        const remotePanel = document.getElementById('panel-remote');
+        if (!remotePanel || remotePanel.style.display === 'none' || !remotePanel.classList.contains('active')) {
+            return;
+        }
+
         switch(e.key) {
             case 'ArrowUp':
             case 'w': case 'W':
@@ -832,6 +844,17 @@ document.addEventListener('DOMContentLoaded', () => {
     });
 
     document.addEventListener('keyup', (e) => {
+        // Ignore keyups if user is typing in form inputs/elements
+        if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' || e.target.tagName === 'SELECT' || e.target.isContentEditable) {
+            return;
+        }
+
+        // Only handle keyups when the "Remote Control" tab is active and visible
+        const remotePanel2 = document.getElementById('panel-remote');
+        if (!remotePanel2 || remotePanel2.style.display === 'none' || !remotePanel2.classList.contains('active')) {
+            return;
+        }
+
         switch(e.key) {
             case 'ArrowUp':    case 'w': case 'W': stopCommand(); if (buttons['btn-up'])           buttons['btn-up'].style.transform = ''; break;
             case 'ArrowDown':  case 's': case 'S': stopCommand(); if (buttons['btn-down'])         buttons['btn-down'].style.transform = ''; break;

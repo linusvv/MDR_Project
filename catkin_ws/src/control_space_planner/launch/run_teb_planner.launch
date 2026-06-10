@@ -60,10 +60,10 @@
                 weight_optimaltime: 2.0 # Slightly higher so the path is driven efficiently without micro-oscillations
                 max_vel_x: 0.07 # Halved from 0.10
                 max_vel_x_backwards: 0.035 # Halved from 0.05
-                max_vel_y: 0.01     # Sideways movement disabled for front-sensor setup
+                max_vel_y: 0.05     # Sideways movement disabled for front-sensor setup
                 max_vel_theta: 0.17 # Halved from 0.25
                 acc_lim_x: 0.2 # Restored to default for faster speed tracking
-                acc_lim_y: 0.01     # Sideways movement disabled
+                acc_lim_y: 0.5     # Sideways movement disabled
                 acc_lim_theta: 1.0 # Restored for quick heading correction to prevent sinus oscillations
                 min_turning_radius: 0.0
                 wheelbase: 0.26
@@ -73,8 +73,8 @@
                     radius: 0.30    # Reverted to physical robot radius to fit inside corridors/hallways
  
                 # Goal Tolerance
-                xy_goal_tolerance: 0.10
-                yaw_goal_tolerance: 0.10
+                xy_goal_tolerance: 0.18
+                yaw_goal_tolerance: 0.18
                 free_goal_vel: True
  
                 # Obstacles
@@ -83,7 +83,7 @@
                 # occupied cell to a 0.52m-away obstacle appears at 0.50m, which
                 # exceeded the previous 0.50m limit by 0cm → borderline infeasible.
                 # 0.05m gives a comfortable 0.17m margin above the 0.35m hard limit.
-                min_obstacle_dist: 0.05
+                min_obstacle_dist: 0.10
                 inflation_dist: 0.10  # soft cost zone beyond the hard limit
                 include_costmap_obstacles: True
                 costmap_obstacles_behind_robot_dist: 1.0

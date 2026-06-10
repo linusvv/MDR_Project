@@ -9,7 +9,7 @@ bridge = CvBridge()
 
 def callback(msg):
     frame = bridge.imgmsg_to_cv2(msg, "bgr8")
-    results = model(frame, conf=0.8, device=0, verbose=False)
+    results = model(frame, conf=0.75, device=0, verbose=False)
     annotated = results[0].plot()
     for box in results[0].boxes:
         cls_name = model.names[int(box.cls)]
@@ -19,6 +19,6 @@ def callback(msg):
     cv2.waitKey(1)
 
 rospy.init_node("yolo_detector")
-rospy.Subscriber("/usb_cam/image_raw", Image, callback)
+rospy.Subscriber("/camera/color/image_raw", Image, callback)
 print("Warte auf Kamerabilder...")
 rospy.spin()

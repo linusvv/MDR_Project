@@ -81,7 +81,7 @@
 
         <!-- 3. Start RTAB-Map SLAM (Configured for Visual Odometry) -->
         <include file="$(find rtabmap_launch)/launch/rtabmap.launch">
-            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2000 --Kp/MaxFeatures 2000 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
+            <arg name="rtabmap_args" value="--delete_db_on_start --Vis/MaxFeatures 2500 --Kp/MaxFeatures 2500 --Rtabmap/LoopThr 0.1 --Rtabmap/DetectionRate 1.0 --Mem/ImagePreDecimation 1 --Grid/MaxObstacleHeight 0.15 --Grid/RayTracing true --RGBD/ProximityBySpace true --RGBD/OptimizeFromGraphEnd false --Vis/MinInliers 10"/>
             <arg name="rgb_topic" value="/camera/color/image_raw_throttle"/>
             <arg name="depth_topic" value="/camera/aligned_depth_to_color/image_raw_throttle"/>
             <arg name="camera_info_topic" value="/camera/color/camera_info"/>
